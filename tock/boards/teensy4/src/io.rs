@@ -44,7 +44,6 @@ impl Write for Writer {
     }
 }
 
-#[cfg(all(target_arch = "arm", target_os = "none"))]
 #[no_mangle]
 #[panic_handler]
 unsafe fn panic_handler(panic_info: &core::panic::PanicInfo) -> ! {
