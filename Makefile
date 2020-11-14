@@ -1,4 +1,4 @@
-TOCK_ROOT_DIRECTORY = ../tock/
+TOCK_ROOT_DIRECTORY = tock/
 TEENSY_LOADER = teensy_loader_cli
 OBJCOPY = arm-none-eabi-objcopy
 
