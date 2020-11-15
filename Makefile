@@ -14,13 +14,13 @@ kernel:
 build:
 	@mkdir -p build
 
-BLINK_APP = blink/build/cortex-m7/cortex-m7.tbf
+BLINK_APP = libtock-c/examples/blink/build/cortex-m7/cortex-m7.tbf
 blink-app:
-	@$(MAKE) -C blink
+	@$(MAKE) -C libtock-c/examples/blink
 
-CONSOLE_APP = console/build/cortex-m7/cortex-m7.tbf
+CONSOLE_APP = libtock-c/examples/tests/console/build/cortex-m7/cortex-m7.tbf
 console-app:
-	@$(MAKE) -C console
+	@$(MAKE) -C libtock-c/examples/tests/console
 
 build/blink.elf: kernel blink-app build
 	@$(OBJCOPY) --update-section .apps=$(BLINK_APP) $(KERNEL) $@
@@ -40,7 +40,8 @@ console: build/console.hex
 clean:
 	@rm -Rf build
 	@$(MAKE) -C $(TEENSY4) clean
-	@$(MAKE) -C blink clean
+	@$(MAKE) -C libtock-c/examples/blink clean
+	@$(MAKE) -C libtock-c/examples/tests/console clean
 
 APPS = $(BLINK_APP) $(CONSOLE_APP)
 all: kernel blink-app console-app build
