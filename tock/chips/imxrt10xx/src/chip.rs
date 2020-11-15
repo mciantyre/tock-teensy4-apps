@@ -42,6 +42,7 @@ impl Chip for Imxrt10xx {
                         nvic::LPUART2 => lpuart::LPUART2.handle_interrupt(),
                         nvic::LPI2C1 => lpi2c::LPI2C1.handle_event(),
                         nvic::GPT1 => gpt::GPT1.handle_interrupt(),
+                        nvic::GPT2 => gpt::GPT2.handle_interrupt(),
                         nvic::GPIO1_1 => gpio::PORT[0].handle_interrupt(gpio::GpioPort::GPIO1),
                         nvic::GPIO1_2 => gpio::PORT[0].handle_interrupt(gpio::GpioPort::GPIO1),
                         nvic::GPIO2_1 => gpio::PORT[1].handle_interrupt(gpio::GpioPort::GPIO2),
