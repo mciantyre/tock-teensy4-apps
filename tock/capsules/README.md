@@ -32,7 +32,7 @@ These implement a driver to setup and read various physical sensors.
 - **[FXOS8700CQ](src/fxos8700cq.rs)**: Accelerometer and magnetometer.
 - **[ISL29035](src/isl29035.rs)**: Light sensor.
 - **[L3GD20](src/l3gd20.rs)**: MEMS 3 axys digital gyroscope and temperature sensor.
-- **[LSM303DLHC](src/lsm303dlhc.rs)**: MEMS 3 axys digital accelerometer, magnetometer and temperature sensor.
+- **[LSM303](src/lsm303.rs)**: MEMS 3 axys digital accelerometer, magnetometer and temperature sensor.
 - **[LPS25HB](src/lps25hb.rs)**: Pressure sensor.
 - **[MLX90614](src/mlx90614.rs)**: Infrared temperature sensor.
 - **[SI7021](src/si7021.rs)**: Temperature and humidity sensor.
@@ -65,7 +65,7 @@ Support for wireless radios.
 Protocol stacks and other libraries.
 
 - **[IEEE 802.15.4](src/ieee802154)**: 802.15.4 networking.
-- **[USB](src/usb.rs)**: USB 2.0.
+- **[USB](src/usb)**: USB 2.0.
 - **[Segger RTT](src/segger_rtt.rs)**: Segger RTT support. Provides `hil::uart`
   interface.
 

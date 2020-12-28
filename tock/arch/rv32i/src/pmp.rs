@@ -26,7 +26,7 @@
 /// number of regions we can protect is `$x/2`.
 #[macro_export]
 macro_rules! PMPConfigMacro {
-    ( $x:expr ) => {
+    ( $x:expr $(,)? ) => {
 
 use core::cell::Cell;
 use core::cmp;
@@ -175,11 +175,11 @@ impl Default for PMPConfig {
 
 impl fmt::Display for PMPConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, " PMP regions:")?;
+        write!(f, " PMP regions:\r\n")?;
         for (n, region) in self.regions.iter().enumerate() {
             match region {
-                None => writeln!(f, "  <unset>")?,
-                Some(region) => writeln!(f, "  [{}]: {}", n, region)?,
+                None => write!(f, "  <unset>\r\n")?,
+                Some(region) => write!(f, "  [{}]: {}\r\n", n, region)?,
             }
         }
         Ok(())
