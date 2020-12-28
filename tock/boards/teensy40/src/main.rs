@@ -67,6 +67,13 @@ pub unsafe fn reset_handler() {
         imxrt1060::chip::Imxrt10xxDefaultPeripherals,
         imxrt1060::chip::Imxrt10xxDefaultPeripherals::new(ccm)
     );
+    peripherals.ccm.set_low_power_mode();
+    peripherals.lpuart1.disable_clock();
+    peripherals.lpuart2.disable_clock();
+    peripherals
+        .ccm
+        .set_uart_clock_sel(imxrt1060::ccm::UartClockSelection::PLL3);
+    peripherals.ccm.set_uart_clock_podf(1);
 
     peripherals.ccm.enable_iomuxc_clock();
     peripherals.ccm.enable_iomuxc_snvs_clock();

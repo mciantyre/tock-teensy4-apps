@@ -515,14 +515,14 @@ impl Ccm {
     /// Set the UART clock selection
     ///
     /// Should only be called when *all* UART clock gates are disabled
-    pub fn set_uart_clock_mux(&self, selection: UartClockSelection) {
+    pub fn set_uart_clock_sel(&self, selection: UartClockSelection) {
         self.registers
             .cscdr1
             .modify(CSCDR1::UART_CLK_SEL.val(selection as u32));
     }
 
     /// Returns the UART clock selection
-    pub fn uart_clock_mux(&self) -> UartClockSelection {
+    pub fn uart_clock_sel(&self) -> UartClockSelection {
         use CSCDR1::UART_CLK_SEL::Value;
         match self.registers.cscdr1.read_as_enum(CSCDR1::UART_CLK_SEL) {
             Some(Value::Oscillator) => UartClockSelection::Oscillator,
