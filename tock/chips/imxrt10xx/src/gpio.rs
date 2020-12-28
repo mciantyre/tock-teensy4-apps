@@ -621,35 +621,12 @@ enum_from_primitive! {
 
 pub struct Port<'a> {
     registers: StaticRef<GpioRegisters>,
-    clock: PortClock,
+    clock: PortClock<'a>,
     pins: [Pin<'a>; 32],
 }
 
-pub static mut PORTS: Ports<'static> = Ports([
-    Port::new(
-        GPIO1_BASE,
-        PortClock(ccm::PeripheralClock::CCGR1(ccm::HCLK1::GPIO1)),
-    ),
-    Port::new(
-        GPIO2_BASE,
-        PortClock(ccm::PeripheralClock::CCGR1(ccm::HCLK1::GPIO1)),
-    ),
-    Port::new(
-        GPIO3_BASE,
-        PortClock(ccm::PeripheralClock::CCGR1(ccm::HCLK1::GPIO1)),
-    ),
-    Port::new(
-        GPIO4_BASE,
-        PortClock(ccm::PeripheralClock::CCGR1(ccm::HCLK1::GPIO1)),
-    ),
-    Port::new(
-        GPIO5_BASE,
-        PortClock(ccm::PeripheralClock::CCGR1(ccm::HCLK1::GPIO1)),
-    ),
-]);
-
 impl<'a> Port<'a> {
-    const fn new(registers: StaticRef<GpioRegisters>, clock: PortClock) -> Self {
+    const fn new(registers: StaticRef<GpioRegisters>, clock: PortClock<'a>) -> Self {
         Self {
             registers,
             clock,
@@ -732,6 +709,30 @@ impl<'a> Port<'a> {
 pub struct Ports<'a>([Port<'a>; 5]);
 
 impl<'a> Ports<'a> {
+    pub const fn new(ccm: &'a ccm::Ccm) -> Self {
+        Ports([
+            Port::new(
+                GPIO1_BASE,
+                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
+            ),
+            Port::new(
+                GPIO2_BASE,
+                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
+            ),
+            Port::new(
+                GPIO3_BASE,
+                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
+            ),
+            Port::new(
+                GPIO4_BASE,
+                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
+            ),
+            Port::new(
+                GPIO5_BASE,
+                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
+            ),
+        ])
+    }
     pub const fn pin(&self, pin: PinId) -> &Pin<'a> {
         &self.0[pin.port()].pins[pin.offset()]
     }
@@ -740,9 +741,9 @@ impl<'a> Ports<'a> {
     }
 }
 
-struct PortClock(ccm::PeripheralClock);
+struct PortClock<'a>(ccm::PeripheralClock<'a>);
 
-impl ClockInterface for PortClock {
+impl ClockInterface for PortClock<'_> {
     fn is_enabled(&self) -> bool {
         self.0.is_enabled()
     }
