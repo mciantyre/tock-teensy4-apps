@@ -3,7 +3,7 @@ TEENSY_LOADER = teensy_loader_cli
 OBJCOPY = arm-none-eabi-objcopy
 
 TARGET = thumbv7em-none-eabi
-PLATFORM = teensy4
+PLATFORM = teensy40
 TEENSY4 = $(TOCK_ROOT_DIRECTORY)boards/$(PLATFORM)/
 KERNEL = $(TOCK_ROOT_DIRECTORY)target/$(TARGET)/release/$(PLATFORM).elf
 LOADER = $(TEENSY_LOADER) --mcu=TEENSY40 -w -v
