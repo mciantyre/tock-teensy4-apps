@@ -5,7 +5,8 @@
 #![crate_name = "imxrt10xx"]
 #![crate_type = "rlib"]
 #![feature(const_fn)]
-#![cfg_attr(target_arch = "arm", no_std)] // Support unit testing on your development host
+#![feature(min_const_generics)] // Stabilized in Rust 1.51 (https://github.com/rust-lang/rust/pull/79135)
+#![cfg_attr(not(test), no_std)] // Support unit testing on your host
 
 pub mod chip;
 pub mod nvic;
