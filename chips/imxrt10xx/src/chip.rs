@@ -39,8 +39,8 @@ pub struct Imxrt10xxDefaultPeripherals {
 }
 
 impl Imxrt10xxDefaultPeripherals {
-    pub fn new(ccm: &'static crate::ccm::Ccm) -> Self {
-        let peripherals = Self {
+    pub const fn new(ccm: &'static crate::ccm::Ccm) -> Self {
+        Self {
             iomuxc: crate::iomuxc::Iomuxc::new(),
             iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs::new(),
             ccm: crate::ccm::Ccm::new(),
@@ -50,19 +50,7 @@ impl Imxrt10xxDefaultPeripherals {
             lpuart2: crate::lpuart::Lpuart::new_lpuart2(ccm),
             gpt1: crate::gpt::Gpt1::new_gpt1(ccm),
             gpt2: crate::gpt::Gpt2::new_gpt2(ccm),
-        };
-
-        peripherals.ccm.set_low_power_mode();
-
-        // Configure UART clocks
-        peripherals.lpuart1.disable_clock();
-        peripherals.lpuart2.disable_clock();
-        peripherals
-            .ccm
-            .set_uart_clock_mux(crate::ccm::UartClockSelection::PLL3);
-        peripherals.ccm.set_uart_clock_podf(1);
-
-        peripherals
+        }
     }
 }
 
