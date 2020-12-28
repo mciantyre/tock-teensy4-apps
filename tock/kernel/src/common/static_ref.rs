@@ -10,7 +10,7 @@ use core::ops::Deref;
 /// given a raw address and acts similarly to `extern` definitions, except
 /// `StaticRef` is subject to module and crate boundaries, while `extern`
 /// definitions can be imported anywhere.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct StaticRef<T> {
     ptr: *const T,
 }

@@ -1,8 +1,32 @@
+//! i.MX RT GPIO driver
+//!
+//! # Design
+//!
+//! Allocate a [`Ports`] collection. Use this to access GPIO pins and GPIO ports.
+//!
+//! - A [`Port`] maps to a GPIO pin bank. `GPIO3` is a port. Ports may provide
+//!   access to pins. Ports handle interrupts.
+//! - A [`Pin`] maps to a physical GPIO pin. `GPIO3[17]` is a pin. It's identified
+//!   by its [`PinId`], [`SdB0_05`][PinId::SdB0_05]. Pins can be set as inputs or
+//!   outputs.
+//!
+//! # Example
+//!
+//! ```
+//! use imxrt10xx::gpio::{Ports, Port, PinId};
+//!
+//! # let ccm = imxrt10xx::ccm::Ccm::new();
+//! let ports = Ports::new(&ccm);
+//! let pin_from_id = ports.pin(PinId::Emc25);
+//! let pin_from_port = ports.gpio4.pin(25);
+//! assert_eq!(pin_from_id as *const _, pin_from_port as *const _);
+//! ```
+
 use cortexm7::support::atomic;
 use enum_primitive::cast::FromPrimitive;
 use enum_primitive::enum_from_primitive;
 use kernel::common::cells::OptionalCell;
-use kernel::common::registers::{register_bitfields, ReadOnly, ReadWrite, WriteOnly};
+use kernel::common::registers::{ReadOnly, ReadWrite, WriteOnly};
 use kernel::common::StaticRef;
 use kernel::hil;
 use kernel::ClockInterface;
@@ -13,396 +37,29 @@ use crate::ccm;
 #[repr(C)]
 struct GpioRegisters {
     // GPIO data register
-    dr: ReadWrite<u32, DR::Register>,
+    dr: ReadWrite<u32>,
     // GPIO direction register
-    gdir: ReadWrite<u32, GDIR::Register>,
+    gdir: ReadWrite<u32>,
     // GPIO pad status register
-    psr: ReadOnly<u32, PSR::Register>,
+    psr: ReadOnly<u32>,
     // GPIO Interrupt configuration register 1
-    icr1: ReadWrite<u32, ICR1::Register>,
+    icr1: ReadWrite<u32>,
     // GPIO Interrupt configuration register 2
-    icr2: ReadWrite<u32, ICR2::Register>,
+    icr2: ReadWrite<u32>,
     // GPIO interrupt mask register
-    imr: ReadWrite<u32, IMR::Register>,
+    imr: ReadWrite<u32>,
     // GPIO interrupt status register -- W1C - Write 1 to clear
-    isr: ReadWrite<u32, ISR::Register>,
+    isr: ReadWrite<u32>,
     // GPIO edge select register
-    edge_sel: ReadWrite<u32, EDGE_SEL::Register>,
+    edge_sel: ReadWrite<u32>,
     _reserved1: [u8; 100],
     // GPIO data register set
-    dr_set: WriteOnly<u32, DR_SET::Register>,
+    dr_set: WriteOnly<u32>,
     // GPIO data register clear
-    dr_clear: WriteOnly<u32, DR_CLEAR::Register>,
+    dr_clear: WriteOnly<u32>,
     // GPIO data register toggle
-    dr_toggle: WriteOnly<u32, DR_TOGGLE::Register>,
+    dr_toggle: WriteOnly<u32>,
 }
-
-register_bitfields![u32,
-    DR [
-        // the value of the GPIO output when the signal is configured as an output
-        DR31 OFFSET(31) NUMBITS(1) [],
-        DR30 OFFSET(30) NUMBITS(1) [],
-        DR29 OFFSET(29) NUMBITS(1) [],
-        DR28 OFFSET(28) NUMBITS(1) [],
-        DR27 OFFSET(27) NUMBITS(1) [],
-        DR26 OFFSET(26) NUMBITS(1) [],
-        DR25 OFFSET(25) NUMBITS(1) [],
-        DR24 OFFSET(24) NUMBITS(1) [],
-        DR23 OFFSET(23) NUMBITS(1) [],
-        DR22 OFFSET(22) NUMBITS(1) [],
-        DR21 OFFSET(21) NUMBITS(1) [],
-        DR20 OFFSET(20) NUMBITS(1) [],
-        DR19 OFFSET(19) NUMBITS(1) [],
-        DR18 OFFSET(18) NUMBITS(1) [],
-        DR17 OFFSET(17) NUMBITS(1) [],
-        DR16 OFFSET(16) NUMBITS(1) [],
-        DR15 OFFSET(15) NUMBITS(1) [],
-        DR14 OFFSET(14) NUMBITS(1) [],
-        DR13 OFFSET(13) NUMBITS(1) [],
-        DR12 OFFSET(12) NUMBITS(1) [],
-        DR11 OFFSET(11) NUMBITS(1) [],
-        DR10 OFFSET(10) NUMBITS(1) [],
-        DR9 OFFSET(9) NUMBITS(1) [],
-        DR8 OFFSET(8) NUMBITS(1) [],
-        DR7 OFFSET(7) NUMBITS(1) [],
-        DR6 OFFSET(6) NUMBITS(1) [],
-        DR5 OFFSET(5) NUMBITS(1) [],
-        DR4 OFFSET(4) NUMBITS(1) [],
-        DR3 OFFSET(3) NUMBITS(1) [],
-        DR2 OFFSET(2) NUMBITS(1) [],
-        DR1 OFFSET(1) NUMBITS(1) [],
-        DR0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    GDIR [
-        // bit n of this register defines the direction of the GPIO[n] signal
-        GDIR31 OFFSET(31) NUMBITS(1) [],
-        GDIR30 OFFSET(30) NUMBITS(1) [],
-        GDIR29 OFFSET(29) NUMBITS(1) [],
-        GDIR28 OFFSET(28) NUMBITS(1) [],
-        GDIR27 OFFSET(27) NUMBITS(1) [],
-        GDIR26 OFFSET(26) NUMBITS(1) [],
-        GDIR25 OFFSET(25) NUMBITS(1) [],
-        GDIR24 OFFSET(24) NUMBITS(1) [],
-        GDIR23 OFFSET(23) NUMBITS(1) [],
-        GDIR22 OFFSET(22) NUMBITS(1) [],
-        GDIR21 OFFSET(21) NUMBITS(1) [],
-        GDIR20 OFFSET(20) NUMBITS(1) [],
-        GDIR19 OFFSET(19) NUMBITS(1) [],
-        GDIR18 OFFSET(18) NUMBITS(1) [],
-        GDIR17 OFFSET(17) NUMBITS(1) [],
-        GDIR16 OFFSET(16) NUMBITS(1) [],
-        GDIR15 OFFSET(15) NUMBITS(1) [],
-        GDIR14 OFFSET(14) NUMBITS(1) [],
-        GDIR13 OFFSET(13) NUMBITS(1) [],
-        GDIR12 OFFSET(12) NUMBITS(1) [],
-        GDIR11 OFFSET(11) NUMBITS(1) [],
-        GDIR10 OFFSET(10) NUMBITS(1) [],
-        GDIR9 OFFSET(9) NUMBITS(1) [],
-        GDIR8 OFFSET(8) NUMBITS(1) [],
-        GDIR7 OFFSET(7) NUMBITS(1) [],
-        GDIR6 OFFSET(6) NUMBITS(1) [],
-        GDIR5 OFFSET(5) NUMBITS(1) [],
-        GDIR4 OFFSET(4) NUMBITS(1) [],
-        GDIR3 OFFSET(3) NUMBITS(1) [],
-        GDIR2 OFFSET(2) NUMBITS(1) [],
-        GDIR1 OFFSET(1) NUMBITS(1) [],
-        GDIR0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    PSR [
-        // bit n of this register returns the state of the corresponding GPIO[n] signal
-        PSR31 OFFSET(31) NUMBITS(1) [],
-        PSR30 OFFSET(30) NUMBITS(1) [],
-        PSR29 OFFSET(29) NUMBITS(1) [],
-        PSR28 OFFSET(28) NUMBITS(1) [],
-        PSR27 OFFSET(27) NUMBITS(1) [],
-        PSR26 OFFSET(26) NUMBITS(1) [],
-        PSR25 OFFSET(25) NUMBITS(1) [],
-        PSR24 OFFSET(24) NUMBITS(1) [],
-        PSR23 OFFSET(23) NUMBITS(1) [],
-        PSR22 OFFSET(22) NUMBITS(1) [],
-        PSR21 OFFSET(21) NUMBITS(1) [],
-        PSR20 OFFSET(20) NUMBITS(1) [],
-        PSR19 OFFSET(19) NUMBITS(1) [],
-        PSR18 OFFSET(18) NUMBITS(1) [],
-        PSR17 OFFSET(17) NUMBITS(1) [],
-        PSR16 OFFSET(16) NUMBITS(1) [],
-        PSR15 OFFSET(15) NUMBITS(1) [],
-        PSR14 OFFSET(14) NUMBITS(1) [],
-        PSR13 OFFSET(13) NUMBITS(1) [],
-        PSR12 OFFSET(12) NUMBITS(1) [],
-        PSR11 OFFSET(11) NUMBITS(1) [],
-        PSR10 OFFSET(10) NUMBITS(1) [],
-        PSR9 OFFSET(9) NUMBITS(1) [],
-        PSR8 OFFSET(8) NUMBITS(1) [],
-        PSR7 OFFSET(7) NUMBITS(1) [],
-        PSR6 OFFSET(6) NUMBITS(1) [],
-        PSR5 OFFSET(5) NUMBITS(1) [],
-        PSR4 OFFSET(4) NUMBITS(1) [],
-        PSR3 OFFSET(3) NUMBITS(1) [],
-        PSR2 OFFSET(2) NUMBITS(1) [],
-        PSR1 OFFSET(1) NUMBITS(1) [],
-        PSR0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    ICR1 [
-        // IRCn of this register defines interrupt condition for signal n
-        ICR15 OFFSET(15) NUMBITS(2) [],
-        ICR14 OFFSET(14) NUMBITS(2) [],
-        ICR13 OFFSET(13) NUMBITS(2) [],
-        ICR12 OFFSET(12) NUMBITS(2) [],
-        ICR11 OFFSET(11) NUMBITS(2) [],
-        ICR10 OFFSET(10) NUMBITS(2) [],
-        ICR9 OFFSET(9) NUMBITS(2) [],
-        ICR8 OFFSET(8) NUMBITS(2) [],
-        ICR7 OFFSET(7) NUMBITS(2) [],
-        ICR6 OFFSET(6) NUMBITS(2) [],
-        ICR5 OFFSET(5) NUMBITS(2) [],
-        ICR4 OFFSET(4) NUMBITS(2) [],
-        ICR3 OFFSET(3) NUMBITS(2) [],
-        ICR2 OFFSET(2) NUMBITS(2) [],
-        ICR1 OFFSET(1) NUMBITS(2) [],
-        ICR0 OFFSET(0) NUMBITS(2) []
-    ],
-
-    ICR2 [
-        // IRCn of this register defines interrupt condition for signal n
-        ICR31 OFFSET(31) NUMBITS(2) [],
-        ICR30 OFFSET(30) NUMBITS(2) [],
-        ICR29 OFFSET(29) NUMBITS(2) [],
-        ICR28 OFFSET(28) NUMBITS(2) [],
-        ICR27 OFFSET(27) NUMBITS(2) [],
-        ICR26 OFFSET(26) NUMBITS(2) [],
-        ICR25 OFFSET(25) NUMBITS(2) [],
-        ICR24 OFFSET(24) NUMBITS(2) [],
-        ICR23 OFFSET(23) NUMBITS(2) [],
-        ICR22 OFFSET(22) NUMBITS(2) [],
-        ICR21 OFFSET(21) NUMBITS(2) [],
-        ICR20 OFFSET(20) NUMBITS(2) [],
-        ICR19 OFFSET(19) NUMBITS(2) [],
-        ICR18 OFFSET(18) NUMBITS(2) [],
-        ICR17 OFFSET(17) NUMBITS(2) [],
-        ICR16 OFFSET(16) NUMBITS(2) []
-    ],
-
-    IMR [
-        // enable or disable the interrupt function on each of the 32 GPIO signals
-        IMR31 OFFSET(31) NUMBITS(1) [],
-        IMR30 OFFSET(30) NUMBITS(1) [],
-        IMR29 OFFSET(29) NUMBITS(1) [],
-        IMR28 OFFSET(28) NUMBITS(1) [],
-        IMR27 OFFSET(27) NUMBITS(1) [],
-        IMR26 OFFSET(26) NUMBITS(1) [],
-        IMR25 OFFSET(25) NUMBITS(1) [],
-        IMR24 OFFSET(24) NUMBITS(1) [],
-        IMR23 OFFSET(23) NUMBITS(1) [],
-        IMR22 OFFSET(22) NUMBITS(1) [],
-        IMR21 OFFSET(21) NUMBITS(1) [],
-        IMR20 OFFSET(20) NUMBITS(1) [],
-        IMR19 OFFSET(19) NUMBITS(1) [],
-        IMR18 OFFSET(18) NUMBITS(1) [],
-        IMR17 OFFSET(17) NUMBITS(1) [],
-        IMR16 OFFSET(16) NUMBITS(1) [],
-        IMR15 OFFSET(15) NUMBITS(1) [],
-        IMR14 OFFSET(14) NUMBITS(1) [],
-        IMR13 OFFSET(13) NUMBITS(1) [],
-        IMR12 OFFSET(12) NUMBITS(1) [],
-        IMR11 OFFSET(11) NUMBITS(1) [],
-        IMR10 OFFSET(10) NUMBITS(1) [],
-        IMR9 OFFSET(9) NUMBITS(1) [],
-        IMR8 OFFSET(8) NUMBITS(1) [],
-        IMR7 OFFSET(7) NUMBITS(1) [],
-        IMR6 OFFSET(6) NUMBITS(1) [],
-        IMR5 OFFSET(5) NUMBITS(1) [],
-        IMR4 OFFSET(4) NUMBITS(1) [],
-        IMR3 OFFSET(3) NUMBITS(1) [],
-        IMR2 OFFSET(2) NUMBITS(1) [],
-        IMR1 OFFSET(1) NUMBITS(1) [],
-        IMR0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    ISR [
-        // Bit n of this register is asserted (active high) when the active condition is detected
-        // on the GPIO input and waiting for service
-        ISR31 OFFSET(31) NUMBITS(1) [],
-        ISR30 OFFSET(30) NUMBITS(1) [],
-        ISR29 OFFSET(29) NUMBITS(1) [],
-        ISR28 OFFSET(28) NUMBITS(1) [],
-        ISR27 OFFSET(27) NUMBITS(1) [],
-        ISR26 OFFSET(26) NUMBITS(1) [],
-        ISR25 OFFSET(25) NUMBITS(1) [],
-        ISR24 OFFSET(24) NUMBITS(1) [],
-        ISR23 OFFSET(23) NUMBITS(1) [],
-        ISR22 OFFSET(22) NUMBITS(1) [],
-        ISR21 OFFSET(21) NUMBITS(1) [],
-        ISR20 OFFSET(20) NUMBITS(1) [],
-        ISR19 OFFSET(19) NUMBITS(1) [],
-        ISR18 OFFSET(18) NUMBITS(1) [],
-        ISR17 OFFSET(17) NUMBITS(1) [],
-        ISR16 OFFSET(16) NUMBITS(1) [],
-        ISR15 OFFSET(15) NUMBITS(1) [],
-        ISR14 OFFSET(14) NUMBITS(1) [],
-        ISR13 OFFSET(13) NUMBITS(1) [],
-        ISR12 OFFSET(12) NUMBITS(1) [],
-        ISR11 OFFSET(11) NUMBITS(1) [],
-        ISR10 OFFSET(10) NUMBITS(1) [],
-        ISR9 OFFSET(9) NUMBITS(1) [],
-        ISR8 OFFSET(8) NUMBITS(1) [],
-        ISR7 OFFSET(7) NUMBITS(1) [],
-        ISR6 OFFSET(6) NUMBITS(1) [],
-        ISR5 OFFSET(5) NUMBITS(1) [],
-        ISR4 OFFSET(4) NUMBITS(1) [],
-        ISR3 OFFSET(3) NUMBITS(1) [],
-        ISR2 OFFSET(2) NUMBITS(1) [],
-        ISR1 OFFSET(1) NUMBITS(1) [],
-        ISR0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    EDGE_SEL [
-        // When EDGE_SELn is set, the GPIO disregards the ICRn setting
-        EDGE_SEL31 OFFSET(31) NUMBITS(1) [],
-        EDGE_SEL30 OFFSET(30) NUMBITS(1) [],
-        EDGE_SEL29 OFFSET(29) NUMBITS(1) [],
-        EDGE_SEL28 OFFSET(28) NUMBITS(1) [],
-        EDGE_SEL27 OFFSET(27) NUMBITS(1) [],
-        EDGE_SEL26 OFFSET(26) NUMBITS(1) [],
-        EDGE_SEL25 OFFSET(25) NUMBITS(1) [],
-        EDGE_SEL24 OFFSET(24) NUMBITS(1) [],
-        EDGE_SEL23 OFFSET(23) NUMBITS(1) [],
-        EDGE_SEL22 OFFSET(22) NUMBITS(1) [],
-        EDGE_SEL21 OFFSET(21) NUMBITS(1) [],
-        EDGE_SEL20 OFFSET(20) NUMBITS(1) [],
-        EDGE_SEL19 OFFSET(19) NUMBITS(1) [],
-        EDGE_SEL18 OFFSET(18) NUMBITS(1) [],
-        EDGE_SEL17 OFFSET(17) NUMBITS(1) [],
-        EDGE_SEL16 OFFSET(16) NUMBITS(1) [],
-        EDGE_SEL15 OFFSET(15) NUMBITS(1) [],
-        EDGE_SEL14 OFFSET(14) NUMBITS(1) [],
-        EDGE_SEL13 OFFSET(13) NUMBITS(1) [],
-        EDGE_SEL12 OFFSET(12) NUMBITS(1) [],
-        EDGE_SEL11 OFFSET(11) NUMBITS(1) [],
-        EDGE_SEL10 OFFSET(10) NUMBITS(1) [],
-        EDGE_SEL9 OFFSET(9) NUMBITS(1) [],
-        EDGE_SEL8 OFFSET(8) NUMBITS(1) [],
-        EDGE_SEL7 OFFSET(7) NUMBITS(1) [],
-        EDGE_SEL6 OFFSET(6) NUMBITS(1) [],
-        EDGE_SEL5 OFFSET(5) NUMBITS(1) [],
-        EDGE_SEL4 OFFSET(4) NUMBITS(1) [],
-        EDGE_SEL3 OFFSET(3) NUMBITS(1) [],
-        EDGE_SEL2 OFFSET(2) NUMBITS(1) [],
-        EDGE_SEL1 OFFSET(1) NUMBITS(1) [],
-        EDGE_SEL0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    DR_SET [
-        // The set register of DR
-        DR_SET31 OFFSET(31) NUMBITS(1) [],
-        DR_SET30 OFFSET(30) NUMBITS(1) [],
-        DR_SET29 OFFSET(29) NUMBITS(1) [],
-        DR_SET28 OFFSET(28) NUMBITS(1) [],
-        DR_SET27 OFFSET(27) NUMBITS(1) [],
-        DR_SET26 OFFSET(26) NUMBITS(1) [],
-        DR_SET25 OFFSET(25) NUMBITS(1) [],
-        DR_SET24 OFFSET(24) NUMBITS(1) [],
-        DR_SET23 OFFSET(23) NUMBITS(1) [],
-        DR_SET22 OFFSET(22) NUMBITS(1) [],
-        DR_SET21 OFFSET(21) NUMBITS(1) [],
-        DR_SET20 OFFSET(20) NUMBITS(1) [],
-        DR_SET19 OFFSET(19) NUMBITS(1) [],
-        DR_SET18 OFFSET(18) NUMBITS(1) [],
-        DR_SET17 OFFSET(17) NUMBITS(1) [],
-        DR_SET16 OFFSET(16) NUMBITS(1) [],
-        DR_SET15 OFFSET(15) NUMBITS(1) [],
-        DR_SET14 OFFSET(14) NUMBITS(1) [],
-        DR_SET13 OFFSET(13) NUMBITS(1) [],
-        DR_SET12 OFFSET(12) NUMBITS(1) [],
-        DR_SET11 OFFSET(11) NUMBITS(1) [],
-        DR_SET10 OFFSET(10) NUMBITS(1) [],
-        DR_SET9 OFFSET(9) NUMBITS(1) [],
-        DR_SET8 OFFSET(8) NUMBITS(1) [],
-        DR_SET7 OFFSET(7) NUMBITS(1) [],
-        DR_SET6 OFFSET(6) NUMBITS(1) [],
-        DR_SET5 OFFSET(5) NUMBITS(1) [],
-        DR_SET4 OFFSET(4) NUMBITS(1) [],
-        DR_SET3 OFFSET(3) NUMBITS(1) [],
-        DR_SET2 OFFSET(2) NUMBITS(1) [],
-        DR_SET1 OFFSET(1) NUMBITS(1) [],
-        DR_SET0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    DR_CLEAR [
-        // The clear register of DR
-        DR_CLEAR31 OFFSET(31) NUMBITS(1) [],
-        DR_CLEAR30 OFFSET(30) NUMBITS(1) [],
-        DR_CLEAR29 OFFSET(29) NUMBITS(1) [],
-        DR_CLEAR28 OFFSET(28) NUMBITS(1) [],
-        DR_CLEAR27 OFFSET(27) NUMBITS(1) [],
-        DR_CLEAR26 OFFSET(26) NUMBITS(1) [],
-        DR_CLEAR25 OFFSET(25) NUMBITS(1) [],
-        DR_CLEAR24 OFFSET(24) NUMBITS(1) [],
-        DR_CLEAR23 OFFSET(23) NUMBITS(1) [],
-        DR_CLEAR22 OFFSET(22) NUMBITS(1) [],
-        DR_CLEAR21 OFFSET(21) NUMBITS(1) [],
-        DR_CLEAR20 OFFSET(20) NUMBITS(1) [],
-        DR_CLEAR19 OFFSET(19) NUMBITS(1) [],
-        DR_CLEAR18 OFFSET(18) NUMBITS(1) [],
-        DR_CLEAR17 OFFSET(17) NUMBITS(1) [],
-        DR_CLEAR16 OFFSET(16) NUMBITS(1) [],
-        DR_CLEAR15 OFFSET(15) NUMBITS(1) [],
-        DR_CLEAR14 OFFSET(14) NUMBITS(1) [],
-        DR_CLEAR13 OFFSET(13) NUMBITS(1) [],
-        DR_CLEAR12 OFFSET(12) NUMBITS(1) [],
-        DR_CLEAR11 OFFSET(11) NUMBITS(1) [],
-        DR_CLEAR10 OFFSET(10) NUMBITS(1) [],
-        DR_CLEAR9 OFFSET(9) NUMBITS(1) [],
-        DR_CLEAR8 OFFSET(8) NUMBITS(1) [],
-        DR_CLEAR7 OFFSET(7) NUMBITS(1) [],
-        DR_CLEAR6 OFFSET(6) NUMBITS(1) [],
-        DR_CLEAR5 OFFSET(5) NUMBITS(1) [],
-        DR_CLEAR4 OFFSET(4) NUMBITS(1) [],
-        DR_CLEAR3 OFFSET(3) NUMBITS(1) [],
-        DR_CLEAR2 OFFSET(2) NUMBITS(1) [],
-        DR_CLEAR1 OFFSET(1) NUMBITS(1) [],
-        DR_CLEAR0 OFFSET(0) NUMBITS(1) []
-    ],
-
-    DR_TOGGLE [
-        // The toggle register of DR
-        DR_TOGGLE31 OFFSET(31) NUMBITS(1) [],
-        DR_TOGGLE30 OFFSET(30) NUMBITS(1) [],
-        DR_TOGGLE29 OFFSET(29) NUMBITS(1) [],
-        DR_TOGGLE28 OFFSET(28) NUMBITS(1) [],
-        DR_TOGGLE27 OFFSET(27) NUMBITS(1) [],
-        DR_TOGGLE26 OFFSET(26) NUMBITS(1) [],
-        DR_TOGGLE25 OFFSET(25) NUMBITS(1) [],
-        DR_TOGGLE24 OFFSET(24) NUMBITS(1) [],
-        DR_TOGGLE23 OFFSET(23) NUMBITS(1) [],
-        DR_TOGGLE22 OFFSET(22) NUMBITS(1) [],
-        DR_TOGGLE21 OFFSET(21) NUMBITS(1) [],
-        DR_TOGGLE20 OFFSET(20) NUMBITS(1) [],
-        DR_TOGGLE19 OFFSET(19) NUMBITS(1) [],
-        DR_TOGGLE18 OFFSET(18) NUMBITS(1) [],
-        DR_TOGGLE17 OFFSET(17) NUMBITS(1) [],
-        DR_TOGGLE16 OFFSET(16) NUMBITS(1) [],
-        DR_TOGGLE15 OFFSET(15) NUMBITS(1) [],
-        DR_TOGGLE14 OFFSET(14) NUMBITS(1) [],
-        DR_TOGGLE13 OFFSET(13) NUMBITS(1) [],
-        DR_TOGGLE12 OFFSET(12) NUMBITS(1) [],
-        DR_TOGGLE11 OFFSET(11) NUMBITS(1) [],
-        DR_TOGGLE10 OFFSET(10) NUMBITS(1) [],
-        DR_TOGGLE9 OFFSET(9) NUMBITS(1) [],
-        DR_TOGGLE8 OFFSET(8) NUMBITS(1) [],
-        DR_TOGGLE7 OFFSET(7) NUMBITS(1) [],
-        DR_TOGGLE6 OFFSET(6) NUMBITS(1) [],
-        DR_TOGGLE5 OFFSET(5) NUMBITS(1) [],
-        DR_TOGGLE4 OFFSET(4) NUMBITS(1) [],
-        DR_TOGGLE3 OFFSET(3) NUMBITS(1) [],
-        DR_TOGGLE2 OFFSET(2) NUMBITS(1) [],
-        DR_TOGGLE1 OFFSET(1) NUMBITS(1) [],
-        DR_TOGGLE0 OFFSET(0) NUMBITS(1) []
-    ]
-];
 
 const GPIO1_BASE: StaticRef<GpioRegisters> =
     unsafe { StaticRef::new(0x401B8000 as *const GpioRegisters) };
@@ -419,24 +76,25 @@ const GPIO4_BASE: StaticRef<GpioRegisters> =
 const GPIO5_BASE: StaticRef<GpioRegisters> =
     unsafe { StaticRef::new(0x400C0000 as *const GpioRegisters) };
 
-/// Imxrt1050-evkb has 5 GPIO ports labeled from 1-5 [^1]. This is represented
-/// by three bits.
-///
-/// [^1]: 12.5.1 GPIO memory map, page 1009 of the Reference Manual.
-#[repr(u16)]
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub enum GpioPort {
-    GPIO1 = 0b000,
-    GPIO2 = 0b001,
-    GPIO3 = 0b010,
-    GPIO4 = 0b011,
-    GPIO5 = 0b100,
+enum_from_primitive! {
+    /// Imxrt1050-evkb has 5 GPIO ports labeled from 1-5 [^1]. This is represented
+    /// by three bits.
+    ///
+    /// [^1]: 12.5.1 GPIO memory map, page 1009 of the Reference Manual.
+    #[repr(u16)]
+    enum GpioPort {
+        GPIO1 = 0b000,
+        GPIO2 = 0b001,
+        GPIO3 = 0b010,
+        GPIO4 = 0b011,
+        GPIO5 = 0b100,
+    }
 }
 
 /// Creates a GPIO ID
 ///
 /// Low 6 bits are the GPIO offset; the '17' in GPIO2[17]
-/// Next 3 bits are the GPIO port; the '2' in GPIO2[17]
+/// Next 3 bits are the GPIO port; the '2' in GPIO2[17] (base 0 index, 2 -> 1)
 const fn gpio_id(port: GpioPort, offset: u16) -> u16 {
     ((port as u16) << 6) | offset & 0x3F
 }
@@ -588,13 +246,9 @@ pub enum PinId {
 }
 
 impl PinId {
-    /// Returns the port number as a base 0 index
-    ///
-    /// GPIO5 -> 4
-    /// GPIO2 -> 1
-    /// GPIO1 -> 0
-    const fn port(self) -> usize {
-        (self as u16 >> 6) as usize
+    /// Returns the port
+    fn port(self) -> GpioPort {
+        GpioPort::from_u16((self as u16) >> 6).unwrap()
     }
     /// Returns the pin offset, half-closed range [0, 32)
     const fn offset(self) -> usize {
@@ -602,35 +256,109 @@ impl PinId {
     }
 }
 
-enum_from_primitive! {
-    #[repr(u32)]
-    #[derive(PartialEq)]
-
-    /// GPIO pin mode
-    /// In order to set alternate functions such as LPI2C or LPUART,
-    /// you will need to use iomuxc enable_sw_mux_ctl_pad_gpio with
-    /// the specific MUX_MODE according to the reference manual (Chapter 11).
-    /// For the gpio mode, input or output we set the GDIR pin accordingly [^1]
-    ///
-    /// [^1]: 12.4.3. GPIO Programming, page 1008 of the Reference Manual
-    pub enum Mode {
-        Input = 0b00,
-        Output = 0b01
-    }
+/// GPIO pin mode
+///
+/// This describes the pin direction when it's a _GPIO pin_.
+/// It does not describe the direction for other I/O, like LPI2C
+/// or LPUART.
+///
+/// In order to set alternate functions such as LPI2C or LPUART,
+/// you will need to use iomuxc enable_sw_mux_ctl_pad_gpio with
+/// the specific MUX_MODE according to the reference manual (Chapter 11).
+/// For the gpio mode, input or output we set the GDIR pin accordingly [^1]
+///
+/// [^1]: 12.4.3. GPIO Programming, page 1008 of the Reference Manual
+pub enum Mode {
+    Input = 0b00,
+    Output = 0b01,
 }
 
-pub struct Port<'a> {
+/// A GPIO port, like `GPIO3`
+///
+/// `Port`s contain collections of pins. Use `Port`s to access pin by their
+/// GPIO offset. See the module-level docs for an example.
+pub struct Port<'a, const N: usize> {
     registers: StaticRef<GpioRegisters>,
     clock: PortClock<'a>,
-    pins: [Pin<'a>; 32],
+    pins: [Pin<'a>; N],
 }
 
-impl<'a> Port<'a> {
-    const fn new(registers: StaticRef<GpioRegisters>, clock: PortClock<'a>) -> Self {
+/// Implementation of a port, generic over the number of
+/// pins
+impl<'a, const N: usize> Port<'a, N> {
+    const fn new(
+        registers: StaticRef<GpioRegisters>,
+        clock: PortClock<'a>,
+        pins: [Pin<'a>; N],
+    ) -> Self {
         Self {
             registers,
             clock,
-            pins: [
+            pins,
+        }
+    }
+
+    pub fn is_enabled_clock(&self) -> bool {
+        self.clock.is_enabled()
+    }
+
+    pub fn enable_clock(&self) {
+        self.clock.enable();
+    }
+
+    pub fn disable_clock(&self) {
+        self.clock.disable();
+    }
+
+    /// Returns the GPIO pin in this port
+    ///
+    /// This is an alterative API to [`Ports::pin`] that maps more closely
+    /// to the GPIO offset.
+    pub const fn pin(&self, offset: usize) -> &Pin<'a> {
+        &self.pins[offset]
+    }
+
+    pub fn handle_interrupt(&self) {
+        let imr_val: u32 = self.registers.imr.get();
+
+        // Read the `ISR` register and toggle the appropriate bits in
+        // `isr`. Once that is done, write the value of `isr` back. We
+        // can have a situation where memory value of `ISR` could have
+        // changed due to an external interrupt. `ISR` is a read/clear write
+        // 1 register (`rc_w1`). So, we only clear bits whose value has been
+        // transferred to `isr`.
+        let isr_val = unsafe {
+            atomic(|| {
+                let isr_val = self.registers.isr.get();
+                self.registers.isr.set(isr_val);
+                isr_val
+            })
+        };
+
+        BitOffsets(isr_val)
+            // Did we enable this interrupt?
+            .filter(|offset| imr_val & (1 << offset) != 0)
+            // Do we have a pin for that interrupt? (Likely)
+            .filter_map(|offset| self.pins.get(offset as usize))
+            // Call client
+            .for_each(|pin| {
+                pin.client.map(|client| client.fired());
+            });
+    }
+}
+
+type GPIO1<'a> = Port<'a, 32>;
+type GPIO2<'a> = Port<'a, 32>;
+type GPIO3<'a> = Port<'a, 28>;
+type GPIO4<'a> = Port<'a, 32>;
+type GPIO5<'a> = Port<'a, 3>;
+
+impl<'a> Port<'a, 32> {
+    const fn new_32(registers: StaticRef<GpioRegisters>, clock: PortClock<'a>) -> Self {
+        Self::new(
+            registers,
+            clock,
+            [
                 Pin::new(registers, 00),
                 Pin::new(registers, 01),
                 Pin::new(registers, 02),
@@ -664,80 +392,130 @@ impl<'a> Port<'a> {
                 Pin::new(registers, 30),
                 Pin::new(registers, 31),
             ],
-        }
+        )
     }
-
-    pub fn is_enabled_clock(&self) -> bool {
-        self.clock.is_enabled()
+    const fn gpio1(ccm: &'a ccm::Ccm) -> GPIO1<'a> {
+        Self::new_32(
+            GPIO1_BASE,
+            PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
+        )
     }
-
-    pub fn enable_clock(&self) {
-        self.clock.enable();
+    const fn gpio2(ccm: &'a ccm::Ccm) -> GPIO2<'a> {
+        Self::new_32(
+            GPIO2_BASE,
+            PortClock(ccm::PeripheralClock::ccgr0(ccm, ccm::HCLK0::GPIO2)),
+        )
     }
-
-    pub fn disable_clock(&self) {
-        self.clock.disable();
-    }
-
-    pub fn handle_interrupt(&self) {
-        let imr_val: u32 = self.registers.imr.get();
-
-        // Read the `ISR` register and toggle the appropriate bits in
-        // `isr`. Once that is done, write the value of `isr` back. We
-        // can have a situation where memory value of `ISR` could have
-        // changed due to an external interrupt. `ISR` is a read/clear write
-        // 1 register (`rc_w1`). So, we only clear bits whose value has been
-        // transferred to `isr`.
-        let isr_val = unsafe {
-            atomic(|| {
-                let isr_val = self.registers.isr.get();
-                self.registers.isr.set(isr_val);
-                isr_val
-            })
-        };
-
-        BitOffsets(isr_val)
-            .filter(|offset| imr_val & (1 << offset) != 0)
-            .for_each(|offset| {
-                self.pins[offset as usize]
-                    .client
-                    .map(|client| client.fired());
-            });
+    const fn gpio4(ccm: &'a ccm::Ccm) -> GPIO4<'a> {
+        Self::new_32(
+            GPIO4_BASE,
+            PortClock(ccm::PeripheralClock::ccgr3(ccm, ccm::HCLK3::GPIO4)),
+        )
     }
 }
 
-pub struct Ports<'a>([Port<'a>; 5]);
+impl<'a> Port<'a, 28> {
+    const fn new_28(registers: StaticRef<GpioRegisters>, clock: PortClock<'a>) -> Self {
+        Self::new(
+            registers,
+            clock,
+            [
+                Pin::new(registers, 00),
+                Pin::new(registers, 01),
+                Pin::new(registers, 02),
+                Pin::new(registers, 03),
+                Pin::new(registers, 04),
+                Pin::new(registers, 05),
+                Pin::new(registers, 06),
+                Pin::new(registers, 07),
+                Pin::new(registers, 08),
+                Pin::new(registers, 09),
+                Pin::new(registers, 10),
+                Pin::new(registers, 11),
+                Pin::new(registers, 12),
+                Pin::new(registers, 13),
+                Pin::new(registers, 14),
+                Pin::new(registers, 15),
+                Pin::new(registers, 16),
+                Pin::new(registers, 17),
+                Pin::new(registers, 18),
+                Pin::new(registers, 19),
+                Pin::new(registers, 20),
+                Pin::new(registers, 21),
+                Pin::new(registers, 22),
+                Pin::new(registers, 23),
+                Pin::new(registers, 24),
+                Pin::new(registers, 25),
+                Pin::new(registers, 26),
+                Pin::new(registers, 27),
+            ],
+        )
+    }
+    const fn gpio3(ccm: &'a ccm::Ccm) -> GPIO3<'a> {
+        Self::new_28(
+            GPIO3_BASE,
+            PortClock(ccm::PeripheralClock::ccgr2(ccm, ccm::HCLK2::GPIO3)),
+        )
+    }
+}
+
+impl<'a> Port<'a, 3> {
+    const fn new_3(registers: StaticRef<GpioRegisters>, clock: PortClock<'a>) -> Self {
+        Self::new(
+            registers,
+            clock,
+            [
+                Pin::new(registers, 00),
+                Pin::new(registers, 01),
+                Pin::new(registers, 02),
+            ],
+        )
+    }
+    const fn gpio5(ccm: &'a ccm::Ccm) -> GPIO5<'a> {
+        Self::new_3(
+            GPIO5_BASE,
+            PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO5)),
+        )
+    }
+}
+
+/// All GPIO ports
+///
+/// Use [`new`](Ports::new) to create all GPIO ports, then use it to access GPIO
+/// pins and individual ports. See the public members for the GPIO ports
+#[non_exhaustive] // Fast GPIOs 6 through 9 not implemented
+pub struct Ports<'a> {
+    pub gpio1: GPIO1<'a>,
+    pub gpio2: GPIO2<'a>,
+    pub gpio3: GPIO3<'a>,
+    pub gpio4: GPIO4<'a>,
+    pub gpio5: GPIO5<'a>,
+}
 
 impl<'a> Ports<'a> {
     pub const fn new(ccm: &'a ccm::Ccm) -> Self {
-        Ports([
-            Port::new(
-                GPIO1_BASE,
-                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
-            ),
-            Port::new(
-                GPIO2_BASE,
-                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
-            ),
-            Port::new(
-                GPIO3_BASE,
-                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
-            ),
-            Port::new(
-                GPIO4_BASE,
-                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
-            ),
-            Port::new(
-                GPIO5_BASE,
-                PortClock(ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPIO1)),
-            ),
-        ])
+        Self {
+            gpio1: GPIO1::gpio1(ccm),
+            gpio2: GPIO2::gpio2(ccm),
+            gpio3: GPIO3::gpio3(ccm),
+            gpio4: GPIO4::gpio4(ccm),
+            gpio5: GPIO5::gpio5(ccm),
+        }
     }
-    pub const fn pin(&self, pin: PinId) -> &Pin<'a> {
-        &self.0[pin.port()].pins[pin.offset()]
-    }
-    pub const fn port(&self, port: GpioPort) -> &Port<'a> {
-        &self.0[port as usize]
+
+    /// Returns a GPIO pin
+    ///
+    /// For an interface that maps more closely to the numbers in
+    /// `GPIO3[17]`, use a combination of the [`Ports`] members, and [`Port::pin()`].
+    /// See the module-level docs for an example.
+    pub fn pin(&self, pin: PinId) -> &Pin<'a> {
+        match pin.port() {
+            GpioPort::GPIO1 => &self.gpio1.pins[pin.offset()],
+            GpioPort::GPIO2 => &self.gpio2.pins[pin.offset()],
+            GpioPort::GPIO3 => &self.gpio3.pins[pin.offset()],
+            GpioPort::GPIO4 => &self.gpio4.pins[pin.offset()],
+            GpioPort::GPIO5 => &self.gpio5.pins[pin.offset()],
+        }
     }
 }
 
@@ -757,10 +535,37 @@ impl ClockInterface for PortClock<'_> {
     }
 }
 
+/// A GPIO pin, like `GPIO3[17]`
+///
+/// `Pin` implements the `hil::gpio` traits. To acquire a `Pin`,
+///
+/// - use [`Ports::pin`] to reference a `Pin` by a [`PinId`], or
+/// - use a combination of the ports on [`Ports`], and [`Port::pin`]
 pub struct Pin<'a> {
     registers: StaticRef<GpioRegisters>,
     offset: usize,
     client: OptionalCell<&'a dyn hil::gpio::Client>,
+}
+
+trait U32Ext {
+    fn set_bit(self, offset: usize) -> Self;
+    fn clear_bit(self, offset: usize) -> Self;
+    fn is_bit_set(self, offset: usize) -> bool;
+}
+
+impl U32Ext for u32 {
+    #[inline(always)]
+    fn set_bit(self, offset: usize) -> u32 {
+        self | (1 << offset)
+    }
+    #[inline(always)]
+    fn clear_bit(self, offset: usize) -> u32 {
+        self & !(1 << offset)
+    }
+    #[inline(always)]
+    fn is_bit_set(self, offset: usize) -> bool {
+        (self & (1 << offset)) != 0
+    }
 }
 
 impl<'a> Pin<'a> {
@@ -773,15 +578,18 @@ impl<'a> Pin<'a> {
     }
 
     fn get_mode(&self) -> Mode {
-        let val = self.registers.gdir.get() >> self.offset;
-        Mode::from_u32(val).unwrap_or(Mode::Input)
+        if self.registers.gdir.get().is_bit_set(self.offset) {
+            Mode::Output
+        } else {
+            Mode::Input
+        }
     }
 
     fn set_mode(&self, mode: Mode) {
         let gdir = self.registers.gdir.get();
         let gdir = match mode {
-            Mode::Input => gdir & !(1 << self.offset),
-            Mode::Output => gdir | (1 << self.offset),
+            Mode::Input => gdir.clear_bit(self.offset),
+            Mode::Output => gdir.set_bit(self.offset),
         };
         self.registers.gdir.set(gdir);
     }
@@ -795,7 +603,7 @@ impl<'a> Pin<'a> {
     }
 
     fn is_output_high(&self) -> bool {
-        self.registers.dr.get() & (1 << self.offset) != 0
+        self.registers.dr.get().is_bit_set(self.offset)
     }
 
     fn toggle_output(&self) -> bool {
@@ -804,18 +612,18 @@ impl<'a> Pin<'a> {
     }
 
     fn read_input(&self) -> bool {
-        self.registers.psr.get() & (1 << self.offset) != 0
+        self.registers.psr.get().is_bit_set(self.offset)
     }
 
     fn mask_interrupt(&self) {
         let imr = self.registers.imr.get();
-        let imr = imr & !(1 << self.offset);
+        let imr = imr.clear_bit(self.offset);
         self.registers.imr.set(imr);
     }
 
     fn unmask_interrupt(&self) {
         let imr = self.registers.imr.get();
-        let imr = imr | (1 << self.offset);
+        let imr = imr.set_bit(self.offset);
         self.registers.imr.set(imr);
     }
 
@@ -829,11 +637,12 @@ impl<'a> Pin<'a> {
         const FALLING_EDGE_SENSITIVE: u32 = 0b11;
 
         let edge_sel = self.registers.edge_sel.get();
-        let icr_offset = self.offset & !0x01;
+        let icr_offset = (self.offset % 16) * 2;
 
         let sensitive = match sensitive {
             EitherEdge => {
-                self.registers.edge_sel.set(edge_sel | (1 << self.offset));
+                let edge_sel = edge_sel.set_bit(self.offset);
+                self.registers.edge_sel.set(edge_sel);
                 // A high EDGE_SEL disregards the corresponding ICR[1|2] setting
                 return;
             }
@@ -841,8 +650,8 @@ impl<'a> Pin<'a> {
             FallingEdge => FALLING_EDGE_SENSITIVE << icr_offset,
         };
 
-        // Clear edge select
-        self.registers.edge_sel.set(edge_sel & !(1 << self.offset));
+        let edge_sel = edge_sel.clear_bit(self.offset);
+        self.registers.edge_sel.set(edge_sel);
 
         let icr_mask = 0b11 << icr_offset;
         if self.offset < 16 {
@@ -898,14 +707,6 @@ impl hil::gpio::Configure for Pin<'_> {
             Mode::Output => hil::gpio::Configuration::Output,
         }
     }
-
-    fn is_input(&self) -> bool {
-        self.get_mode() == Mode::Input
-    }
-
-    fn is_output(&self) -> bool {
-        self.get_mode() == Mode::Output
-    }
 }
 
 impl hil::gpio::Output for Pin<'_> {
@@ -956,50 +757,65 @@ impl<'a> hil::gpio::Interrupt<'a> for Pin<'a> {
     }
 
     fn is_pending(&self) -> bool {
-        self.registers.isr.get() & (1 << self.offset) != 0
+        self.registers.isr.get().is_bit_set(self.offset)
     }
 }
 
 /// An iterator that returns the offsets of each high bit
 ///
-/// Each offset is returned only once. Order of returned
-/// offsets is not guaranteed.
+/// Each offset is returned only once. There is no guarantee
+/// for iteration order.
 struct BitOffsets(u32);
 
 impl Iterator for BitOffsets {
     type Item = u32;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.0 == 0 {
-            None
-        } else {
+        if self.0 != 0 {
             let offset = self.0.trailing_zeros();
             self.0 &= self.0 - 1;
             Some(offset)
+        } else {
+            None
         }
     }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let popcnt = self.0.count_ones() as usize;
+        (popcnt, Some(popcnt))
+    }
 }
+
+impl ExactSizeIterator for BitOffsets {}
 
 #[cfg(test)]
 mod tests {
     use super::BitOffsets;
+    use std::collections::HashSet;
 
     #[test]
-    fn bit_offset_iterator() {
-        assert_eq!(BitOffsets(0).next(), None);
+    fn bit_offsets() {
+        fn check(word: u32, expected: impl ExactSizeIterator<Item = u32>) {
+            let offsets = BitOffsets(word);
+            assert_eq!(offsets.len(), expected.len());
 
-        let iter = BitOffsets(u32::max_value());
-        let expected: Vec<_> = (0..32).collect();
-        let actual: Vec<_> = iter.collect();
-        assert_eq!(actual, expected);
+            let word = offsets.0;
+            let expected: HashSet<_> = expected.collect();
+            let actual: HashSet<_> = offsets.collect();
+            let mut ordered_expected: Vec<_> = expected.iter().cloned().collect();
+            ordered_expected.sort_unstable();
+            let mut ordered_actual: Vec<_> = actual.iter().cloned().collect();
+            ordered_actual.sort_unstable();
+            assert_eq!(
+                expected, actual,
+                "\n  Ordered left: {:?}\n Ordered right: {:?}\n Word: {:#b}",
+                ordered_expected, ordered_actual, word
+            );
+        }
 
-        let iter = BitOffsets(0x5555_5555);
-        let expected: Vec<_> = (0..32).step_by(2).collect();
-        let actual: Vec<_> = iter.collect();
-        assert_eq!(actual, expected);
-
-        let iter = BitOffsets(0xAAAA_AAAA);
-        let expected: Vec<_> = (0..32).skip(1).step_by(2).collect();
-        let actual: Vec<_> = iter.collect();
-        assert_eq!(actual, expected);
+        check(0, std::iter::empty());
+        check(u32::max_value(), 0..32);
+        check(u32::max_value() >> 1, 0..31);
+        check(u32::max_value() << 1, 1..32);
+        check(0x5555_5555, (0..32).step_by(2));
+        check(0xAAAA_AAAA, (0..32).skip(1).step_by(2));
     }
 }
