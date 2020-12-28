@@ -7,12 +7,14 @@
 // Disable this attribute when documenting, as a workaround for
 // https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
-#![feature(const_in_array_repeat_expressions)]
 #![deny(missing_docs)]
 
+use capsules::virtual_aes_ccm::MuxAES128CCM;
 use capsules::virtual_alarm::VirtualMuxAlarm;
 use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
+use kernel::hil::led::LedLow;
+use kernel::hil::symmetric_encryption::AES128;
 use kernel::hil::time::Counter;
 #[allow(unused_imports)]
 use kernel::{capabilities, create_capability, debug, debug_gpio, debug_verbose, static_init};
@@ -80,7 +82,10 @@ pub struct Platform {
     >,
     console: &'static capsules::console::Console<'static>,
     gpio: &'static capsules::gpio::GPIO<'static, nrf52840::gpio::GPIOPin<'static>>,
-    led: &'static capsules::led::LED<'static, nrf52840::gpio::GPIOPin<'static>>,
+    led: &'static capsules::led::LedDriver<
+        'static,
+        LedLow<'static, nrf52840::gpio::GPIOPin<'static>>,
+    >,
     rng: &'static capsules::rng::RngDriver<'static>,
     temp: &'static capsules::temperature::TemperatureSensor<'static>,
     ipc: kernel::ipc::IPC,
@@ -184,25 +189,15 @@ pub unsafe fn reset_handler() {
     .finalize(components::button_component_buf!(nrf52840::gpio::GPIOPin));
 
     let led = components::led::LedsComponent::new(components::led_component_helper!(
-        nrf52840::gpio::GPIOPin,
-        (
-            &base_peripherals.gpio_port[LED1_PIN],
-            kernel::hil::gpio::ActivationMode::ActiveLow
-        ),
-        (
-            &base_peripherals.gpio_port[LED2_R_PIN],
-            kernel::hil::gpio::ActivationMode::ActiveLow
-        ),
-        (
-            &base_peripherals.gpio_port[LED2_G_PIN],
-            kernel::hil::gpio::ActivationMode::ActiveLow
-        ),
-        (
-            &base_peripherals.gpio_port[LED2_B_PIN],
-            kernel::hil::gpio::ActivationMode::ActiveLow
-        )
+        LedLow<'static, nrf52840::gpio::GPIOPin>,
+        LedLow::new(&base_peripherals.gpio_port[LED1_PIN]),
+        LedLow::new(&base_peripherals.gpio_port[LED2_R_PIN]),
+        LedLow::new(&base_peripherals.gpio_port[LED2_G_PIN]),
+        LedLow::new(&base_peripherals.gpio_port[LED2_B_PIN]),
     ))
-    .finalize(components::led_component_buf!(nrf52840::gpio::GPIOPin));
+    .finalize(components::led_component_buf!(
+        LedLow<'static, nrf52840::gpio::GPIOPin>
+    ));
 
     let chip = static_init!(
         nrf52840::chip::NRF52<Nrf52840DefaultPeripherals>,
@@ -273,10 +268,21 @@ pub unsafe fn reset_handler() {
         nrf52_components::BLEComponent::new(board_kernel, &base_peripherals.ble_radio, mux_alarm)
             .finalize(());
 
+    let aes_mux = static_init!(
+        MuxAES128CCM<'static, nrf52840::aes::AesECB>,
+        MuxAES128CCM::new(&base_peripherals.ecb, dynamic_deferred_caller)
+    );
+    base_peripherals.ecb.set_client(aes_mux);
+    aes_mux.initialize_callback_handle(
+        dynamic_deferred_caller
+            .register(aes_mux)
+            .expect("no deferred call slot available for ccm mux"),
+    );
+
     let (ieee802154_radio, _mux_mac) = components::ieee802154::Ieee802154Component::new(
         board_kernel,
         &base_peripherals.ieee802154_radio,
-        &base_peripherals.ecb,
+        aes_mux,
         PAN_ID,
         SRC_MAC,
     )

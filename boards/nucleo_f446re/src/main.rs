@@ -6,7 +6,6 @@
 // Disable this attribute when documenting, as a workaround for
 // https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
-#![feature(const_in_array_repeat_expressions)]
 #![deny(missing_docs)]
 
 use capsules::virtual_alarm::VirtualMuxAlarm;
@@ -14,6 +13,7 @@ use kernel::capabilities;
 use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
 use kernel::hil::gpio::Configure;
+use kernel::hil::led::LedHigh;
 use kernel::Platform;
 use kernel::{create_capability, debug, static_init};
 use stm32f446re::interrupt_service::Stm32f446reDefaultPeripherals;
@@ -44,14 +44,17 @@ const FAULT_RESPONSE: kernel::procs::FaultResponse = kernel::procs::FaultRespons
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
 #[link_section = ".stack_buffer"]
-pub static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
+pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 
 /// A structure representing this platform that holds references to all
 /// capsules for this platform.
 struct NucleoF446RE {
     console: &'static capsules::console::Console<'static>,
     ipc: kernel::ipc::IPC,
-    led: &'static capsules::led::LED<'static, stm32f446re::gpio::Pin<'static>>,
+    led: &'static capsules::led::LedDriver<
+        'static,
+        LedHigh<'static, stm32f446re::gpio::Pin<'static>>,
+    >,
     button: &'static capsules::button::Button<'static, stm32f446re::gpio::Pin<'static>>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
@@ -269,13 +272,12 @@ pub unsafe fn reset_handler() {
 
     // Clock to Port A is enabled in `set_pin_primary_functions()`
     let led = components::led::LedsComponent::new(components::led_component_helper!(
-        stm32f446re::gpio::Pin,
-        (
-            gpio_ports.get_pin(stm32f446re::gpio::PinId::PA05).unwrap(),
-            kernel::hil::gpio::ActivationMode::ActiveHigh
-        )
+        LedHigh<'static, stm32f446re::gpio::Pin>,
+        LedHigh::new(gpio_ports.get_pin(stm32f446re::gpio::PinId::PA05).unwrap()),
     ))
-    .finalize(components::led_component_buf!(stm32f446re::gpio::Pin));
+    .finalize(components::led_component_buf!(
+        LedHigh<'static, stm32f446re::gpio::Pin>
+    ));
 
     // BUTTONs
     let button = components::button::ButtonComponent::new(

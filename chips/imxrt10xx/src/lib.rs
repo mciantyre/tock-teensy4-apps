@@ -5,7 +5,7 @@
 #![crate_name = "imxrt10xx"]
 #![crate_type = "rlib"]
 #![feature(const_fn)]
-#![no_std]
+#![cfg_attr(target_arch = "arm", no_std)] // Support unit testing on your development host
 
 pub mod chip;
 pub mod nvic;

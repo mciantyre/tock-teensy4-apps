@@ -7,7 +7,6 @@
 // Disable this attribute when documenting, as a workaround for
 // https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
-#![feature(const_in_array_repeat_expressions)]
 #![deny(missing_docs)]
 
 use capsules::virtual_alarm::VirtualMuxAlarm;
@@ -18,6 +17,7 @@ use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferred
 use kernel::component::Component;
 use kernel::hil;
 use kernel::hil::i2c::I2CMaster;
+use kernel::hil::led::LedLow;
 use kernel::hil::Controller;
 use kernel::Platform;
 #[allow(unused_imports)]
@@ -67,7 +67,7 @@ struct Hail {
     >,
     nrf51822: &'static capsules::nrf51822_serialization::Nrf51822Serialization<'static>,
     adc: &'static capsules::adc::AdcDedicated<'static, sam4l::adc::Adc>,
-    led: &'static capsules::led::LED<'static, sam4l::gpio::GPIOPin<'static>>,
+    led: &'static capsules::led::LedDriver<'static, LedLow<'static, sam4l::gpio::GPIOPin<'static>>>,
     button: &'static capsules::button::Button<'static, sam4l::gpio::GPIOPin<'static>>,
     rng: &'static capsules::rng::RngDriver<'static>,
     ipc: kernel::ipc::IPC,
@@ -309,21 +309,14 @@ pub unsafe fn reset_handler() {
 
     // LEDs
     let led = components::led::LedsComponent::new(components::led_component_helper!(
-        sam4l::gpio::GPIOPin,
-        (
-            &peripherals.pa[13],
-            kernel::hil::gpio::ActivationMode::ActiveLow
-        ), // Red
-        (
-            &peripherals.pa[15],
-            kernel::hil::gpio::ActivationMode::ActiveLow
-        ), // Green
-        (
-            &peripherals.pa[14],
-            kernel::hil::gpio::ActivationMode::ActiveLow
-        ) // Blue
+        LedLow<'static, sam4l::gpio::GPIOPin>,
+        LedLow::new(&peripherals.pa[13]), // Red
+        LedLow::new(&peripherals.pa[15]), // Green
+        LedLow::new(&peripherals.pa[14]), // Blue
     ))
-    .finalize(components::led_component_buf!(sam4l::gpio::GPIOPin));
+    .finalize(components::led_component_buf!(
+        LedLow<'static, sam4l::gpio::GPIOPin>
+    ));
 
     // BUTTONs
     let button = components::button::ButtonComponent::new(
