@@ -29,6 +29,7 @@ pub struct Imxrt10xxDefaultPeripherals {
     pub iomuxc: crate::iomuxc::Iomuxc,
     pub iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs,
     pub ccm: crate::ccm::Ccm,
+    pub ccm_analog: crate::ccm_analog::CcmAnalog,
     pub ports: crate::gpio::Ports<'static>,
     pub lpi2c1: crate::lpi2c::Lpi2c<'static>,
     pub lpuart1: crate::lpuart::Lpuart<'static>,
@@ -43,6 +44,7 @@ impl Imxrt10xxDefaultPeripherals {
             iomuxc: crate::iomuxc::Iomuxc::new(),
             iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs::new(),
             ccm: crate::ccm::Ccm::new(),
+            ccm_analog: crate::ccm_analog::CcmAnalog::new(),
             ports: crate::gpio::Ports::new(ccm),
             lpi2c1: crate::lpi2c::Lpi2c::new_lpi2c1(ccm),
             lpuart1: crate::lpuart::Lpuart::new_lpuart1(ccm),
@@ -71,9 +73,7 @@ impl InterruptService<()> for Imxrt10xxDefaultPeripherals {
             nvic::GPIO4_2 => self.ports.gpio4.handle_interrupt(),
             nvic::GPIO5_1 => self.ports.gpio5.handle_interrupt(),
             nvic::GPIO5_2 => self.ports.gpio5.handle_interrupt(),
-            nvic::SNVS_LP_WRAPPER => {
-                debug!("A venit intreruperea de SNVS_LP_WRAPPER");
-            }
+            nvic::SNVS_LP_WRAPPER => debug!("Interrupt: SNVS_LP_WRAPPER"),
             _ => {
                 return false;
             }
