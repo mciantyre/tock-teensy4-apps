@@ -56,7 +56,7 @@ impl kernel::Platform for Teensy40 {
     }
 }
 
-type GptFreq = kernel::hil::time::Freq8MHz;
+type GptFreq = kernel::hil::time::Freq1MHz;
 type Peripherals = imxrt1060::chip::Imxrt10xxDefaultPeripherals<GptFreq>;
 type Chip = imxrt1060::chip::Imxrt10xx<Peripherals>;
 static mut CHIP: Option<&'static Chip> = None;
