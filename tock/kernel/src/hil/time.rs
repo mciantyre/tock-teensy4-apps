@@ -327,28 +327,12 @@ impl Frequency for Freq1KHz {
     }
 }
 
-/// 24,750KHz `Frequency`
+/// 24750KHz `Frequency`
 #[derive(Debug)]
 pub struct Freq24750KHz;
 impl Frequency for Freq24750KHz {
     fn frequency() -> u32 {
         24_750_000
-    }
-}
-
-/// 150MHz `Frequency`
-pub struct Freq150MHz;
-impl Frequency for Freq150MHz {
-    fn frequency() -> u32 {
-        150_000_000
-    }
-}
-
-/// 8MHz `Frequency`
-pub struct Freq8MHz;
-impl Frequency for Freq8MHz {
-    fn frequency() -> u32 {
-        8_000_000
     }
 }
 
