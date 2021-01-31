@@ -12,8 +12,6 @@ pub mod nvic;
 
 // Peripherals
 pub mod ccm;
-pub mod ccm_analog;
-pub mod dcdc;
 pub mod gpio;
 pub mod gpt;
 pub mod iomuxc;
