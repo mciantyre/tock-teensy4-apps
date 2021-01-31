@@ -17,6 +17,7 @@ use kernel::capabilities;
 use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
 use kernel::hil::{gpio::Configure, led::LedHigh};
+use kernel::ClockInterface;
 use kernel::{create_capability, static_init};
 
 /// Number of concurrent processes this platform supports
@@ -34,10 +35,10 @@ struct Teensy40 {
     led:
         &'static capsules::led::LedDriver<'static, LedHigh<'static, imxrt1060::gpio::Pin<'static>>>,
     console: &'static capsules::console::Console<'static>,
-    ipc: kernel::ipc::IPC,
+    ipc: kernel::ipc::IPC<NUM_PROCS>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
-        capsules::virtual_alarm::VirtualMuxAlarm<'static, imxrt1060::gpt::Gpt<'static, GptFreq>>,
+        capsules::virtual_alarm::VirtualMuxAlarm<'static, imxrt1060::gpt::Gpt1<'static>>,
     >,
 }
 
@@ -56,9 +57,7 @@ impl kernel::Platform for Teensy40 {
     }
 }
 
-type GptFreq = kernel::hil::time::Freq1MHz;
-type Peripherals = imxrt1060::chip::Imxrt10xxDefaultPeripherals<GptFreq>;
-type Chip = imxrt1060::chip::Imxrt10xx<Peripherals>;
+type Chip = imxrt1060::chip::Imxrt10xx<imxrt1060::chip::Imxrt10xxDefaultPeripherals>;
 static mut CHIP: Option<&'static Chip> = None;
 
 /// Assert that a given predicate is true at compile time
@@ -122,9 +121,14 @@ fn set_arm_clock(ccm: &imxrt1060::ccm::Ccm, ccm_analog: &imxrt1060::ccm_analog::
 pub unsafe fn reset_handler() {
     imxrt1060::init();
     let ccm = static_init!(imxrt1060::ccm::Ccm, imxrt1060::ccm::Ccm::new());
-    let peripherals = static_init!(Peripherals, Peripherals::new(ccm));
+    let peripherals = static_init!(
+        imxrt1060::chip::Imxrt10xxDefaultPeripherals,
+        imxrt1060::chip::Imxrt10xxDefaultPeripherals::new(ccm)
+    );
     peripherals.ccm.set_low_power_mode();
 
+    peripherals.dcdc.clock().enable();
+    peripherals.dcdc.set_target_vdd_soc(1250);
     set_arm_clock(&peripherals.ccm, &peripherals.ccm_analog);
     // IPG clock is 600MHz / 4 == 150MHz
     peripherals.ccm.set_ipg_divider(4);
@@ -166,12 +170,10 @@ pub unsafe fn reset_handler() {
     peripherals.lpuart2.set_baud();
 
     peripherals.gpt1.enable_clock();
-    peripherals.gpt1.reset();
-    peripherals
-        .gpt1
-        .set_clock_source(imxrt1060::gpt::ClockSource::CrystalOscillator);
-    peripherals.gpt1.set_oscillator_divider(3);
-    peripherals.gpt1.start();
+    peripherals.gpt1.start(
+        peripherals.ccm.perclk_sel(),
+        peripherals.ccm.perclk_divider(),
+    );
 
     cortexm7::nvic::Nvic::new(imxrt1060::nvic::GPT1).enable();
     cortexm7::nvic::Nvic::new(imxrt1060::nvic::LPUART2).enable();
@@ -213,11 +215,10 @@ pub unsafe fn reset_handler() {
 
     // Alarm
     let mux_alarm = components::alarm::AlarmMuxComponent::new(&peripherals.gpt1).finalize(
-        components::alarm_mux_component_helper!(imxrt1060::gpt::Gpt<GptFreq>),
+        components::alarm_mux_component_helper!(imxrt1060::gpt::Gpt1),
     );
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm).finalize(
-        components::alarm_component_helper!(imxrt1060::gpt::Gpt<GptFreq>),
-    );
+    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
+        .finalize(components::alarm_component_helper!(imxrt1060::gpt::Gpt1));
 
     //
     // Capabilities

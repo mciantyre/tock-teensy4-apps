@@ -25,37 +25,39 @@ impl<I: InterruptService<()> + 'static> Imxrt10xx<I> {
     }
 }
 
-pub struct Imxrt10xxDefaultPeripherals<F> {
+pub struct Imxrt10xxDefaultPeripherals {
     pub iomuxc: crate::iomuxc::Iomuxc,
     pub iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs,
-    pub ccm: crate::ccm::Ccm,
+    pub ccm: &'static crate::ccm::Ccm,
+    pub dcdc: crate::dcdc::Dcdc<'static>,
     pub ccm_analog: crate::ccm_analog::CcmAnalog,
     pub ports: crate::gpio::Ports<'static>,
     pub lpi2c1: crate::lpi2c::Lpi2c<'static>,
     pub lpuart1: crate::lpuart::Lpuart<'static>,
     pub lpuart2: crate::lpuart::Lpuart<'static>,
-    pub gpt1: crate::gpt::Gpt<'static, F>,
-    pub gpt2: crate::gpt::Gpt<'static, F>,
+    pub gpt1: crate::gpt::Gpt1<'static>,
+    pub gpt2: crate::gpt::Gpt2<'static>,
 }
 
-impl<F: kernel::hil::time::Frequency> Imxrt10xxDefaultPeripherals<F> {
+impl Imxrt10xxDefaultPeripherals {
     pub const fn new(ccm: &'static crate::ccm::Ccm) -> Self {
         Self {
             iomuxc: crate::iomuxc::Iomuxc::new(),
             iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs::new(),
-            ccm: crate::ccm::Ccm::new(),
+            ccm,
+            dcdc: crate::dcdc::Dcdc::new(ccm),
             ccm_analog: crate::ccm_analog::CcmAnalog::new(),
             ports: crate::gpio::Ports::new(ccm),
             lpi2c1: crate::lpi2c::Lpi2c::new_lpi2c1(ccm),
             lpuart1: crate::lpuart::Lpuart::new_lpuart1(ccm),
             lpuart2: crate::lpuart::Lpuart::new_lpuart2(ccm),
-            gpt1: crate::gpt::Gpt::new_gpt1(ccm),
-            gpt2: crate::gpt::Gpt::new_gpt2(ccm),
+            gpt1: crate::gpt::Gpt1::new_gpt1(ccm),
+            gpt2: crate::gpt::Gpt2::new_gpt2(ccm),
         }
     }
 }
 
-impl<F> InterruptService<()> for Imxrt10xxDefaultPeripherals<F> {
+impl InterruptService<()> for Imxrt10xxDefaultPeripherals {
     unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
         match interrupt {
             nvic::LPUART1 => self.lpuart1.handle_interrupt(),

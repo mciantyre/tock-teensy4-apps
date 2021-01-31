@@ -5,7 +5,6 @@
 #![crate_name = "imxrt10xx"]
 #![crate_type = "rlib"]
 #![feature(const_fn)]
-#![feature(min_const_generics)] // Stabilized in Rust 1.51 (https://github.com/rust-lang/rust/pull/79135)
 #![no_std]
 
 pub mod chip;
@@ -14,6 +13,7 @@ pub mod nvic;
 // Peripherals
 pub mod ccm;
 pub mod ccm_analog;
+pub mod dcdc;
 pub mod gpio;
 pub mod gpt;
 pub mod iomuxc;

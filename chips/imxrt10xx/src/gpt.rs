@@ -1,3 +1,6 @@
+use core::sync::atomic::{AtomicU32, Ordering};
+use cortexm7;
+use cortexm7::support::atomic;
 use kernel::common::cells::OptionalCell;
 use kernel::common::registers::{register_bitfields, ReadOnly, ReadWrite};
 use kernel::common::StaticRef;
@@ -7,6 +10,7 @@ use kernel::ClockInterface;
 use kernel::ReturnCode;
 
 use crate::ccm;
+use crate::nvic;
 
 /// General purpose timers
 #[repr(C)]
@@ -153,35 +157,49 @@ const GPT1_BASE: StaticRef<GptRegisters> =
 const GPT2_BASE: StaticRef<GptRegisters> =
     unsafe { StaticRef::new(0x401F0000 as *const GptRegisters) };
 
-pub struct Gpt<'a, F> {
+pub struct Gpt<'a, S> {
     registers: StaticRef<GptRegisters>,
     clock: GptClock<'a>,
     client: OptionalCell<&'a dyn hil::time::AlarmClient>,
-    _frequency: core::marker::PhantomData<F>,
+    irqn: u32,
+    _selection: core::marker::PhantomData<S>,
 }
 
-impl<'a, F: hil::time::Frequency> Gpt<'a, F> {
+pub type Gpt1<'a> = Gpt<'a, _1>;
+pub type Gpt2<'a> = Gpt<'a, _2>;
+
+impl<'a> Gpt1<'a> {
     pub const fn new_gpt1(ccm: &'a crate::ccm::Ccm) -> Self {
         Gpt::new(
             GPT1_BASE,
+            nvic::GPT1,
             ccm::PeripheralClock::ccgr1(ccm, ccm::HCLK1::GPT1),
         )
     }
+}
+
+impl<'a> Gpt2<'a> {
     pub const fn new_gpt2(ccm: &'a crate::ccm::Ccm) -> Self {
         Gpt::new(
             GPT2_BASE,
+            nvic::GPT2,
             ccm::PeripheralClock::ccgr0(ccm, ccm::HCLK0::GPT2),
         )
     }
 }
 
-impl<'a, F> Gpt<'a, F> {
-    const fn new(registers: StaticRef<GptRegisters>, clock_gate: ccm::PeripheralClock<'a>) -> Self {
+impl<'a, S> Gpt<'a, S> {
+    const fn new(
+        registers: StaticRef<GptRegisters>,
+        irqn: u32,
+        clock_gate: ccm::PeripheralClock<'a>,
+    ) -> Self {
         Gpt {
             registers,
             clock: GptClock(clock_gate),
             client: OptionalCell::empty(),
-            _frequency: core::marker::PhantomData,
+            irqn,
+            _selection: core::marker::PhantomData,
         }
     }
 
@@ -198,109 +216,141 @@ impl<'a, F> Gpt<'a, F> {
     }
 
     pub fn handle_interrupt(&self) {
-        self.registers.sr.write(SR::OF1::SET);
-        self.registers.ir.write(IR::OF1IE::CLEAR);
+        self.registers.sr.modify(SR::OF1::SET);
+        self.registers.ir.modify(IR::OF1IE::CLEAR);
 
         self.client.map(|client| client.alarm());
     }
 
-    /// Set the GPT clock source
-    pub fn set_clock_source(&self, source: ClockSource) {
-        match source {
-            ClockSource::CrystalOscillator => {
-                // Enable 24MHz clock input
-                self.registers
-                    .cr
-                    .modify(CR::EN_24M::SET + CR::CLKSRC::CrystalOscillator);
-            }
-            source => {
-                // Disable 24Mhz clock input from crystal
-                //
-                // We will use the ipg_clk_highfreq provided by perclk_clk_root.
-                // Before calling set_alarm, we assume clock
-                // to GPT1 has been enabled.
-                self.registers
-                    .cr
-                    .modify(CR::EN_24M::CLEAR + CR::CLKSRC.val(source as u32));
-            }
-        }
-    }
-
-    /// Set the GPT clock divider
+    /// Start the GPT, specifying the peripheral clock selection and the peripheral clock divider
     ///
-    /// Clamped between [1, 4096]
-    pub fn set_divider(&self, divider: u32) {
-        let prescaler = divider.min(4096).max(1) - 1;
-        self.registers.pr.modify(PR::PRESCALER.val(prescaler));
-    }
-
-    /// Set the GPT 24MHz oscillator divider
+    /// If you select the crystal oscillator as the periodic clock root, the GPT will divide the
+    /// input clock by 3.
     ///
-    /// Clamped between [1, 16]
-    pub fn set_oscillator_divider(&self, divider: u32) {
-        let prescaler = divider.min(16).max(1) - 1;
-        self.registers.pr.modify(PR::PRESCALER24M.val(prescaler));
-    }
-
-    /// Resets the GPT
-    ///
-    /// When this returns, the GPT is disabled and ready to be configured
-    pub fn reset(&self) {
-        // Disable the GPT
+    /// `divider` must be non-zero.
+    pub fn start(&self, selection: ccm::PerclkClockSel, divider: u8) {
+        // Disable GPT and the GPT interrupt register first
         self.registers.cr.modify(CR::EN::CLEAR);
+
+        self.registers.ir.modify(IR::ROVIE::CLEAR);
+        self.registers.ir.modify(IR::IF1IE::CLEAR);
+        self.registers.ir.modify(IR::IF2IE::CLEAR);
+        self.registers.ir.modify(IR::OF1IE::CLEAR);
+        self.registers.ir.modify(IR::OF2IE::CLEAR);
+        self.registers.ir.modify(IR::OF3IE::CLEAR);
+
+        // Clear Output mode to disconnected
+        self.registers.cr.modify(CR::OM1::CLEAR);
+        self.registers.cr.modify(CR::OM2::CLEAR);
+        self.registers.cr.modify(CR::OM3::CLEAR);
+
+        // Disable Input Capture Mode
+        self.registers.cr.modify(CR::IM1::CLEAR);
+        self.registers.cr.modify(CR::IM2::CLEAR);
 
         // Reset all the registers to the their default values, except EN,
         // ENMOD, STOPEN, DOZEEN, WAITEN, and DBGEN bits in the CR
         self.registers.cr.modify(CR::SWR::SET);
 
-        // Wait until registers are cleared
+        // wait until registers are cleared
         while self.registers.cr.is_set(CR::SWR) {}
-
-        // Disable all interrupts
-        self.registers.ir.set(0);
-        // Clear Output mode to disconnected
-        self.registers
-            .cr
-            .modify(CR::OM1::CLEAR + CR::OM2::CLEAR + CR::OM3::CLEAR);
-        // Disable Input Capture Mode
-        self.registers.cr.modify(CR::IM1::CLEAR + CR::IM2::CLEAR);
 
         // Clear the GPT status register
         self.registers.sr.set(31 as u32);
 
-        self.registers.cr.modify(
-            CR::FRR::SET // Enable free run mode
-                + CR::WAITEN::SET // Enable run in wait mode
-                + CR::STOPEN::SET // Enable run in stop mode
-                + CR::ENMOD::SET, // Bring GPT counter to 0x00000000 when disabled
-        );
+        // Enable free run mode
+        self.registers.cr.modify(CR::FRR::SET);
+
+        // Enable run in wait mode
+        self.registers.cr.modify(CR::WAITEN::SET);
+
+        // Enable run in stop mode
+        self.registers.cr.modify(CR::STOPEN::SET);
+
+        // Bring GPT counter to 0x00000000
+        self.registers.cr.modify(CR::ENMOD::SET);
 
         // Set the value of the Output Compare Register
         self.registers.ocr1.set(0xFFFF_FFFF - 1);
-    }
 
-    /// Start the GPT
-    pub fn start(&self) {
+        match selection {
+            ccm::PerclkClockSel::IPG => {
+                // Disable 24Mhz clock input from crystal
+                self.registers.cr.modify(CR::EN_24M::CLEAR);
+
+                // We will use the ipg_clk_highfreq provided by perclk_clk_root,
+                // which runs at 24.75 MHz. Before calling set_alarm, we assume clock
+                // to GPT1 has been enabled.
+                self.registers.cr.modify(CR::CLKSRC.val(0x2 as u32));
+
+                // We do not prescale the value for the moment. We will do so
+                // after we will set the ARM_PLL1 CLK accordingly.
+                self.registers.pr.modify(PR::PRESCALER.val(0 as u32));
+
+                self.set_frequency(IMXRT1050_IPG_CLOCK_HZ / divider as u32);
+            }
+            ccm::PerclkClockSel::Oscillator => {
+                // Enable 24MHz clock input
+                self.registers
+                    .cr
+                    .modify(CR::EN_24M::SET + CR::CLKSRC::CrystalOscillator);
+
+                // Funknown reasons, the 24HMz prescaler must be non-zero, even
+                // though zero is a valid value according to the reference manual.
+                // If it's not set, the counter doesn't count! Thanks to the se4L
+                // project for adding a comment to their code.
+                //
+                // I'm also finding that it can't be too large; a prescaler of 8
+                // for the 24MHz clock doesn't work!
+                const DEFAULT_PRESCALER: u32 = 3;
+                self.registers
+                    .pr
+                    .write(PR::PRESCALER24M.val(DEFAULT_PRESCALER - 1));
+                self.set_frequency(OSCILLATOR_HZ / DEFAULT_PRESCALER / divider as u32);
+            }
+        }
+
         // Enable the GPT
         self.registers.cr.modify(CR::EN::SET);
+
+        // Enable the Output Compare 1 Interrupt Enable
+        self.registers.ir.modify(IR::OF1IE::SET);
+    }
+
+    fn set_frequency(&self, hz: u32) {
+        let idx = match self.irqn {
+            nvic::GPT1 => 0,
+            nvic::GPT2 => 1,
+            _ => unreachable!(),
+        };
+        GPT_FREQUENCIES[idx].store(hz, Ordering::Release);
     }
 }
 
-/// GPT clock source
-#[repr(u32)]
-pub enum ClockSource {
-    /// No clock
-    NoClock = 0,
-    /// Peripheral Clock (ipg_clk)
-    PeripheralClock = 1,
-    /// High Frequency Reference Clock (ipg_clk_highfreq)
-    HighFrequencyReferenceClock = 2,
-    /// External Clock
-    ExternalClock = 3,
-    /// Low Frequency Reference Clock (ipg_clk_32k)
-    LowFrequencyReferenceClock = 4,
-    /// Crystal oscillator as Reference Clock (ipg_clk_24M)
-    CrystalOscillator = 5,
+/// Assumed IPG clock frequency for the iMXRT1050 processor family.
+///
+/// TODO this is not a constant value; it changes when setting the ARM clock
+/// frequency. Change this after correctly configuring ARM frequency.
+const IMXRT1050_IPG_CLOCK_HZ: u32 = 24_750_000;
+/// Crystal oscillator frequency
+const OSCILLATOR_HZ: u32 = 24_000_000;
+
+/// GPT selection tags
+pub enum _1 {}
+pub enum _2 {}
+
+static GPT_FREQUENCIES: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+impl hil::time::Frequency for _1 {
+    fn frequency() -> u32 {
+        GPT_FREQUENCIES[0].load(Ordering::Acquire)
+    }
+}
+
+impl hil::time::Frequency for _2 {
+    fn frequency() -> u32 {
+        GPT_FREQUENCIES[1].load(Ordering::Acquire)
+    }
 }
 
 impl<F: hil::time::Frequency> hil::time::Time for Gpt<'_, F> {
@@ -330,7 +380,7 @@ impl<'a, F: hil::time::Frequency> hil::time::Alarm<'a> for Gpt<'a, F> {
 
         self.disarm();
         self.registers.ocr1.set(expire.into_u32());
-        self.registers.ir.write(IR::OF1IE::SET);
+        self.registers.ir.modify(IR::OF1IE::SET);
     }
 
     fn get_alarm(&self) -> Self::Ticks {
@@ -338,7 +388,13 @@ impl<'a, F: hil::time::Frequency> hil::time::Alarm<'a> for Gpt<'a, F> {
     }
 
     fn disarm(&self) -> ReturnCode {
-        self.registers.ir.write(IR::OF1IE::CLEAR);
+        unsafe {
+            atomic(|| {
+                // Disable counter
+                self.registers.ir.modify(IR::OF1IE::CLEAR);
+                cortexm7::nvic::Nvic::new(self.irqn).clear_pending();
+            });
+        }
         ReturnCode::SUCCESS
     }
 

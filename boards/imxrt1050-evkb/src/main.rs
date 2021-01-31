@@ -45,9 +45,7 @@ const NUM_PROCS: usize = 1;
 // Actual memory for holding the active process structures.
 static mut PROCESSES: [Option<&'static dyn kernel::procs::ProcessType>; NUM_PROCS] = [None];
 
-type GptFreq = kernel::hil::time::Freq24750KHz;
-type Peripherals = imxrt1050::chip::Imxrt10xxDefaultPeripherals<GptFreq>;
-type Chip = imxrt1050::chip::Imxrt10xx<Peripherals>;
+type Chip = imxrt1050::chip::Imxrt10xx<imxrt1050::chip::Imxrt10xxDefaultPeripherals>;
 static mut CHIP: Option<&'static Chip> = None;
 
 // How should the kernel respond when a process faults.
@@ -70,12 +68,12 @@ pub static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
 struct Imxrt1050EVKB {
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
-        VirtualMuxAlarm<'static, imxrt1050::gpt::Gpt<'static, GptFreq>>,
+        VirtualMuxAlarm<'static, imxrt1050::gpt::Gpt1<'static>>,
     >,
     button: &'static capsules::button::Button<'static, imxrt1050::gpio::Pin<'static>>,
     console: &'static capsules::console::Console<'static>,
     gpio: &'static capsules::gpio::GPIO<'static, imxrt1050::gpio::Pin<'static>>,
-    ipc: kernel::ipc::IPC,
+    ipc: kernel::ipc::IPC<NUM_PROCS>,
     led: &'static capsules::led::LedDriver<'static, LedLow<'static, imxrt1050::gpio::Pin<'static>>>,
     ninedof: &'static capsules::ninedof::NineDof<'static>,
 }
@@ -105,7 +103,9 @@ impl Platform for Imxrt1050EVKB {
 // }
 
 /// Helper function called during bring-up that configures multiplexed I/O.
-unsafe fn set_pin_primary_functions(peripherals: &'static Peripherals) {
+unsafe fn set_pin_primary_functions(
+    peripherals: &'static imxrt1050::chip::Imxrt10xxDefaultPeripherals,
+) {
     use imxrt1050::gpio::PinId;
 
     peripherals.ccm.enable_iomuxc_clock();
@@ -158,18 +158,16 @@ unsafe fn set_pin_primary_functions(peripherals: &'static Peripherals) {
 }
 
 /// Helper function for miscellaneous peripheral functions
-unsafe fn setup_peripherals(peripherals: &Peripherals) {
+unsafe fn setup_peripherals(peripherals: &imxrt1050::chip::Imxrt10xxDefaultPeripherals) {
     // LPUART1 IRQn is 20
     cortexm7::nvic::Nvic::new(imxrt1050::nvic::LPUART1).enable();
 
     // TIM2 IRQn is 28
     peripherals.gpt1.enable_clock();
-    peripherals.gpt1.reset();
-    peripherals
-        .gpt1
-        .set_clock_source(imxrt1050::gpt::ClockSource::HighFrequencyReferenceClock);
-    peripherals.gpt1.set_divider(1);
-    peripherals.gpt1.start();
+    peripherals.gpt1.start(
+        peripherals.ccm.perclk_sel(),
+        peripherals.ccm.perclk_divider(),
+    );
     cortexm7::nvic::Nvic::new(imxrt1050::nvic::GPT1).enable();
 }
 
@@ -183,7 +181,10 @@ unsafe fn setup_peripherals(peripherals: &Peripherals) {
 pub unsafe fn reset_handler() {
     imxrt1050::init();
     let ccm = static_init!(imxrt1050::ccm::Ccm, imxrt1050::ccm::Ccm::new());
-    let peripherals = static_init!(Peripherals, Peripherals::new(ccm));
+    let peripherals = static_init!(
+        imxrt1050::chip::Imxrt10xxDefaultPeripherals,
+        imxrt1050::chip::Imxrt10xxDefaultPeripherals::new(ccm)
+    );
     peripherals.ccm.set_low_power_mode();
     peripherals.lpuart1.disable_clock();
     peripherals.lpuart2.disable_clock();
@@ -304,12 +305,11 @@ pub unsafe fn reset_handler() {
     // ALARM
     let gpt1 = &peripherals.gpt1;
     let mux_alarm = components::alarm::AlarmMuxComponent::new(gpt1).finalize(
-        components::alarm_mux_component_helper!(imxrt1050::gpt::Gpt<GptFreq>),
+        components::alarm_mux_component_helper!(imxrt1050::gpt::Gpt1),
     );
 
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm).finalize(
-        components::alarm_component_helper!(imxrt1050::gpt::Gpt<GptFreq>),
-    );
+    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
+        .finalize(components::alarm_component_helper!(imxrt1050::gpt::Gpt1));
 
     // GPIO
     // For now we expose only two pins
