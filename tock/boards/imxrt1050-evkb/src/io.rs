@@ -37,8 +37,7 @@ impl Write for Writer {
 
 impl IoWrite for Writer {
     fn write(&mut self, buf: &[u8]) {
-        let ccm = crate::imxrt1050::ccm::Ccm::new();
-        let uart = imxrt1050::lpuart::Lpuart::new_lpuart1(&ccm);
+        let uart = imxrt1050::lpuart::Lpuart::new_lpuart1();
 
         if !self.initialized {
             self.initialized = true;
@@ -63,8 +62,7 @@ impl IoWrite for Writer {
 #[panic_handler]
 pub unsafe extern "C" fn panic_fmt(info: &PanicInfo) -> ! {
     // User Led is connected to AdB0_09
-    let ccm = crate::imxrt1050::ccm::Ccm::new();
-    let ports = imxrt1050::gpio::Ports::new(&ccm);
+    let ports = imxrt1050::gpio::Ports::new();
     let led = &mut led::LedLow::new(ports.pin(PinId::AdB0_09));
     let writer = &mut WRITER;
 

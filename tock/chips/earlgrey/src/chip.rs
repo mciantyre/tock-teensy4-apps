@@ -1,22 +1,25 @@
 //! High-level setup and interrupt mapping for the chip.
 
 use core::fmt::Write;
+use core::hint::unreachable_unchecked;
 use kernel;
 use kernel::debug;
 use kernel::hil::time::Alarm;
 use kernel::{Chip, InterruptService};
 use rv32i::csr::{mcause, mie::mie, mip::mip, mtvec::mtvec, CSR};
-use rv32i::pmp::PMP;
 use rv32i::syscall::SysCall;
+use rv32i::PMPConfigMacro;
 
 use crate::chip_config::CONFIG;
 use crate::interrupts;
 use crate::plic::Plic;
 use crate::plic::PLIC;
 
+PMPConfigMacro!(4);
+
 pub struct EarlGrey<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> {
     userspace_kernel_boundary: SysCall,
-    pmp: PMP<4, 2>,
+    pmp: PMP,
     plic: &'a Plic,
     scheduler_timer: kernel::VirtualSchedulerTimer<A>,
     timer: &'static crate::timer::RvTimer<'static>,
@@ -154,7 +157,7 @@ impl<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> EarlGrey<'a,
 impl<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> kernel::Chip
     for EarlGrey<'a, A, I>
 {
-    type MPU = PMP<4, 2>;
+    type MPU = PMP;
     type UserspaceKernelBoundary = SysCall;
     type SchedulerTimer = kernel::VirtualSchedulerTimer<A>;
     type WatchDog = ();
@@ -245,7 +248,7 @@ fn handle_exception(exception: mcause::Exception) {
         | mcause::Exception::LoadPageFault
         | mcause::Exception::StorePageFault
         | mcause::Exception::Unknown => {
-            panic!("fatal exception: {:?}: {:#x}", exception, CSR.mtval.get());
+            panic!("fatal exception");
         }
     }
 }
@@ -320,7 +323,7 @@ pub unsafe extern "C" fn start_trap_rust() {
 /// interrupt that fired so that it does not trigger again.
 #[export_name = "_disable_interrupt_trap_rust_from_app"]
 pub unsafe extern "C" fn disable_interrupt_trap_handler(mcause_val: u32) {
-    match mcause::Trap::from(mcause_val as usize) {
+    match mcause::Trap::from(mcause_val) {
         mcause::Trap::Interrupt(interrupt) => {
             handle_interrupt(interrupt);
         }
@@ -333,7 +336,7 @@ pub unsafe extern "C" fn disable_interrupt_trap_handler(mcause_val: u32) {
 pub unsafe fn configure_trap_handler() {
     // The Ibex CPU does not support non-vectored trap entries.
     CSR.mtvec
-        .write(mtvec::trap_addr.val(_start_trap_vectored as usize >> 2) + mtvec::mode::Vectored)
+        .write(mtvec::trap_addr.val(_start_trap_vectored as u32 >> 2) + mtvec::mode::Vectored)
 }
 
 // Mock implementation for crate tests that does not include the section
@@ -341,7 +344,6 @@ pub unsafe fn configure_trap_handler() {
 // compilation environment may not allow the section name.
 #[cfg(not(any(target_arch = "riscv32", target_os = "none")))]
 pub extern "C" fn _start_trap_vectored() {
-    use core::hint::unreachable_unchecked;
     unsafe {
         unreachable_unchecked();
     }
@@ -360,8 +362,8 @@ pub extern "C" fn _start_trap_vectored() -> ! {
         //
         // Below are 32 (non-compressed) jumps to cover the entire possible
         // range of vectored traps.
-        asm!(
-            "
+        #[cfg(all(target_arch = "riscv32", target_os = "none"))]
+        llvm_asm!("
             j _start_trap
             j _start_trap
             j _start_trap
@@ -394,8 +396,11 @@ pub extern "C" fn _start_trap_vectored() -> ! {
             j _start_trap
             j _start_trap
             j _start_trap
-        ",
-            options(noreturn)
-        );
+        "
+        :
+        :
+        :
+        : "volatile");
+        unreachable_unchecked()
     }
 }

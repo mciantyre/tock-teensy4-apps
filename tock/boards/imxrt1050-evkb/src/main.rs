@@ -73,7 +73,7 @@ struct Imxrt1050EVKB {
     button: &'static capsules::button::Button<'static, imxrt1050::gpio::Pin<'static>>,
     console: &'static capsules::console::Console<'static>,
     gpio: &'static capsules::gpio::GPIO<'static, imxrt1050::gpio::Pin<'static>>,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
+    ipc: kernel::ipc::IPC,
     led: &'static capsules::led::LedDriver<'static, LedLow<'static, imxrt1050::gpio::Pin<'static>>>,
     ninedof: &'static capsules::ninedof::NineDof<'static>,
 }
@@ -111,7 +111,10 @@ unsafe fn set_pin_primary_functions(
     peripherals.ccm.enable_iomuxc_clock();
     peripherals.ccm.enable_iomuxc_snvs_clock();
 
-    peripherals.ports.gpio1.enable_clock();
+    peripherals
+        .gpios
+        .port(imxrt1050::gpio::GpioPort::GPIO1)
+        .enable_clock();
 
     // User_LED is connected to GPIO_AD_B0_09.
     // Values set accordingly to the evkbimxrt1050_iled_blinky SDK example
@@ -138,23 +141,27 @@ unsafe fn set_pin_primary_functions(
     );
 
     // Configuring the GPIO_AD_B0_09 as output
-    let pin = peripherals.ports.pin(PinId::AdB0_09);
+    let pin = peripherals.gpios.pin(PinId::AdB0_09);
     pin.make_output();
     kernel::debug::assign_gpios(Some(pin), None, None);
 
     // User_Button is connected to IOMUXC_SNVS_WAKEUP.
-    peripherals.ports.gpio5.enable_clock();
+    peripherals
+        .gpios
+        .port(imxrt1050::gpio::GpioPort::GPIO5)
+        .enable_clock();
 
     // We configure the pin in GPIO mode and disable the Software Input
     // on Field, so that the Input Path is determined by functionality.
-    peripherals.iomuxc_snvs.enable_sw_mux_ctl_pad_gpio(
+    peripherals.iomuxc.enable_sw_mux_ctl_pad_gpio(
+        PadId::Snvs,
         MuxMode::ALT5, // ALT5 for AdB0_09: GPIO5_IO00 of instance: gpio5
         Sion::Disabled,
         0,
     );
 
     // Configuring the IOMUXC_SNVS_WAKEUP pin as input
-    peripherals.ports.pin(PinId::Wakeup).make_input();
+    peripherals.gpios.pin(PinId::Wakeup).make_input();
 }
 
 /// Helper function for miscellaneous peripheral functions
@@ -180,18 +187,10 @@ unsafe fn setup_peripherals(peripherals: &imxrt1050::chip::Imxrt10xxDefaultPerip
 #[no_mangle]
 pub unsafe fn reset_handler() {
     imxrt1050::init();
-    let ccm = static_init!(imxrt1050::ccm::Ccm, imxrt1050::ccm::Ccm::new());
     let peripherals = static_init!(
         imxrt1050::chip::Imxrt10xxDefaultPeripherals,
-        imxrt1050::chip::Imxrt10xxDefaultPeripherals::new(ccm)
+        imxrt1050::chip::Imxrt10xxDefaultPeripherals::new()
     );
-    peripherals.ccm.set_low_power_mode();
-    peripherals.lpuart1.disable_clock();
-    peripherals.lpuart2.disable_clock();
-    peripherals
-        .ccm
-        .set_uart_clock_sel(imxrt1050::ccm::UartClockSelection::PLL3);
-    peripherals.ccm.set_uart_clock_podf(1);
     peripherals.lpuart1.set_baud();
 
     set_pin_primary_functions(peripherals);
@@ -282,7 +281,7 @@ pub unsafe fn reset_handler() {
     // Clock to Port A is enabled in `set_pin_primary_functions()
     let led = components::led::LedsComponent::new(components::led_component_helper!(
         LedLow<'static, imxrt1050::gpio::Pin<'static>>,
-        LedLow::new(peripherals.ports.pin(imxrt1050::gpio::PinId::AdB0_09)),
+        LedLow::new(peripherals.gpios.pin(imxrt1050::gpio::PinId::AdB0_09)),
     ))
     .finalize(components::led_component_buf!(
         LedLow<'static, imxrt1050::gpio::Pin<'static>>
@@ -294,7 +293,7 @@ pub unsafe fn reset_handler() {
         components::button_component_helper!(
             imxrt1050::gpio::Pin,
             (
-                peripherals.ports.pin(imxrt1050::gpio::PinId::Wakeup),
+                peripherals.gpios.pin(imxrt1050::gpio::PinId::Wakeup),
                 kernel::hil::gpio::ActivationMode::ActiveHigh,
                 kernel::hil::gpio::FloatingState::PullDown
             )
@@ -318,7 +317,7 @@ pub unsafe fn reset_handler() {
         components::gpio_component_helper!(
             imxrt1050::gpio::Pin<'static>,
             // The User Led
-            0 => peripherals.ports.pin(imxrt1050::gpio::PinId::AdB0_09)
+            0 => peripherals.gpios.pin(imxrt1050::gpio::PinId::AdB0_09)
         ),
     )
     .finalize(components::gpio_component_buf!(
@@ -386,7 +385,7 @@ pub unsafe fn reset_handler() {
     // Fxos8700 sensor
     let fxos8700 = components::fxos8700::Fxos8700Component::new(
         mux_i2c,
-        peripherals.ports.pin(PinId::AdB1_00),
+        peripherals.gpios.pin(PinId::AdB1_00),
     )
     .finalize(());
 
