@@ -164,6 +164,8 @@ register_bitfields![u32,
 const PWM0_BASE: StaticRef<PwmRegisters> =
     unsafe { StaticRef::new(0x4001C000 as *const PwmRegisters) };
 
+pub static mut PWM0: Pwm = Pwm::new(PWM0_BASE);
+
 /// `DUTY_CYCLES` is a static array that must be passed to the PWM hardware.
 /// The nRF52 hardware uses this static array in memory to enable switching
 /// between multiple duty cycles automatically while generating the PWM output.
@@ -176,9 +178,9 @@ pub struct Pwm {
 }
 
 impl Pwm {
-    pub const fn new() -> Pwm {
+    const fn new(registers: StaticRef<PwmRegisters>) -> Pwm {
         Pwm {
-            registers: PWM0_BASE,
+            registers: registers,
         }
     }
 

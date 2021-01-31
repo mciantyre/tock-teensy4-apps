@@ -200,6 +200,8 @@ pub enum FlashState {
     Erase, // Performing an erase operation.
 }
 
+pub static mut NVMC: Nvmc = Nvmc::new();
+
 pub struct Nvmc {
     registers: StaticRef<NvmcRegisters>,
     client: OptionalCell<&'static dyn hil::flash::Client<Nvmc>>,

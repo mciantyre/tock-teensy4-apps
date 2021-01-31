@@ -31,6 +31,7 @@ impl<'a, I: InterruptService<DeferredCallTask> + 'a> NRF52<'a, I> {
 pub struct Nrf52DefaultPeripherals<'a> {
     pub acomp: crate::acomp::Comparator<'a>,
     pub ecb: crate::aes::AesECB<'a>,
+    pub gpio_port: &'static crate::gpio::Port<'static>,
     pub pwr_clk: crate::power::Power<'a>,
     pub ieee802154_radio: crate::ieee802154_radio::Radio<'a>,
     pub ble_radio: crate::ble_radio::Radio<'a>,
@@ -48,15 +49,14 @@ pub struct Nrf52DefaultPeripherals<'a> {
     pub spim2: crate::spi::SPIM,
     pub adc: crate::adc::Adc,
     pub nvmc: crate::nvmc::Nvmc,
-    pub clock: crate::clock::Clock,
-    pub pwm0: crate::pwm::Pwm,
 }
 
 impl<'a> Nrf52DefaultPeripherals<'a> {
-    pub fn new(ppi: &'a crate::ppi::Ppi) -> Self {
+    pub fn new(gpio_port: &'static crate::gpio::Port<'static>, ppi: &'a crate::ppi::Ppi) -> Self {
         Self {
             acomp: crate::acomp::Comparator::new(),
             ecb: crate::aes::AesECB::new(),
+            gpio_port,
             pwr_clk: crate::power::Power::new(),
             ieee802154_radio: crate::ieee802154_radio::Radio::new(ppi),
             ble_radio: crate::ble_radio::Radio::new(),
@@ -74,8 +74,6 @@ impl<'a> Nrf52DefaultPeripherals<'a> {
             spim2: crate::spi::SPIM::new(2),
             adc: crate::adc::Adc::new(),
             nvmc: crate::nvmc::Nvmc::new(),
-            clock: crate::clock::Clock::new(),
-            pwm0: crate::pwm::Pwm::new(),
         }
     }
     // Necessary for setting up circular dependencies
@@ -88,6 +86,7 @@ impl<'a> kernel::InterruptService<DeferredCallTask> for Nrf52DefaultPeripherals<
         match interrupt {
             crate::peripheral_interrupts::COMP => self.acomp.handle_interrupt(),
             crate::peripheral_interrupts::ECB => self.ecb.handle_interrupt(),
+            crate::peripheral_interrupts::GPIOTE => self.gpio_port.handle_interrupt(),
             crate::peripheral_interrupts::POWER_CLOCK => self.pwr_clk.handle_interrupt(),
             crate::peripheral_interrupts::RADIO => {
                 match (
@@ -182,7 +181,7 @@ impl<'a, I: InterruptService<DeferredCallTask> + 'a> kernel::Chip for NRF52<'a, 
                     }
                 } else if let Some(interrupt) = nvic::next_pending() {
                     if !self.interrupt_service.service_interrupt(interrupt) {
-                        panic!("unhandled interrupt {}", interrupt);
+                        panic!("unhandled interrupt");
                     }
                     let n = nvic::Nvic::new(interrupt);
                     n.clear_pending();

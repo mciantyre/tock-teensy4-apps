@@ -53,7 +53,7 @@ impl Region {
 /// Null type for the default type of the `MpuConfig` type in an implementation
 /// of the `MPU` trait. We need this to workaround a bug in the Rust compiler.
 ///
-/// Depending how <https://github.com/rust-lang/rust/issues/65774> is resolved we
+/// Depending how https://github.com/rust-lang/rust/issues/65774 is resolved we
 /// may be able to remove this type, but only if a default `Display` is
 /// provided for the `()` type.
 #[derive(Default)]
@@ -91,7 +91,7 @@ pub trait MPU {
     /// It is `Default` so we can create empty state when the process is
     /// created, and `Display` so that the `panic!()` output can display the
     /// current state to help with debugging.
-    type MpuConfig: Default + Display;
+    type MpuConfig: Default + Display = MpuConfigDefault;
 
     /// Clears the MPU.
     ///
@@ -266,9 +266,7 @@ pub trait MPU {
 }
 
 /// Implement default MPU trait for unit.
-impl MPU for () {
-    type MpuConfig = MpuConfigDefault;
-}
+impl MPU for () {}
 
 /// The generic trait that particular kernel level memory protection unit
 /// implementations need to implement.
@@ -287,7 +285,7 @@ pub trait KernelMPU {
     /// It is `Default` so we can create empty state when the kernel is
     /// created, and `Display` so that the `panic!()` output can display the
     /// current state to help with debugging.
-    type KernelMpuConfig: Default + Display;
+    type KernelMpuConfig: Default + Display = MpuConfigDefault;
 
     /// Mark a region of memory that the Tock kernel owns.
     ///

@@ -151,19 +151,19 @@ impl<'a, R: LiteXSoCRegisterConfiguration> LiteXLed<'a, R> {
 }
 
 impl<'a, R: LiteXSoCRegisterConfiguration> hil::led::Led for LiteXLed<'a, R> {
-    fn init(&self) {
+    fn init(&mut self) {
         self.controller.set_led(self.index, false);
     }
 
-    fn on(&self) {
+    fn on(&mut self) {
         self.controller.set_led(self.index, true);
     }
 
-    fn off(&self) {
+    fn off(&mut self) {
         self.controller.set_led(self.index, false);
     }
 
-    fn toggle(&self) {
+    fn toggle(&mut self) {
         self.controller
             .set_led(self.index, !self.controller.read_led(self.index));
     }

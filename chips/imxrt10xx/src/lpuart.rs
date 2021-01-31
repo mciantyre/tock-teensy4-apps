@@ -316,7 +316,7 @@ enum USARTStateRX {
 
 pub struct Lpuart<'a> {
     registers: StaticRef<LpuartRegisters>,
-    clock: LpuartClock<'a>,
+    clock: LpuartClock,
 
     tx_client: OptionalCell<&'a dyn hil::uart::TransmitClient>,
     rx_client: OptionalCell<&'a dyn hil::uart::ReceiveClient>,
@@ -333,21 +333,21 @@ pub struct Lpuart<'a> {
 }
 
 impl<'a> Lpuart<'a> {
-    pub const fn new_lpuart1(ccm: &'a ccm::Ccm) -> Self {
+    pub const fn new_lpuart1() -> Self {
         Lpuart::new(
             LPUART1_BASE,
-            LpuartClock(ccm::PeripheralClock::ccgr5(ccm, ccm::HCLK5::LPUART1)),
+            LpuartClock(ccm::PeripheralClock::CCGR5(ccm::HCLK5::LPUART1)),
         )
     }
 
-    pub const fn new_lpuart2(ccm: &'a ccm::Ccm) -> Self {
+    pub const fn new_lpuart2() -> Self {
         Lpuart::new(
             LPUART2_BASE,
-            LpuartClock(ccm::PeripheralClock::ccgr0(ccm, ccm::HCLK0::LPUART2)),
+            LpuartClock(ccm::PeripheralClock::CCGR0(ccm::HCLK0::LPUART2)),
         )
     }
 
-    const fn new(base_addr: StaticRef<LpuartRegisters>, clock: LpuartClock<'a>) -> Lpuart<'a> {
+    const fn new(base_addr: StaticRef<LpuartRegisters>, clock: LpuartClock) -> Lpuart<'a> {
         Lpuart {
             registers: base_addr,
             clock: clock,
@@ -571,7 +571,22 @@ impl<'a> hil::uart::Configure for Lpuart<'a> {
             );
         }
 
-        self.enable_clock();
+        unsafe {
+            self.disable_clock();
+            // TODO this isn't a safe way to control the UART
+            // clocks.
+            //
+            // We need to disable _all_ UART clocks at the clock gates
+            // before we change the UART clock root.
+            //
+            // The 'disable' term for the clock mux is misleading. This
+            // call actually transitions the UART to use PLL3, not disable
+            // the clock to the UART. (If the PLL is off, that's not obvious
+            // from this call.)
+            ccm::CCM.disable_uart_clock_mux();
+            ccm::CCM.disable_uart_clock_podf();
+            self.enable_clock();
+        }
         // Reset the LPUART using software
         self.registers.global.modify(GLOBAL::RST::SET);
         self.registers.global.modify(GLOBAL::RST::CLEAR);
@@ -676,9 +691,9 @@ impl<'a> hil::uart::Receive<'a> for Lpuart<'a> {
 
 impl<'a> hil::uart::UartData<'a> for Lpuart<'a> {}
 impl<'a> hil::uart::Uart<'a> for Lpuart<'a> {}
-struct LpuartClock<'a>(ccm::PeripheralClock<'a>);
+struct LpuartClock(ccm::PeripheralClock);
 
-impl ClockInterface for LpuartClock<'_> {
+impl ClockInterface for LpuartClock {
     fn is_enabled(&self) -> bool {
         self.0.is_enabled()
     }

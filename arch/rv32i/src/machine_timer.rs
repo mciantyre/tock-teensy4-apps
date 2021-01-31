@@ -39,7 +39,7 @@ impl MachineTimer<'_> {
         });
     }
 
-    pub fn disable_machine_timer(&self) {
+    fn disable_machine_timer(&self) {
         self.registers.compare_high.set(0xFFFF_FFFF);
         self.registers.compare_low.set(0xFFFF_FFFF);
     }

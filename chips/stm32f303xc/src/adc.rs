@@ -546,7 +546,11 @@ impl<'a> Adc<'a> {
         // when ADVRGEN becomes enabled
         // we chose 720 because the frequency is 72MHz and it needs 10 us to become enabled
         for _i in 0..720 {
-            cortexm4::support::nop()
+            unsafe {
+                llvm_asm!(
+                "nop"
+            : : : : "volatile" );
+            }
         }
 
         // Enable ADC Ready interrupt

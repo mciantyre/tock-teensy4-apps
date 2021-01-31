@@ -1,4 +1,3 @@
-use core::cell::Cell;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use core::str;
@@ -29,22 +28,22 @@ impl IoWrite for Writer {
 
 // The LiteX simulation does not have LEDs, hence use a dummy type for
 // the debug::panic function
-struct DummyLed(Cell<bool>);
+struct DummyLed(bool);
 impl kernel::hil::led::Led for DummyLed {
-    fn init(&self) {
-        self.0.set(false);
+    fn init(&mut self) {
+        self.0 = false;
     }
-    fn on(&self) {
-        self.0.set(true);
+    fn on(&mut self) {
+        self.0 = true;
     }
-    fn off(&self) {
-        self.0.set(false);
+    fn off(&mut self) {
+        self.0 = false;
     }
-    fn toggle(&self) {
-        self.0.set(!self.0.get());
+    fn toggle(&mut self) {
+        self.0 = !self.0;
     }
     fn read(&self) -> bool {
-        self.0.get()
+        self.0
     }
 }
 

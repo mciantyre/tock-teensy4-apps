@@ -9,5 +9,4 @@ kernel = { path = "../../kernel" }
 tock-rt0 = { path = "../../libraries/tock-rt0" }
 tock-registers = { path = "../../libraries/tock-register-interface" }
 riscv-csr = { path = "../../libraries/riscv-csr" }
-riscv = { path = "../riscv" }
 

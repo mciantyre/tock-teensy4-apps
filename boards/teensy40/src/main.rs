@@ -34,7 +34,7 @@ struct Teensy40 {
     led:
         &'static capsules::led::LedDriver<'static, LedHigh<'static, imxrt1060::gpio::Pin<'static>>>,
     console: &'static capsules::console::Console<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
+    ipc: kernel::ipc::IPC,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
         capsules::virtual_alarm::VirtualMuxAlarm<'static, imxrt1060::gpt::Gpt1<'static>>,
@@ -62,18 +62,11 @@ static mut CHIP: Option<&'static Chip> = None;
 #[no_mangle]
 pub unsafe fn reset_handler() {
     imxrt1060::init();
-    let ccm = static_init!(imxrt1060::ccm::Ccm, imxrt1060::ccm::Ccm::new());
+
     let peripherals = static_init!(
         imxrt1060::chip::Imxrt10xxDefaultPeripherals,
-        imxrt1060::chip::Imxrt10xxDefaultPeripherals::new(ccm)
+        imxrt1060::chip::Imxrt10xxDefaultPeripherals::new()
     );
-    peripherals.ccm.set_low_power_mode();
-    peripherals.lpuart1.disable_clock();
-    peripherals.lpuart2.disable_clock();
-    peripherals
-        .ccm
-        .set_uart_clock_sel(imxrt1060::ccm::UartClockSelection::PLL3);
-    peripherals.ccm.set_uart_clock_podf(1);
 
     peripherals.ccm.enable_iomuxc_clock();
     peripherals.ccm.enable_iomuxc_snvs_clock();
@@ -83,7 +76,7 @@ pub unsafe fn reset_handler() {
         .set_perclk_sel(imxrt1060::ccm::PerclkClockSel::Oscillator);
     peripherals.ccm.set_perclk_divider(8);
 
-    peripherals.ports.pin(PinId::B0_03).make_output();
+    peripherals.gpios.pin(PinId::B0_03).make_output();
 
     // Pin 13 is an LED
     peripherals
@@ -142,7 +135,7 @@ pub unsafe fn reset_handler() {
     // LED
     let led = components::led::LedsComponent::new(components::led_component_helper!(
         LedHigh<imxrt1060::gpio::Pin>,
-        LedHigh::new(peripherals.ports.pin(PinId::B0_03))
+        LedHigh::new(peripherals.gpios.pin(PinId::B0_03))
     ))
     .finalize(components::led_component_buf!(
         LedHigh<'static, imxrt1060::gpio::Pin>

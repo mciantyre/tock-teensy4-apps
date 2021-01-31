@@ -67,18 +67,18 @@ struct MatrixLed(
 );
 
 impl led::Led for MatrixLed {
-    fn init(&self) {
+    fn init(&mut self) {
         self.0.make_output();
         self.1.make_output();
         self.1.clear();
     }
-    fn on(&self) {
+    fn on(&mut self) {
         self.1.set();
     }
-    fn off(&self) {
+    fn off(&mut self) {
         self.1.clear();
     }
-    fn toggle(&self) {
+    fn toggle(&mut self) {
         self.1.toggle();
     }
     fn read(&self) -> bool {
@@ -97,8 +97,8 @@ pub unsafe extern "C" fn panic_fmt(pi: &PanicInfo) -> ! {
     // let mut led = Led (&gpio::PORT[Pin::P0_28], );
 
     // MicroBit v2 has a microphone LED, use it for panic
-    let led_kernel_pin = &nrf52833::gpio::GPIOPin::new(Pin::P0_20);
-    let led = &mut led::LedLow::new(led_kernel_pin);
+    const LED_KERNEL_PIN: Pin = Pin::P0_20;
+    let led = &mut led::LedHigh::new(&nrf52833::gpio::PORT[LED_KERNEL_PIN]);
     // MatrixLed(&gpio::PORT[Pin::P0_28], &gpio::PORT[Pin::P0_21]);
     let writer = &mut WRITER;
     debug::panic(

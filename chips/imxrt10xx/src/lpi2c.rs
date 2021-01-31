@@ -431,7 +431,7 @@ const LPI2C1_BASE: StaticRef<Lpi2cRegisters> =
 
 pub struct Lpi2c<'a> {
     registers: StaticRef<Lpi2cRegisters>,
-    clock: Lpi2cClock<'a>,
+    clock: Lpi2cClock,
 
     // I2C slave support not yet implemented
     master_client: OptionalCell<&'a dyn hil::i2c::I2CHwMasterClient>,
@@ -461,14 +461,14 @@ enum Lpi2cStatus {
     Reading,
 }
 
-impl<'a> Lpi2c<'a> {
-    pub const fn new_lpi2c1(ccm: &'a ccm::Ccm) -> Self {
+impl Lpi2c<'_> {
+    pub const fn new_lpi2c1() -> Self {
         Lpi2c::new(
             LPI2C1_BASE,
-            Lpi2cClock(ccm::PeripheralClock::ccgr2(ccm, ccm::HCLK2::LPI2C1)),
+            Lpi2cClock(ccm::PeripheralClock::CCGR2(ccm::HCLK2::LPI2C1)),
         )
     }
-    const fn new(base_addr: StaticRef<Lpi2cRegisters>, clock: Lpi2cClock<'a>) -> Self {
+    const fn new(base_addr: StaticRef<Lpi2cRegisters>, clock: Lpi2cClock) -> Self {
         Self {
             registers: base_addr,
             clock,
@@ -759,9 +759,9 @@ impl i2c::I2CMaster for Lpi2c<'_> {
     }
 }
 
-struct Lpi2cClock<'a>(ccm::PeripheralClock<'a>);
+struct Lpi2cClock(ccm::PeripheralClock);
 
-impl ClockInterface for Lpi2cClock<'_> {
+impl ClockInterface for Lpi2cClock {
     fn is_enabled(&self) -> bool {
         self.0.is_enabled()
     }
