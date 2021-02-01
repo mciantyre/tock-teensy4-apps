@@ -5,7 +5,7 @@
 #![crate_name = "imxrt10xx"]
 #![crate_type = "rlib"]
 #![feature(const_fn)]
-#![cfg_attr(not(test), no_std)] // Support unit testing on your host
+#![no_std]
 
 pub mod chip;
 pub mod nvic;
@@ -242,6 +242,4 @@ pub unsafe fn init() {
     cortexm7::scb::set_vector_table_offset(
         &BASE_VECTORS as *const [unsafe extern "C" fn(); 16] as *const (),
     );
-
-    ccm::CCM.set_low_power_mode();
 }
