@@ -316,15 +316,14 @@ register_bitfields![u32,
 const CCM_BASE: StaticRef<CcmRegisters> =
     unsafe { StaticRef::new(0x400FC000 as *const CcmRegisters) };
 
-// TODO try to remove this.
-pub(crate) static mut CCM: Ccm = Ccm::new();
-
 pub struct Ccm {
     registers: StaticRef<CcmRegisters>,
 }
 
+pub static mut CCM: Ccm = Ccm::new();
+
 impl Ccm {
-    pub const fn new() -> Ccm {
+    const fn new() -> Ccm {
         Ccm {
             registers: CCM_BASE,
         }

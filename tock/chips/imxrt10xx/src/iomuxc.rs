@@ -214,6 +214,8 @@ pub struct Iomuxc {
     registers: StaticRef<IomuxcRegisters>,
 }
 
+pub static mut IOMUXC: Iomuxc = Iomuxc::new();
+
 // Most of the gpio pins are grouped in the following 8 pads:
 #[repr(u32)]
 pub enum PadId {
@@ -342,7 +344,7 @@ pub enum SlewRate {
 }
 
 impl Iomuxc {
-    pub const fn new() -> Iomuxc {
+    const fn new() -> Iomuxc {
         Iomuxc {
             registers: IOMUXC_BASE,
         }
