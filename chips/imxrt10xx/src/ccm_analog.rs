@@ -7,38 +7,46 @@
 //    a Groups struct.
 // 3. Remove unused
 
-use core::ops::Range;
 use kernel::common::registers::{
-    register_bitfields, register_structs, ReadWrite, RegisterLongName,
+    register_bitfields, register_structs, ReadWrite, RegisterLongName, WriteOnly,
 };
 use kernel::common::StaticRef;
 
 /// Many CCM_ANALOG registers are laid out with additional set, clear, and toggle
-/// registers. This groups them together.
+/// registers. This groups them together into an extended register.
 ///
-/// TODO better name...?
+/// Selecting suffix 'SCT' given the mention in the reference manual:
+///
+/// > A set of SCT registeres is offered for registers in many modules [...]
+///
+/// Although the CCM_ANALOG memory map indicates the SCT registers are R/W,
+/// the reference manual front-matter (section 1.5.2) indicates that they should
+/// be treated as as write only:
+///
+/// > The SCT registers always read back 0, and should be considered write-only.
 #[repr(C)]
-struct Group<R: RegisterLongName = ()> {
+struct RegisterSCT<R: RegisterLongName = ()> {
+    /// The normal register
     reg: ReadWrite<u32, R>,
     /// Write 1 sets bits in reg
-    set: ReadWrite<u32, R>,
+    set: WriteOnly<u32, R>,
     /// Write 1 clears bits in reg
-    clear: ReadWrite<u32, R>,
+    clear: WriteOnly<u32, R>,
     /// Write 1 toggles bits in reg
-    toggle: ReadWrite<u32, R>,
+    toggle: WriteOnly<u32, R>,
 }
 
 register_structs! {
     /// CCM_ANALOG
     CcmAnalogRegisters {
         /// Analog ARM PLL control Register
-        (0x000 => pll_arm: Group<PLL_ARM::Register>),
+        (0x000 => pll_arm: RegisterSCT<PLL_ARM::Register>),
         /// Analog USB1 480MHz PLL Control Register
-        (0x010 => pll_usb1: Group<PLL_USB1::Register>),
+        (0x010 => pll_usb1: RegisterSCT<PLL_USB1::Register>),
         /// Analog USB2 480MHz PLL Control Register
-        (0x020 => pll_usb2: Group<PLL_USB2::Register>),
+        (0x020 => pll_usb2: RegisterSCT<PLL_USB2::Register>),
         /// Analog System PLL Control Register
-        (0x030 => pll_sys: Group<PLL_SYS::Register>),
+        (0x030 => pll_sys: RegisterSCT<PLL_SYS::Register>),
         /// 528MHz System PLL Spread Spectrum Register
         (0x040 => pll_sys_ss: ReadWrite<u32, PLL_SYS_SS::Register>),
         (0x044 => _reserved0),
@@ -49,7 +57,7 @@ register_structs! {
         (0x060 => pll_sys_denom: ReadWrite<u32>),
         (0x064 => _reserved2),
         /// Analog Audio PLL control Register
-        (0x070 => pll_audio: Group<PLL_AUDIO::Register>),
+        (0x070 => pll_audio: RegisterSCT<PLL_AUDIO::Register>),
         /// Numerator of Audio PLL Fractional Loop Divider Register
         (0x080 => pll_audio_num: ReadWrite<u32>),
         (0x084 => _reserved3),
@@ -57,7 +65,7 @@ register_structs! {
         (0x090 => pll_audio_denom: ReadWrite<u32>),
         (0x094 => _reserved4),
         /// Analog Video PLL control Register
-        (0x0A0 => pll_video: Group<PLL_VIDEO::Register>),
+        (0x0A0 => pll_video: RegisterSCT<PLL_VIDEO::Register>),
         /// Numerator of Video PLL Fractional Loop Divider Register
         (0x0B0 => pll_video_num: ReadWrite<u32>),
         (0x0B4 => _reserved5),
@@ -65,18 +73,18 @@ register_structs! {
         (0x0C0 => pll_video_denom: ReadWrite<u32>),
         (0x0C4 => _reserved6),
         /// Analog ENET PLL Control Register
-        (0x0E0 => pll_enet: Group<PLL_ENET::Register>),
+        (0x0E0 => pll_enet: RegisterSCT<PLL_ENET::Register>),
         /// 480MHz Clock (PLL3) Phase Fractional Divider Control Register
-        (0x0F0 => pfd_480: Group<PFD_480::Register>),
+        (0x0F0 => pfd_480: RegisterSCT<PFD_480::Register>),
         /// 528MHz Clock (PLL2) Phase Fractional Divider Control Register
-        (0x100 => pfd_528: Group<PFD_528::Register>),
+        (0x100 => pfd_528: RegisterSCT<PFD_528::Register>),
         (0x110 => _reserved7),
         /// Miscellaneous Register 0
-        (0x150 => misc0: Group<MISC0::Register>),
+        (0x150 => misc0: RegisterSCT<MISC0::Register>),
         /// Miscellaneous Register 1
-        (0x160 => misc1: Group<MISC1::Register>),
+        (0x160 => misc1: RegisterSCT<MISC1::Register>),
         /// Miscellaneous Register 2
-        (0x170 => misc2: Group<MISC2::Register>),
+        (0x170 => misc2: RegisterSCT<MISC2::Register>),
         (0x180 => @END),
     }
 }
@@ -603,7 +611,7 @@ impl CcmAnalog {
     ///
     /// Clamps `div_sel` to [54, 108].
     pub fn restart_pll1(&self, div_sel: u32) {
-        let div_sel = clamp(div_sel, PLL1_DIV_SEL_RANGE);
+        let div_sel = div_sel.min(108).max(54);
 
         // Clear all bits except powerdown
         self.registers.pll_arm.reg.write(PLL_ARM::POWERDOWN::SET);
@@ -616,39 +624,5 @@ impl CcmAnalog {
         self.registers.pll_arm.set.write(PLL_ARM::ENABLE::SET);
         // Wait for lock
         while self.registers.pll_arm.reg.read(PLL_ARM::LOCK) == 0 {}
-    }
-}
-
-/// Valid range of PLL1 `DIV_SEL` values
-pub const PLL1_DIV_SEL_RANGE: Range<u32> = 54..109;
-
-/// Clamp `value` within `range`
-fn clamp(value: u32, range: Range<u32>) -> u32 {
-    value.min(range.end - 1).max(range.start)
-}
-
-/// Computes the PLL1 output frequency for a given `DIV_SEL` value
-///
-/// Clamps `div_sel` to the valid range; see [`PLL1_DIV_SEL_RANGE`] for valid
-/// ranges.
-///
-/// Upper frequency might exceed the the maximum supported frequency. Check
-/// the datasheet for more information.
-pub fn pll1_hz(div_sel: u32) -> u32 {
-    // PLL output frequency = Fref * DIV_SEL/2
-    //
-    // where
-    //  Fref is the 24MHz oscillator
-    12_000_000 * clamp(div_sel, PLL1_DIV_SEL_RANGE)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn pll1_hz() {
-        assert_eq!(super::pll1_hz(54), 648_000_000);
-        assert_eq!(super::pll1_hz(108), 1_296_000_000);
-        assert_eq!(super::pll1_hz(53), super::pll1_hz(54));
-        assert_eq!(super::pll1_hz(109), super::pll1_hz(108));
     }
 }
