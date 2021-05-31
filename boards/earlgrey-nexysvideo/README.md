@@ -19,7 +19,7 @@ Programming
 -----------
 
 Tock on OpenTitan requires
-lowRISC/opentitan@99cb19827ebbd5dcee097c061a271ac09be5b523 or newer. In
+lowRISC/opentitan@23acbe8159634e5479d568b350fdbfa9b4dbd5fd or newer. In
 general it is recommended that users start with the latest OpenTitan bitstream
 and if that results in issues try the one mentioned above.
 
@@ -40,7 +40,7 @@ In the OpenTitan repo build the `spiflash` program.
 
 ```shell
 ./meson_init.sh
-ninja -C build-out/
+ninja -C build-out sw/host/spiflash/spiflash_export
 ```
 
 Export the `OPENTITAN_TREE` enviroment variable to point to the OpenTitan tree.
@@ -57,8 +57,8 @@ If you need help getting console access check the
 section in the OpenTitan documentation.
 
 ```
-bootstrap: DONE!
-Jump!
+Bootstrap: DONE!
+Boot ROM initialisation has completed, jump into flash!
 OpenTitan initialisation complete. Entering main loop
 ```
 

@@ -24,11 +24,10 @@ use kernel::{create_capability, static_init};
 const NUM_PROCS: usize = 4;
 
 /// Actual process memory
-static mut PROCESSES: [Option<&'static dyn kernel::procs::ProcessType>; NUM_PROCS] =
-    [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] = [None; NUM_PROCS];
 
 /// What should we do if a process faults?
-const FAULT_RESPONSE: kernel::procs::FaultResponse = kernel::procs::FaultResponse::Panic;
+const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
 
 /// Teensy 4 platform
 struct Teensy40 {
@@ -38,7 +37,7 @@ struct Teensy40 {
     ipc: kernel::ipc::IPC<NUM_PROCS>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
-        capsules::virtual_alarm::VirtualMuxAlarm<'static, imxrt1060::gpt::Gpt<'static, GptFreq>>,
+        capsules::virtual_alarm::VirtualMuxAlarm<'static, imxrt1060::gpt::Gpt1<'static>>,
     >,
 }
 
@@ -57,9 +56,21 @@ impl kernel::Platform for Teensy40 {
     }
 }
 
-type GptFreq = kernel::hil::time::Freq1MHz;
-type Peripherals = imxrt1060::chip::Imxrt10xxDefaultPeripherals<GptFreq>;
-type Chip = imxrt1060::chip::Imxrt10xx<Peripherals>;
+/// This is in a separate, inline(never) function so that its stack frame is
+/// removed when this function returns. Otherwise, the stack space used for
+/// these static_inits is wasted.
+#[inline(never)]
+unsafe fn get_peripherals() -> &'static mut imxrt1060::chip::Imxrt10xxDefaultPeripherals {
+    let ccm = static_init!(imxrt1060::ccm::Ccm, imxrt1060::ccm::Ccm::new());
+    let peripherals = static_init!(
+        imxrt1060::chip::Imxrt10xxDefaultPeripherals,
+        imxrt1060::chip::Imxrt10xxDefaultPeripherals::new(ccm)
+    );
+
+    peripherals
+}
+
+type Chip = imxrt1060::chip::Imxrt10xx<imxrt1060::chip::Imxrt10xxDefaultPeripherals>;
 static mut CHIP: Option<&'static Chip> = None;
 
 /// Set the ARM clock frequency to 600MHz
@@ -97,10 +108,10 @@ fn set_arm_clock(ccm: &imxrt1060::ccm::Ccm, ccm_analog: &imxrt1060::ccm_analog::
 }
 
 #[no_mangle]
-pub unsafe fn reset_handler() {
+pub unsafe fn main() {
     imxrt1060::init();
-    let ccm = static_init!(imxrt1060::ccm::Ccm, imxrt1060::ccm::Ccm::new());
-    let peripherals = static_init!(Peripherals, Peripherals::new(ccm));
+
+    let peripherals = get_peripherals();
     peripherals.ccm.set_low_power_mode();
 
     peripherals.dcdc.clock().enable();
@@ -146,12 +157,10 @@ pub unsafe fn reset_handler() {
     peripherals.lpuart2.set_baud();
 
     peripherals.gpt1.enable_clock();
-    peripherals.gpt1.reset();
-    peripherals
-        .gpt1
-        .set_clock_source(imxrt1060::gpt::ClockSource::CrystalOscillator);
-    peripherals.gpt1.set_oscillator_divider(3);
-    peripherals.gpt1.start();
+    peripherals.gpt1.start(
+        peripherals.ccm.perclk_sel(),
+        peripherals.ccm.perclk_divider(),
+    );
 
     cortexm7::nvic::Nvic::new(imxrt1060::nvic::GPT1).enable();
     cortexm7::nvic::Nvic::new(imxrt1060::nvic::LPUART2).enable();
@@ -193,11 +202,10 @@ pub unsafe fn reset_handler() {
 
     // Alarm
     let mux_alarm = components::alarm::AlarmMuxComponent::new(&peripherals.gpt1).finalize(
-        components::alarm_mux_component_helper!(imxrt1060::gpt::Gpt<GptFreq>),
+        components::alarm_mux_component_helper!(imxrt1060::gpt::Gpt1),
     );
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm).finalize(
-        components::alarm_component_helper!(imxrt1060::gpt::Gpt<GptFreq>),
-    );
+    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
+        .finalize(components::alarm_component_helper!(imxrt1060::gpt::Gpt1));
 
     //
     // Capabilities
@@ -249,7 +257,7 @@ pub unsafe fn reset_handler() {
             &_eappmem as *const u8 as usize - &_sappmem as *const u8 as usize,
         ),
         &mut PROCESSES,
-        FAULT_RESPONSE,
+        &FAULT_RESPONSE,
         &process_management_capability,
     )
     .unwrap();

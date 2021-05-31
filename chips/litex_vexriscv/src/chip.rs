@@ -2,6 +2,7 @@
 
 use core::fmt::Write;
 use kernel;
+use kernel::common::registers::interfaces::{ReadWriteable, Readable};
 use kernel::debug;
 use kernel::hil::time::Alarm;
 use kernel::InterruptService;
@@ -22,7 +23,7 @@ pub struct LiteXVexRiscv<A: 'static + Alarm<'static>, I: 'static + InterruptServ
     soc_identifier: &'static str,
     userspace_kernel_boundary: SysCall,
     interrupt_controller: &'static VexRiscvInterruptController,
-    pmp: PMP<16, 8>,
+    pmp: PMP<8>,
     scheduler_timer: kernel::VirtualSchedulerTimer<A>,
     interrupt_service: &'static I,
 }
@@ -60,7 +61,7 @@ impl<A: 'static + Alarm<'static>, I: 'static + InterruptService<()>> LiteXVexRis
 impl<A: 'static + Alarm<'static>, I: 'static + InterruptService<()>> kernel::Chip
     for LiteXVexRiscv<A, I>
 {
-    type MPU = PMP<16, 8>;
+    type MPU = PMP<8>;
     type UserspaceKernelBoundary = SysCall;
     type SchedulerTimer = kernel::VirtualSchedulerTimer<A>;
     type WatchDog = ();
