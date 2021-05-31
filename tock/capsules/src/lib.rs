@@ -1,4 +1,4 @@
-#![feature(const_fn)]
+#![feature(const_fn_trait_bound)]
 #![forbid(unsafe_code)]
 #![no_std]
 
@@ -32,6 +32,7 @@ pub mod gpio;
 pub mod gpio_async;
 pub mod hd44780;
 pub mod hmac;
+pub mod hts221;
 pub mod humidity;
 pub mod i2c_master;
 pub mod i2c_master_slave_driver;

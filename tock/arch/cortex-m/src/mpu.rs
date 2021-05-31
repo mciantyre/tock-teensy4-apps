@@ -1,5 +1,5 @@
-//! Implementation of the memory protection unit for the Cortex-M3 and
-//! Cortex-M4.
+//! Implementation of the memory protection unit for the Cortex-M3,
+//! Cortex-M4, and Cortex-M7
 
 use core::cell::Cell;
 use core::cmp;
@@ -7,12 +7,13 @@ use core::fmt;
 use kernel;
 use kernel::common::cells::OptionalCell;
 use kernel::common::math;
+use kernel::common::registers::interfaces::{Readable, Writeable};
 use kernel::common::registers::{register_bitfields, FieldValue, ReadOnly, ReadWrite};
 use kernel::common::StaticRef;
 use kernel::mpu;
-use kernel::AppId;
+use kernel::ProcessId;
 
-/// MPU Registers for the Cortex-M3 and Cortex-M4 families
+/// MPU Registers for the Cortex-M3, Cortex-M4 and Cortex-M7 families
 /// Described in section 4.5 of
 /// <http://infocenter.arm.com/help/topic/com.arm.doc.dui0553a/DUI0553A_cortex_m4_dgug.pdf>
 #[repr(C)]
@@ -127,18 +128,18 @@ const MPU_BASE_ADDRESS: StaticRef<MpuRegisters> =
 ///
 /// There should only be one instantiation of this object as it represents
 /// real hardware.
-pub struct MPU {
+pub struct MPU<const NUM_REGIONS: usize> {
     /// MMIO reference to MPU registers.
     registers: StaticRef<MpuRegisters>,
     /// Optimization logic. This is used to indicate which application the MPU
     /// is currently configured for so that the MPU can skip updating when the
     /// kernel returns to the same app.
-    hardware_is_configured_for: OptionalCell<AppId>,
+    hardware_is_configured_for: OptionalCell<ProcessId>,
 }
 
-impl MPU {
-    pub const unsafe fn new() -> MPU {
-        MPU {
+impl<const NUM_REGIONS: usize> MPU<NUM_REGIONS> {
+    pub const unsafe fn new() -> Self {
+        Self {
             registers: MPU_BASE_ADDRESS,
             hardware_is_configured_for: OptionalCell::empty(),
         }
@@ -150,9 +151,9 @@ impl MPU {
 /// The cortex-m MPU has eight regions, all of which must be configured (though
 /// unused regions may be configured as disabled). This struct caches the result
 /// of region configuration calculation
-pub struct CortexMConfig {
+pub struct CortexMConfig<const NUM_REGIONS: usize> {
     /// The computed region configuration for this process.
-    regions: [CortexMRegion; 8],
+    regions: [CortexMRegion; NUM_REGIONS],
     /// Has the configuration changed since the last time the this process
     /// configuration was written to hardware?
     is_dirty: Cell<bool>,
@@ -160,25 +161,21 @@ pub struct CortexMConfig {
 
 const APP_MEMORY_REGION_NUM: usize = 0;
 
-impl Default for CortexMConfig {
-    fn default() -> CortexMConfig {
-        CortexMConfig {
-            regions: [
-                CortexMRegion::empty(0),
-                CortexMRegion::empty(1),
-                CortexMRegion::empty(2),
-                CortexMRegion::empty(3),
-                CortexMRegion::empty(4),
-                CortexMRegion::empty(5),
-                CortexMRegion::empty(6),
-                CortexMRegion::empty(7),
-            ],
+impl<const NUM_REGIONS: usize> Default for CortexMConfig<NUM_REGIONS> {
+    fn default() -> Self {
+        // a bit of a hack to initialize array without unsafe
+        let mut ret = Self {
+            regions: [CortexMRegion::empty(0); NUM_REGIONS],
             is_dirty: Cell::new(true),
+        };
+        for i in 0..NUM_REGIONS {
+            ret.regions[i] = CortexMRegion::empty(i);
         }
+        ret
     }
 }
 
-impl fmt::Display for CortexMConfig {
+impl<const NUM_REGIONS: usize> fmt::Display for CortexMConfig<NUM_REGIONS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "\r\n Cortex-M MPU")?;
         for (i, region) in self.regions.iter().enumerate() {
@@ -232,7 +229,7 @@ impl fmt::Display for CortexMConfig {
     }
 }
 
-impl CortexMConfig {
+impl<const NUM_REGIONS: usize> CortexMConfig<NUM_REGIONS> {
     fn unused_region_number(&self) -> Option<usize> {
         for (number, region) in self.regions.iter().enumerate() {
             if number == APP_MEMORY_REGION_NUM {
@@ -362,8 +359,8 @@ impl CortexMRegion {
     }
 }
 
-impl kernel::mpu::MPU for MPU {
-    type MpuConfig = CortexMConfig;
+impl<const NUM_REGIONS: usize> kernel::mpu::MPU for MPU<NUM_REGIONS> {
+    type MpuConfig = CortexMConfig<NUM_REGIONS>;
 
     fn clear_mpu(&self) {
         self.registers.ctrl.write(Control::ENABLE::CLEAR);
@@ -644,19 +641,29 @@ impl kernel::mpu::MPU for MPU {
             return Err(());
         }
 
+        // Number of bytes the process wants access to.
         let app_memory_size = app_memory_break - region_start;
+        // Number of bytes the kernel has reserved.
         let kernel_memory_size = region_start + region_size - kernel_memory_break;
+
+        // There are eight subregions for every region in the Cortex-M3/4 MPU.
+        let subregion_size = region_size / 8;
 
         // Determine the number of subregions to enable.
         let num_subregions_used = {
             if kernel_memory_size == 0 {
+                // We can give all of the memory to the app, i.e. enable
+                // all eight subregions.
                 8
             } else {
-                app_memory_size * 8 / region_size + 1
+                // Calculate the minimum number of subregions needed to cover
+                // the `app_memory_size`.
+                //
+                // Want `round_up(app_memory_size / subregion_size)`.
+                (app_memory_size + subregion_size - 1) / subregion_size
             }
         };
 
-        let subregion_size = region_size / 8;
         let subregions_end = region_start + subregion_size * num_subregions_used;
 
         // If we can no longer cover app memory with an MPU region without overlapping kernel
@@ -681,7 +688,7 @@ impl kernel::mpu::MPU for MPU {
         Ok(())
     }
 
-    fn configure_mpu(&self, config: &Self::MpuConfig, app_id: &AppId) {
+    fn configure_mpu(&self, config: &Self::MpuConfig, app_id: &ProcessId) {
         // If the hardware is already configured for this app and the app's MPU
         // configuration has not changed, then skip the hardware update.
         if !self.hardware_is_configured_for.contains(app_id) || config.is_dirty.get() {

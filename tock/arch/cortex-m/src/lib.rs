@@ -2,13 +2,13 @@
 
 #![crate_name = "cortexm"]
 #![crate_type = "rlib"]
-#![feature(llvm_asm)]
 #![feature(asm)]
 #![feature(naked_functions)]
 #![no_std]
 
 use core::fmt::Write;
 
+pub mod mpu;
 pub mod nvic;
 pub mod scb;
 pub mod support;
@@ -17,8 +17,6 @@ pub mod systick;
 
 /// These constants are defined in the linker script.
 extern "C" {
-    // _estack is not really a function, but it makes the types work
-    // You should never actually invoke it!!
     static _estack: u32;
     static mut _sstack: u32;
     static mut _szero: u32;
@@ -34,9 +32,14 @@ extern "C" {
 /// interrupt has occurred, but is slightly more efficient than the
 /// `generic_isr` handler on account of not needing to mark the interrupt as
 /// pending.
-#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    target_arch = "arm",
+    target_feature = "v7",
+    target_feature = "thumb-mode",
+    target_os = "none"
+))]
 #[naked]
-pub unsafe extern "C" fn systick_handler() {
+pub unsafe extern "C" fn systick_handler_arm_v7m() {
     asm!(
         "
     // Set thread mode to privileged to switch back to kernel mode.
@@ -59,9 +62,14 @@ pub unsafe extern "C" fn systick_handler() {
 
 /// This is called after a `svc` instruction, both when switching to userspace
 /// and when userspace makes a system call.
-#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    target_arch = "arm",
+    target_feature = "v7",
+    target_feature = "thumb-mode",
+    target_os = "none"
+))]
 #[naked]
-pub unsafe extern "C" fn svc_handler() {
+pub unsafe extern "C" fn svc_handler_arm_v7m() {
     asm!(
         "
     // First check to see which direction we are going in. If the link register
@@ -116,9 +124,14 @@ pub unsafe extern "C" fn svc_handler() {
 ///
 /// If the ISR is called while an app is running, this will switch control to
 /// the kernel.
-#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    target_arch = "arm",
+    target_feature = "v7",
+    target_feature = "thumb-mode",
+    target_os = "none"
+))]
 #[naked]
-pub unsafe extern "C" fn generic_isr() {
+pub unsafe extern "C" fn generic_isr_arm_v7m() {
     asm!(
         "
     // Set thread mode to privileged to ensure we are executing as the kernel.
@@ -210,27 +223,105 @@ pub unsafe extern "C" fn unhandled_interrupt() {
     panic!("Unhandled Interrupt. ISR {} is active.", interrupt_number);
 }
 
+/// Assembly function to initialize the .bss and .data sections in RAM.
+///
+/// We need to (unfortunately) do these operations in assembly because it is
+/// not valid to run Rust code without RAM initialized.
+///
+/// See https://github.com/tock/tock/issues/2222 for more information.
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[naked]
+pub unsafe extern "C" fn initialize_ram_jump_to_main() {
+    asm!(
+        "
+    // Start by initializing .bss memory. The Tock linker script defines
+    // `_szero` and `_ezero` to mark the .bss segment.
+    ldr r0, ={sbss}     // r0 = first address of .bss
+    ldr r1, ={ebss}     // r1 = first address after .bss
+
+    mov r2, #0          // r2 = 0
+
+  bss_init_loop:
+    cmp r1, r0          // We increment r0. Check if we have reached r1
+                        // (end of .bss), and stop if so.
+    beq bss_init_done   // If r0 == r1, we are done.
+    stm r0!, {{r2}}     // Write a word to the address in r0, and increment r0.
+                        // Since r2 contains zero, this will clear the memory
+                        // pointed to by r0. Using `stm` (store multiple) with the
+                        // bang allows us to also increment r0 automatically.
+    b bss_init_loop     // Continue the loop.
+
+  bss_init_done:
+
+
+    // Now initialize .data memory. This involves coping the values right at the
+    // end of the .text section (in flash) into the .data section (in RAM).
+    ldr r0, ={sdata}    // r0 = first address of data section in RAM
+    ldr r1, ={edata}    // r1 = first address after data section in RAM
+    ldr r2, ={etext}    // r2 = address of stored data initial values
+
+  data_init_loop:
+    cmp r1, r0          // We increment r0. Check if we have reached the end
+                        // of the data section, and if so we are done.
+    beq data_init_done  // r0 == r1, and we have iterated through the .data section
+    ldm r2!, {{r3}}     // r3 = *(r2), r2 += 1. Load the initial value into r3,
+                        // and use the bang to increment r2.
+    stm r0!, {{r3}}     // *(r0) = r3, r0 += 1. Store the value to memory, and
+                        // increment r0.
+    b data_init_loop    // Continue the loop.
+
+  data_init_done:
+
+    // Now that memory has been initialized, we can jump to main() where the
+    // board initialization takes place and Rust code starts.
+    bl main
+    ",
+        sbss = sym _szero,
+        ebss = sym _ezero,
+        sdata = sym _srelocate,
+        edata = sym _erelocate,
+        etext = sym _etext,
+        options(noreturn)
+    );
+}
+
 /// Assembly function called from `UserspaceKernelBoundary` to switch to an
 /// an application. This handles storing and restoring application state before
 /// and after the switch.
-#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    target_arch = "arm",
+    target_feature = "v7",
+    target_feature = "thumb-mode",
+    target_os = "none"
+))]
 #[no_mangle]
 pub unsafe extern "C" fn switch_to_user_arm_v7m(
     mut user_stack: *const usize,
     process_regs: &mut [usize; 8],
 ) -> *const usize {
-    llvm_asm!(
-        "
+    asm!(
+    "
+    // Rust `asm!()` macro (as of May 2021) will not let us mark r6, r7 and r9
+    // as clobbers. r6 and r9 is used internally by LLVM, and r7 is used for
+    // the frame pointer. However, in the process of restoring and saving the
+    // process's registers, we do in fact clobber r6, r7 and r9. So, we work
+    // around this by doing our own manual saving of r6 using r2, r7 using r3,
+    // r9 using r12, and then mark those as clobbered.
+    mov r2, r6
+    mov r3, r7
+    mov r12, r9
+
     // The arguments passed in are:
-    // - `r0` is the top of the user stack
+    // - `r0` is the bottom of the user stack
     // - `r1` is a reference to `CortexMStoredState.regs`
 
     // Load bottom of stack into Process Stack Pointer.
-    msr psp, $0
+    msr psp, r0  // PSP = r0
 
     // Load non-hardware-stacked registers from the process stored state. Ensure
-    // that $2 is stored in a callee saved register.
-    ldmia $2, {r4-r11}
+    // that the address register (right now r1) is stored in a callee saved
+    // register.
+    ldmia r1, {{r4-r11}}
 
     // SWITCH
     svc 0xff   // It doesn't matter which SVC number we use here as it has no
@@ -242,18 +333,32 @@ pub unsafe extern "C" fn switch_to_user_arm_v7m(
 
     // Push non-hardware-stacked registers into the saved state for the
     // application.
-    stmia $2, {r4-r11}
+    stmia r1, {{r4-r11}}
 
     // Update the user stack pointer with the current value after the
     // application has executed.
-    mrs $0, PSP   // r0 = PSP"
-    : "={r0}"(user_stack)
-    : "{r0}"(user_stack), "{r1}"(process_regs)
-    : "r4","r5","r6","r8","r9","r10","r11" : "volatile" );
+    mrs r0, PSP   // r0 = PSP
+
+    // Need to restore r6 and r7 since we clobbered them when switching to and
+    // from the app.
+    mov r6, r2
+    mov r7, r3
+    mov r9, r12
+    ",
+    inout("r0") user_stack,
+    in("r1") process_regs,
+    out("r2") _, out("r3") _, out("r4") _, out("r5") _, out("r8") _, out("r10") _,
+    out("r11") _, out("r12") _);
+
     user_stack
 }
 
-#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    target_arch = "arm",
+    target_feature = "v7",
+    target_feature = "thumb-mode",
+    target_os = "none"
+))]
 #[inline(never)]
 unsafe fn kernel_hardfault_arm_v7m(faulting_stack: *mut u32) -> ! {
     let stacked_r0: u32 = *faulting_stack.offset(0);
@@ -396,7 +501,12 @@ unsafe fn kernel_hardfault_arm_v7m(faulting_stack: *mut u32) -> ! {
     );
 }
 
-#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    target_arch = "arm",
+    target_feature = "v7",
+    target_feature = "thumb-mode",
+    target_os = "none"
+))]
 /// Continue the hardfault handler. This function is not `#[naked]`, meaning we can mix
 /// `asm!()` and Rust. We separate this logic to not have to write the entire fault
 /// handler entirely in assembly.
@@ -453,7 +563,12 @@ unsafe extern "C" fn hard_fault_handler_arm_v7m_continued(
     }
 }
 
-#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    target_arch = "arm",
+    target_feature = "v7",
+    target_feature = "thumb-mode",
+    target_os = "none"
+))]
 #[naked]
 pub unsafe extern "C" fn hard_fault_handler_arm_v7m() {
     // First need to determine if this a kernel fault or a userspace fault, and store
@@ -537,7 +652,7 @@ pub unsafe fn print_cortexm_state(writer: &mut dyn Write) {
     let vecttbl = (hfsr & 0x02) == 0x02;
     let forced = (hfsr & 0x40000000) == 0x40000000;
 
-    let _ = writer.write_fmt(format_args!("\r\n---| Fault Status |---\r\n"));
+    let _ = writer.write_fmt(format_args!("\r\n---| Cortex-M Fault Status |---\r\n"));
 
     if iaccviol {
         let _ = writer.write_fmt(format_args!(
@@ -670,7 +785,7 @@ pub unsafe fn print_cortexm_state(writer: &mut dyn Write) {
     }
 
     if cfsr == 0 && hfsr == 0 {
-        let _ = writer.write_fmt(format_args!("No faults detected.\r\n"));
+        let _ = writer.write_fmt(format_args!("No Cortex-M faults detected.\r\n"));
     } else {
         let _ = writer.write_fmt(format_args!(
             "Fault Status Register (CFSR):       {:#010X}\r\n",
@@ -713,22 +828,27 @@ pub fn ipsr_isr_number_to_str(isr_number: usize) -> &'static str {
 ///////////////////////////////////////////////////////////////////
 
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn systick_handler() {
+pub unsafe extern "C" fn systick_handler_arm_v7m() {
     unimplemented!()
 }
 
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn svc_handler() {
+pub unsafe extern "C" fn svc_handler_arm_v7m() {
     unimplemented!()
 }
 
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn generic_isr() {
+pub unsafe extern "C" fn generic_isr_arm_v7m() {
     unimplemented!()
 }
 
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
 pub unsafe extern "C" fn unhandled_interrupt() {
+    unimplemented!()
+}
+
+#[cfg(not(any(target_arch = "arm", target_os = "none")))]
+pub unsafe extern "C" fn initialize_ram_jump_to_main() {
     unimplemented!()
 }
 
