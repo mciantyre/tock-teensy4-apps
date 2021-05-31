@@ -1,3 +1,4 @@
+#include <string.h>
 #include <tock.h>
 
 #if defined(STACK_SIZE)
@@ -77,7 +78,7 @@ void _start(void* app_start __attribute__((unused)),
   // 8 byte boundary per section 5.2.1.2 here:
   // http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042f/IHI0042F_aapcs.pdf
 
-  asm volatile (
+  __asm__ volatile (
     // Compute the stack top
     //
     // struct hdr* myhdr = (struct hdr*)app_start;
@@ -124,21 +125,21 @@ void _start(void* app_start __attribute__((unused)),
     // memop(0, app_brk);
     "movs r0, #0\n"
     "movs r1, r5\n"
-    "svc 4\n"                   // memop
+    "svc 5\n"                   // memop
     //
     // Debug support, tell the kernel the stack location
     //
     // memop(10, stacktop);
     "movs r0, #10\n"
     "movs r1, r4\n"
-    "svc 4\n"                   // memop
+    "svc 5\n"                   // memop
     //
     // Debug support, tell the kernel the heap location
     //
     // memop(11, app_brk);
     "movs r0, #11\n"
     "movs r1, r5\n"
-    "svc 4\n"                   // memop
+    "svc 5\n"                   // memop
     //
     // Setup initial stack pointer for normal execution. If we did this before
     // then this is redundant and just a no-op. If not then no harm in
@@ -163,7 +164,7 @@ void _start(void* app_start __attribute__((unused)),
 
 #elif defined(__riscv)
 
-  asm volatile (
+  __asm__ volatile (
     // Compute the stack top.
     //
     // struct hdr* myhdr = (struct hdr*) app_start;
@@ -210,25 +211,25 @@ void _start(void* app_start __attribute__((unused)),
     // Call `brk` to set to requested memory
 
     // memop(0, stacktop + appdata_size);
-    "li  a0, 4\n"               // a0 = 4   // memop syscall
-    "li  a1, 0\n"               // a1 = 0
-    "mv  a2, t1\n"              // a2 = app_brk
+    "li  a4, 5\n"               // a4 = 5   // memop syscall
+    "li  a0, 0\n"               // a0 = 0
+    "mv  a1, t1\n"              // a1 = app_brk
     "ecall\n"                   // memop
     //
     // Debug support, tell the kernel the stack location
     //
     // memop(10, stacktop);
-    "li  a0, 4\n"               // a0 = 4   // memop syscall
-    "li  a1, 10\n"              // a1 = 10
-    "mv  a2, s1\n"              // a2 = stacktop
+    "li  a4, 5\n"               // a4 = 5   // memop syscall
+    "li  a0, 10\n"              // a0 = 10
+    "mv  a1, s1\n"              // a1 = stacktop
     "ecall\n"                   // memop
     //
     // Debug support, tell the kernel the heap location
     //
     // memop(11, app_brk);
-    "li  a0, 4\n"               // a0 = 4   // memop syscall
-    "li  a1, 11\n"              // a1 = 11
-    "mv  a2, t1\n"              // a2 = app_brk
+    "li  a4, 5\n"               // a4 = 5   // memop syscall
+    "li  a0, 11\n"              // a0 = 11
+    "mv  a1, t1\n"              // a1 = app_brk
     "ecall\n"                   // memop
     //
     // Setup initial stack pointer for normal execution
@@ -260,9 +261,9 @@ void _c_start_pic(uint32_t app_start, uint32_t mem_start) {
   // Fix up the Global Offset Table (GOT).
 
   // Get the address in memory of where the table should go.
-  volatile uint32_t* got_start = (uint32_t*)(myhdr->got_start + mem_start);
+  uint32_t* got_start = (uint32_t*)(myhdr->got_start + mem_start);
   // Get the address in flash of where the table currently is.
-  volatile uint32_t* got_sym_start = (uint32_t*)(myhdr->got_sym_start + app_start);
+  uint32_t* got_sym_start = (uint32_t*)(myhdr->got_sym_start + app_start);
   // Iterate all entries in the table and correct the addresses.
   for (uint32_t i = 0; i < (myhdr->got_size / (uint32_t)sizeof(uint32_t)); i++) {
     // Use the sentinel here. If the most significant bit is 0, then we know

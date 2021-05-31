@@ -47,7 +47,7 @@ ssize_t udp_send_to(void *buf, size_t len, sock_addr_t *dst_addr);
 // Receives messages from that socket asynchronously.
 // The callback is passed the return code for the reception.
 // Returns 0 on successful bind, negative on failure.
-ssize_t udp_recv(subscribe_cb callback, void *buf, size_t len);
+ssize_t udp_recv(subscribe_upcall callback, void *buf, size_t len);
 
 // Receives messages from the bound socket synchronously.
 // Returns 0 on successful reception, negative on failure.
@@ -59,7 +59,7 @@ ssize_t udp_recv_sync(void *buf, size_t len);
 int udp_list_ifaces(ipv6_addr_t *ifaces, size_t len);
 
 // Returns the maximum length udp payload that the app can transmit
-int udp_get_max_tx_len(void);
+int udp_get_max_tx_len(int* length);
 
 #ifdef __cplusplus
 }

@@ -23,12 +23,15 @@ int main(void) {
   printf("[DAC] Sine test app\n");
 
   ret = dac_initialize();
-  if (ret != 0) printf("ERROR initializing DAC\n");
+  if (ret != RETURNCODE_SUCCESS) {
+    printf("ERROR initializing DAC\n");
+    return 1;
+  }
 
   while (1) {
     for (int i = 0; i < 100; i++) {
       ret = dac_set_value(sine_samples[i]);
-      if (ret != 0) {
+      if (ret != RETURNCODE_SUCCESS) {
         printf("ERROR setting DAC value\n");
         return 1;
       }

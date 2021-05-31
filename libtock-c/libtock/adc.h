@@ -27,7 +27,7 @@ typedef enum {
 //
 // callback - pointer to function to be called
 // callback_args - pointer to data provided to the callback
-int adc_set_callback(subscribe_cb callback, void* callback_args);
+int adc_set_callback(subscribe_upcall callback, void* callback_args);
 
 // provides an application buffer to the ADC driver to fill with samples
 //
@@ -48,7 +48,7 @@ int adc_set_double_buffer(uint16_t* buffer, uint32_t length);
 bool adc_is_present(void);
 
 // query how many channels are available in the ADC driver
-int adc_channel_count(void);
+int adc_channel_count(int* count);
 
 // request a single analog sample
 //

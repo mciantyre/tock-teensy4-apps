@@ -8,118 +8,73 @@ struct max17205_data {
   bool fired;
 };
 
-static struct max17205_data result = { .fired = false, .rc = 0, .value0 = 0, .value1 = 0 };
-static subscribe_cb* user_cb       = NULL;
+static struct max17205_data result   = { .fired = false, .rc = 0, .value0 = 0, .value1 = 0 };
+static subscribe_upcall* user_upcall = NULL;
 
 // Internal callback for faking synchronous reads
-static void internal_user_cb(int return_code,
-                             int value0,
-                             int value1,
-                             void* ud) {
+static void internal_user_upcall(int status,
+                                 int value0,
+                                 int value1,
+                                 void* ud) {
 
   struct max17205_data* data = (struct max17205_data*) ud;
-  data->rc     = return_code;
+  data->rc     = tock_status_to_returncode(status);
   data->value0 = value0;
   data->value1 = value1;
   data->fired  = true;
 }
 
-static bool is_busy = false;
 // Lower level CB that allows us to stop more commands while busy
-static void max17205_cb(int return_code,
-                        int value0,
-                        int value1,
-                        void* ud) {
-  is_busy = false;
-  if (user_cb) {
-    user_cb(return_code, value0, value1, ud);
+static void max17205_upcall(int return_code,
+                            int value0,
+                            int value1,
+                            void* ud) {
+  if (user_upcall) {
+    user_upcall(return_code, value0, value1, ud);
   }
 }
 
-int max17205_set_callback (subscribe_cb callback, void* callback_args) {
+int max17205_set_callback (subscribe_upcall callback, void* callback_args) {
   // Set the user-level calllback to the provided one
-  user_cb = callback;
+  user_upcall = callback;
 
   // Subscribe to the callback with our lower-layer callback, but pass
-  // callback arugments.
-  return subscribe(DRIVER_NUM_MAX17205, 0, max17205_cb, callback_args);
+  // callback arguments.
+  subscribe_return_t sval = subscribe(DRIVER_NUM_MAX17205, 0, max17205_upcall, callback_args);
+  return tock_subscribe_return_to_returncode(sval);
 }
 
 int max17205_read_status(void) {
-  if (is_busy) {
-    return TOCK_EBUSY;
-  } else {
-    is_busy = true;
-    int rc = command(DRIVER_NUM_MAX17205, 1, 0, 0);
-    if (rc != TOCK_SUCCESS) {
-      is_busy = false;
-    }
 
-    return rc;
-  }
+  syscall_return_t com = command(DRIVER_NUM_MAX17205, 1, 0, 0);
+  return tock_command_return_novalue_to_returncode(com);
 }
 
 int max17205_read_soc(void) {
-  if (is_busy) {
-    return TOCK_EBUSY;
-  } else {
-    is_busy = true;
-    int rc = command(DRIVER_NUM_MAX17205, 2, 0, 0);
-    if (rc != TOCK_SUCCESS) {
-      is_busy = false;
-    }
-
-    return rc;
-  }
+  syscall_return_t com = command(DRIVER_NUM_MAX17205, 2, 0, 0);
+  return tock_command_return_novalue_to_returncode(com);
 }
 
 int max17205_read_voltage_current(void) {
-  if (is_busy) {
-    return TOCK_EBUSY;
-  } else {
-    is_busy = true;
-    int rc = command(DRIVER_NUM_MAX17205, 3, 0, 0);
-    if (rc != TOCK_SUCCESS) {
-      is_busy = false;
-    }
-
-    return rc;
-  }
+  syscall_return_t com = command(DRIVER_NUM_MAX17205, 3, 0, 0);
+  return tock_command_return_novalue_to_returncode(com);
 }
 
 int max17205_read_coulomb(void) {
-  if (is_busy) {
-    return TOCK_EBUSY;
-  } else {
-    is_busy = true;
-    int rc = command(DRIVER_NUM_MAX17205, 4, 0, 0);
-    if (rc != TOCK_SUCCESS) {
-      is_busy = false;
-    }
-
-    return rc;
-  }
+  syscall_return_t com = command(DRIVER_NUM_MAX17205, 4, 0, 0);
+  return tock_command_return_novalue_to_returncode(com);
 }
 
 int max17205_read_rom_id(void) {
-  if (is_busy) {
-    return TOCK_EBUSY;
-  } else {
-    is_busy = true;
-    int rc = command(DRIVER_NUM_MAX17205, 5, 0, 0);
-    if (rc != TOCK_SUCCESS) {
-      is_busy = false;
-    }
-
-    return rc;
-  }
+  syscall_return_t com = command(DRIVER_NUM_MAX17205, 5, 0, 0);
+  return tock_command_return_novalue_to_returncode(com);
 }
 
 int max17205_read_status_sync(uint16_t* status) {
   int err;
   result.fired = false;
 
-  err = max17205_set_callback(internal_user_cb, (void*) &result);
+  err = max17205_set_callback(internal_user_upcall, (void*) &result);
   if (err < 0) return err;
 
   err = max17205_read_status();
@@ -137,7 +92,7 @@ int max17205_read_soc_sync(uint16_t* percent, uint16_t* soc_mah, uint16_t* soc_m
   int err;
   result.fired = false;
 
-  err = max17205_set_callback(internal_user_cb, (void*) &result);
+  err = max17205_set_callback(internal_user_upcall, (void*) &result);
   if (err < 0) return err;
 
   err = max17205_read_soc();
@@ -157,7 +112,7 @@ int max17205_read_voltage_current_sync(uint16_t* voltage, int16_t* current) {
   int err;
   result.fired = false;
 
-  err = max17205_set_callback(internal_user_cb, (void*) &result);
+  err = max17205_set_callback(internal_user_upcall, (void*) &result);
   if (err < 0) return err;
 
   err = max17205_read_voltage_current();
@@ -176,7 +131,7 @@ int max17205_read_coulomb_sync(uint16_t* coulomb) {
   int err;
   result.fired = false;
 
-  err = max17205_set_callback(internal_user_cb, (void*) &result);
+  err = max17205_set_callback(internal_user_upcall, (void*) &result);
   if (err < 0) return err;
 
   err = max17205_read_coulomb();
@@ -194,7 +149,7 @@ int max17205_read_rom_id_sync(uint64_t* rom_id) {
   int err;
   result.fired = false;
 
-  err = max17205_set_callback(internal_user_cb, (void*) &result);
+  err = max17205_set_callback(internal_user_upcall, (void*) &result);
   if (err < 0) return err;
 
   err = max17205_read_rom_id();

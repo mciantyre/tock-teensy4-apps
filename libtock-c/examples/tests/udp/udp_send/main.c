@@ -9,7 +9,6 @@
 #include <temperature.h>
 #include <timer.h>
 
-#include <ieee802154.h>
 #include <udp.h>
 
 #define DEBUG 1
@@ -24,10 +23,6 @@ int main(void) {
   printf("[UDP] Starting UDP_Send Test App.\n");
 
   static char packet[70];
-
-  ieee802154_set_pan(0xABCD);
-  ieee802154_config_commit();
-  ieee802154_up();
 
   ipv6_addr_t ifaces[10];
   udp_list_ifaces(ifaces, 10);
@@ -73,7 +68,7 @@ int main(void) {
     ssize_t result = udp_send_to(packet, len, &destination);
 
     switch (result) {
-      case TOCK_SUCCESS:
+      case RETURNCODE_SUCCESS:
         if (DEBUG) {
           printf("Packet sent.\n\n");
         }
