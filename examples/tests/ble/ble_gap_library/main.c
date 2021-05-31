@@ -20,26 +20,26 @@ int main(void) {
   printf("[Test] Bluetooth Low Energy Gap Library\r\n");
 
   err = test_off_by_one_name();
-  if (err == TOCK_SUCCESS) {
-    printf("test_off_by_one_name failed: %s\r\n", tock_strerror(err));
+  if (err == RETURNCODE_SUCCESS) {
+    printf("test_off_by_one_name failed: %s\r\n", tock_strrcode(err));
     return err;
   }
 
   err = test_off_by_one_service_data();
-  if (err == TOCK_SUCCESS) {
-    printf("test_off_by_one_service_data failed: %s\r\n", tock_strerror(err));
+  if (err == RETURNCODE_SUCCESS) {
+    printf("test_off_by_one_service_data failed: %s\r\n", tock_strrcode(err));
     return err;
   }
 
   err = test_exactly_full_buffer_service_data();
-  if (err != TOCK_SUCCESS) {
-    printf("test_exactly_full_buffer_service_data failed: %s\r\n", tock_strerror(err));
+  if (err != RETURNCODE_SUCCESS) {
+    printf("test_exactly_full_buffer_service_data failed: %s\r\n", tock_strrcode(err));
     return err;
   }
 
   err = test_exactly_full_buffer();
-  if (err != TOCK_SUCCESS) {
-    printf("test_exactly_full_buffer failed: %s\r\n", tock_strerror(err));
+  if (err != RETURNCODE_SUCCESS) {
+    printf("test_exactly_full_buffer failed: %s\r\n", tock_strrcode(err));
     return err;
   }
 

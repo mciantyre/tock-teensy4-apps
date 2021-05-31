@@ -40,7 +40,8 @@ static void ipc_callback(int pid, int len, int buf, __attribute__ ((unused)) voi
   }
 
   // Fill the buffer with random bytes.
-  int number_of_bytes_received = rng_sync(rng, len, number_of_bytes);
+  int number_of_bytes_received;
+  rng_sync(rng, len, number_of_bytes, &number_of_bytes_received);
   memcpy(buffer, rng, number_of_bytes_received);
   free(rng);
 
@@ -51,6 +52,6 @@ static void ipc_callback(int pid, int len, int buf, __attribute__ ((unused)) voi
 int main(void) {
   // Register the IPC service for this app. It is identified by the PACKAGE_NAME
   // of this app.
-  ipc_register_svc(ipc_callback, NULL);
+  ipc_register_service_callback(ipc_callback, NULL);
   return 0;
 }

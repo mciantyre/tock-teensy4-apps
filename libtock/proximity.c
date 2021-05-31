@@ -27,16 +27,19 @@ static void cb(int proximity,
   data->fired     = true;
 }
 
-int proximity_set_callback(subscribe_cb callback, void *callback_args) {
-  return subscribe(DRIVER_NUM_PROXIMITY, 0, callback, callback_args);
+int proximity_set_callback(subscribe_upcall upcall, void *callback_args) {
+  subscribe_return_t sval = subscribe(DRIVER_NUM_PROXIMITY, 0, upcall, callback_args);
+  return tock_subscribe_return_to_returncode(sval);
 }
 
 int proximity_read(void) {
-  return command(DRIVER_NUM_PROXIMITY, 1, 0, 0);
+  syscall_return_t com = command(DRIVER_NUM_PROXIMITY, 1, 0, 0);
+  return tock_command_return_novalue_to_returncode(com);
 }
 
 int proximity_read_on_interrupt(void) {
-  return command(DRIVER_NUM_PROXIMITY, 2, threshes.lower_threshold, threshes.higher_threshold);
+  syscall_return_t com = command(DRIVER_NUM_PROXIMITY, 2, threshes.lower_threshold, threshes.higher_threshold);
+  return tock_command_return_novalue_to_returncode(com);
 }
 
 int proximity_set_interrupt_thresholds(uint8_t lower, uint8_t upper) {
@@ -63,7 +66,7 @@ int proximity_read_sync(uint8_t *proximity) {
 
   *proximity = result.proximity;
 
-  return 0;
+  return RETURNCODE_SUCCESS;
 }
 
 int proximity_read_on_interrupt_sync(uint8_t *proximity) {
@@ -85,5 +88,5 @@ int proximity_read_on_interrupt_sync(uint8_t *proximity) {
 
   *proximity = result.proximity;
 
-  return 0;
+  return RETURNCODE_SUCCESS;
 }

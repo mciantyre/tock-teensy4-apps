@@ -65,7 +65,11 @@ int main(void) {
   printf(" : %d, and binding to that socket.\n", addr.port);
   sock_handle_t h;
   handle = &h;
-  udp_bind(handle, &addr, BUF_BIND_CFG);
+  int ret = udp_bind(handle, &addr, BUF_BIND_CFG);
+  if (ret < 0) {
+    printf("Error in bind: %d\n", ret);
+  }
+  ;
 
   ieee802154_set_address(49138); // Corresponds to the dst mac addr set in kernel
   ieee802154_set_pan(0xABCD);
@@ -76,16 +80,16 @@ int main(void) {
   ssize_t result = udp_recv(callback, packet_rx, MAX_RX_PACKET_LEN);
 
   switch (result) {
-    case TOCK_SUCCESS:
+    case RETURNCODE_SUCCESS:
       printf("Succesfully bound to socket, listening for UDP packets\n\n");
       break;
-    case TOCK_EINVAL:
+    case RETURNCODE_EINVAL:
       printf("The address requested is not a local interface\n");
       break;
-    case TOCK_EBUSY:
+    case RETURNCODE_EBUSY:
       printf("Another userland app has already bound to this addr/port\n");
       break;
-    case TOCK_ERESERVE:
+    case RETURNCODE_ERESERVE:
       printf("Receive Failure. Must bind to a port before calling receive\n");
       break;
     default:

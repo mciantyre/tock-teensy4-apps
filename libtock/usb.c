@@ -1,20 +1,22 @@
 #include "usb.h"
 
 int usb_exists(void) {
-  return command(DRIVER_NUM_USB, 0, 0, 0) >= 0;
+  return driver_exists(DRIVER_NUM_USB);
 }
 
-int usb_subscribe(subscribe_cb callback, void *ud) {
-  return subscribe(DRIVER_NUM_USB, 0, callback, ud);
+int usb_subscribe(subscribe_upcall upcall, void *ud) {
+  subscribe_return_t sval = subscribe(DRIVER_NUM_USB, 0, upcall, ud);
+  return tock_subscribe_return_to_returncode(sval);
 }
 
 int usb_enable_and_attach_async(void) {
-  return command(DRIVER_NUM_USB, 1, 0, 0);
+  syscall_return_t cval = command(DRIVER_NUM_USB, 1, 0, 0);
+  return tock_command_return_novalue_to_returncode(cval);
 }
 
 struct data {
   bool fired;
-  int status;
+  int rcode;
 };
 
 static void callback(int status,
@@ -23,24 +25,23 @@ static void callback(int status,
                      void *data)
 {
   struct data *d = data;
-  d->fired  = true;
-  d->status = status;
+  d->fired = true;
+  d->rcode = tock_status_to_returncode(status);
 }
 
 int usb_enable_and_attach(void)
 {
-  int status;
+  int err;
 
   struct data d = { .fired = false };
 
-  if ((status = usb_subscribe(callback, (void *) &d)) != TOCK_SUCCESS) {
-    return status;
-  }
+  err = usb_subscribe(callback, (void *) &d);
+  if (err < 0) return err;
 
-  if ((status = usb_enable_and_attach_async()) != TOCK_SUCCESS) {
-    return status;
-  }
+  err = usb_enable_and_attach_async();
+  if (err < 0) return err;
 
   yield_for(&d.fired);
-  return d.status;
+
+  return d.rcode;
 }

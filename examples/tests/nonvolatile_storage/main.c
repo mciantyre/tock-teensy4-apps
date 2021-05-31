@@ -38,7 +38,8 @@ int main (void) {
 }
 
 static int test_all(void) {
-  int num_bytes = nonvolatile_storage_internal_get_number_bytes();
+  int num_bytes;
+  nonvolatile_storage_internal_get_number_bytes(&num_bytes);
   printf("Have %i bytes of nonvolatile storage\n", num_bytes);
 
   int r;
@@ -58,26 +59,26 @@ static int test(uint8_t *readbuf, uint8_t *writebuf, size_t size, size_t offset,
   printf("Test with size %d ...\n", size);
 
   ret = nonvolatile_storage_internal_read_buffer(readbuf, size);
-  if (ret != 0) {
+  if (ret != RETURNCODE_SUCCESS) {
     printf("\tERROR setting read buffer\n");
     return ret;
   }
 
   ret = nonvolatile_storage_internal_write_buffer(writebuf, size);
-  if (ret != 0) {
+  if (ret != RETURNCODE_SUCCESS) {
     printf("\tERROR setting write buffer\n");
     return ret;
   }
 
   // Setup callbacks
   ret = nonvolatile_storage_internal_read_done_subscribe(read_done, NULL);
-  if (ret != 0) {
+  if (ret != RETURNCODE_SUCCESS) {
     printf("\tERROR setting read done callback\n");
     return ret;
   }
 
   ret = nonvolatile_storage_internal_write_done_subscribe(write_done, NULL);
-  if (ret != 0) {
+  if (ret != RETURNCODE_SUCCESS) {
     printf("\tERROR setting write done callback\n");
     return ret;
   }
