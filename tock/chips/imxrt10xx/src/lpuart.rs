@@ -602,6 +602,28 @@ impl<'a> Lpuart<'a> {
         )
     }
 
+    /// Execute an interrupt-driven transfer.
+    fn transmit_buffer_interrupt(
+        &self,
+        tx_data: &'static mut [u8],
+        tx_len: usize,
+    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+        if self.tx_status.get() == LPUARTStateTX::Idle {
+            if tx_len <= tx_data.len() {
+                self.tx_buffer.put(Some(tx_data));
+                self.tx_position.set(0);
+                self.tx_len.set(tx_len);
+                self.tx_status.set(LPUARTStateTX::Transmitting);
+                self.enable_transmit_complete_interrupt();
+                Ok(())
+            } else {
+                Err((ErrorCode::SIZE, tx_data))
+            }
+        } else {
+            Err((ErrorCode::BUSY, tx_data))
+        }
+    }
+
     /// Execute a transfer using a DMA channel.
     ///
     /// When this call returns, the transfer buffer is associated
@@ -635,6 +657,16 @@ impl<'a> Lpuart<'a> {
             .unwrap() // OK: checked is_some above
     }
 
+    /// Abort an interrupt-driven transfer.
+    fn transmit_abort_interrupt(&self) -> Result<(), ErrorCode> {
+        if self.tx_status.get() != LPUARTStateTX::Idle {
+            self.tx_status.set(LPUARTStateTX::AbortRequested);
+            Err(ErrorCode::BUSY)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Abort a DMA transfer.
     fn transmit_abort_dma(&self) -> Result<(), ErrorCode> {
         self.registers.baud.modify(BAUD::TDMAE::CLEAR);
@@ -648,6 +680,28 @@ impl<'a> Lpuart<'a> {
             dma_channel.disable();
         });
         Ok(())
+    }
+
+    /// Schedule an interrupt-driver UART receive.
+    fn receive_buffer_interrupt(
+        &self,
+        rx_buffer: &'static mut [u8],
+        rx_len: usize,
+    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+        if self.rx_status.get() == USARTStateRX::Idle {
+            if rx_len <= rx_buffer.len() {
+                self.rx_buffer.put(Some(rx_buffer));
+                self.rx_position.set(0);
+                self.rx_len.set(rx_len);
+                self.rx_status.set(USARTStateRX::Receiving);
+                self.enable_receive_interrupt();
+                Ok(())
+            } else {
+                Err((ErrorCode::SIZE, rx_buffer))
+            }
+        } else {
+            Err((ErrorCode::BUSY, rx_buffer))
+        }
     }
 
     /// Execute a receive using a DMA channel.
@@ -685,6 +739,16 @@ impl<'a> Lpuart<'a> {
             .unwrap() // Safe: checked is_none above
     }
 
+    /// Abort an interrupt-driven receive.
+    fn receive_abort_interrupt(&self) -> Result<(), ErrorCode> {
+        if self.rx_status.get() != USARTStateRX::Idle {
+            self.rx_status.set(USARTStateRX::AbortRequested);
+            Err(ErrorCode::BUSY)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Abort a DMA receive.
     fn receive_abort_dma(&self) -> Result<(), ErrorCode> {
         self.registers.baud.modify(BAUD::RDMAE::CLEAR);
@@ -714,22 +778,8 @@ impl<'a> hil::uart::Transmit<'a> for Lpuart<'a> {
     ) -> Result<(), (ErrorCode, &'static mut [u8])> {
         if self.tx_dma_channel.is_some() {
             return self.transmit_buffer_dma(tx_data, tx_len);
-        }
-
-        // TODO move into method
-        if self.tx_status.get() == LPUARTStateTX::Idle {
-            if tx_len <= tx_data.len() {
-                self.tx_buffer.put(Some(tx_data));
-                self.tx_position.set(0);
-                self.tx_len.set(tx_len);
-                self.tx_status.set(LPUARTStateTX::Transmitting);
-                self.enable_transmit_complete_interrupt();
-                Ok(())
-            } else {
-                Err((ErrorCode::SIZE, tx_data))
-            }
         } else {
-            Err((ErrorCode::BUSY, tx_data))
+            return self.transmit_buffer_interrupt(tx_data, tx_len);
         }
     }
 
@@ -741,14 +791,8 @@ impl<'a> hil::uart::Transmit<'a> for Lpuart<'a> {
     fn transmit_abort(&self) -> Result<(), ErrorCode> {
         if self.tx_dma_channel.is_some() {
             return self.transmit_abort_dma();
-        }
-
-        // TODO move into method
-        if self.tx_status.get() != LPUARTStateTX::Idle {
-            self.tx_status.set(LPUARTStateTX::AbortRequested);
-            Err(ErrorCode::BUSY)
         } else {
-            Ok(())
+            return self.transmit_abort_interrupt();
         }
     }
 }
@@ -833,22 +877,8 @@ impl<'a> hil::uart::Receive<'a> for Lpuart<'a> {
     ) -> Result<(), (ErrorCode, &'static mut [u8])> {
         if self.rx_dma_channel.is_some() {
             return self.receive_buffer_dma(rx_buffer, rx_len);
-        }
-
-        // TODO move into method.
-        if self.rx_status.get() == USARTStateRX::Idle {
-            if rx_len <= rx_buffer.len() {
-                self.rx_buffer.put(Some(rx_buffer));
-                self.rx_position.set(0);
-                self.rx_len.set(rx_len);
-                self.rx_status.set(USARTStateRX::Receiving);
-                self.enable_receive_interrupt();
-                Ok(())
-            } else {
-                Err((ErrorCode::SIZE, rx_buffer))
-            }
         } else {
-            Err((ErrorCode::BUSY, rx_buffer))
+            return self.receive_buffer_interrupt(rx_buffer, rx_len);
         }
     }
 
@@ -860,14 +890,8 @@ impl<'a> hil::uart::Receive<'a> for Lpuart<'a> {
     fn receive_abort(&self) -> Result<(), ErrorCode> {
         if self.rx_dma_channel.is_some() {
             return self.receive_abort_dma();
-        }
-
-        // TODO move into method.
-        if self.rx_status.get() != USARTStateRX::Idle {
-            self.rx_status.set(USARTStateRX::AbortRequested);
-            Err(ErrorCode::BUSY)
         } else {
-            Ok(())
+            return self.receive_abort_interrupt();
         }
     }
 }
