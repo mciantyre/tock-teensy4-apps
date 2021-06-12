@@ -56,9 +56,17 @@ in
       rust_build
       llvm
       qemu
+
+      # Required for tools/print_tock_memory_usage.py
+      pythonPackages.cxxfilt
     ];
 
     LD_LIBRARY_PATH="${stdenv.cc.cc.lib}/lib64:$LD_LIBRARY_PATH";
+
+    # Instruct the Tock gnumake-based build system to not check for
+    # rustup and assume all required tools are installed and available
+    # in the $PATH
+    NO_RUSTUP = "1";
 
     # The defaults "objcopy" and "objdump" are wrong (for x86), use
     # "llvm-obj{copy,dump}" as defined in the makefile
