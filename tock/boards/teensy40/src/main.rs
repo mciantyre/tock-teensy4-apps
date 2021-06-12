@@ -162,18 +162,8 @@ pub unsafe fn main() {
         peripherals.ccm.perclk_divider(),
     );
 
-    peripherals.dma.clock().enable();
-    peripherals.dma.reset_tcds();
-    peripherals
-        .lpuart2
-        .set_rx_dma_channel(&peripherals.dma.channels[7]);
-    peripherals
-        .lpuart2
-        .set_tx_dma_channel(&peripherals.dma.channels[8]);
-
     cortexm7::nvic::Nvic::new(imxrt1060::nvic::GPT1).enable();
-    cortexm7::nvic::Nvic::new(imxrt1060::nvic::DMA7_23).enable();
-    cortexm7::nvic::Nvic::new(imxrt1060::nvic::DMA8_24).enable();
+    cortexm7::nvic::Nvic::new(imxrt1060::nvic::LPUART2).enable();
 
     let chip = static_init!(Chip, Chip::new(peripherals));
     CHIP = Some(chip);
