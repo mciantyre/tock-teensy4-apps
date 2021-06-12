@@ -30,7 +30,6 @@ pub struct Imxrt10xxDefaultPeripherals {
     pub iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs,
     pub ccm: &'static crate::ccm::Ccm,
     pub dcdc: crate::dcdc::Dcdc<'static>,
-    pub dma: crate::dma::Dma<'static>,
     pub ccm_analog: crate::ccm_analog::CcmAnalog,
     pub ports: crate::gpio::Ports<'static>,
     pub lpi2c1: crate::lpi2c::Lpi2c<'static>,
@@ -47,7 +46,6 @@ impl Imxrt10xxDefaultPeripherals {
             iomuxc_snvs: crate::iomuxc_snvs::IomuxcSnvs::new(),
             ccm,
             dcdc: crate::dcdc::Dcdc::new(ccm),
-            dma: crate::dma::Dma::new(ccm),
             ccm_analog: crate::ccm_analog::CcmAnalog::new(),
             ports: crate::gpio::Ports::new(ccm),
             lpi2c1: crate::lpi2c::Lpi2c::new_lpi2c1(ccm),
@@ -78,21 +76,6 @@ impl InterruptService<()> for Imxrt10xxDefaultPeripherals {
             nvic::GPIO5_1 => self.ports.gpio5.handle_interrupt(),
             nvic::GPIO5_2 => self.ports.gpio5.handle_interrupt(),
             nvic::SNVS_LP_WRAPPER => debug!("Interrupt: SNVS_LP_WRAPPER"),
-            nvic::DMA0_16..=nvic::DMA15_31 => {
-                let low = (interrupt - nvic::DMA0_16) as usize;
-                let high = low + 16;
-                for channel in [&self.dma.channels[low], &self.dma.channels[high]] {
-                    if channel.is_interrupt() | channel.is_error() {
-                        channel.handle_interrupt();
-                    }
-                }
-            }
-            nvic::DMA_ERROR => self
-                .dma
-                .channels
-                .iter()
-                .filter(|channel| channel.is_error())
-                .for_each(|channel| channel.handle_interrupt()),
             _ => {
                 return false;
             }
