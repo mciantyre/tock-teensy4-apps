@@ -1,11 +1,11 @@
 use core::cell::Cell;
-use kernel::common::cells::{OptionalCell, TakeCell};
-use kernel::common::registers::interfaces::{ReadWriteable, Readable, Writeable};
-use kernel::common::registers::{register_bitfields, ReadOnly, ReadWrite};
+use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
+use kernel::utilities::registers::{register_bitfields, ReadOnly, ReadWrite};
 
-use kernel::common::StaticRef;
 use kernel::hil;
-use kernel::ClockInterface;
+use kernel::platform::chip::ClockInterface;
+use kernel::utilities::StaticRef;
 use kernel::ErrorCode;
 
 use crate::{ccm, dma};
@@ -777,9 +777,9 @@ impl<'a> hil::uart::Transmit<'a> for Lpuart<'a> {
         tx_len: usize,
     ) -> Result<(), (ErrorCode, &'static mut [u8])> {
         if self.tx_dma_channel.is_some() {
-            return self.transmit_buffer_dma(tx_data, tx_len);
+            self.transmit_buffer_dma(tx_data, tx_len)
         } else {
-            return self.transmit_buffer_interrupt(tx_data, tx_len);
+            self.transmit_buffer_interrupt(tx_data, tx_len)
         }
     }
 
@@ -790,9 +790,9 @@ impl<'a> hil::uart::Transmit<'a> for Lpuart<'a> {
 
     fn transmit_abort(&self) -> Result<(), ErrorCode> {
         if self.tx_dma_channel.is_some() {
-            return self.transmit_abort_dma();
+            self.transmit_abort_dma()
         } else {
-            return self.transmit_abort_interrupt();
+            self.transmit_abort_interrupt()
         }
     }
 }
@@ -876,9 +876,9 @@ impl<'a> hil::uart::Receive<'a> for Lpuart<'a> {
         rx_len: usize,
     ) -> Result<(), (ErrorCode, &'static mut [u8])> {
         if self.rx_dma_channel.is_some() {
-            return self.receive_buffer_dma(rx_buffer, rx_len);
+            self.receive_buffer_dma(rx_buffer, rx_len)
         } else {
-            return self.receive_buffer_interrupt(rx_buffer, rx_len);
+            self.receive_buffer_interrupt(rx_buffer, rx_len)
         }
     }
 
@@ -889,15 +889,13 @@ impl<'a> hil::uart::Receive<'a> for Lpuart<'a> {
 
     fn receive_abort(&self) -> Result<(), ErrorCode> {
         if self.rx_dma_channel.is_some() {
-            return self.receive_abort_dma();
+            self.receive_abort_dma()
         } else {
-            return self.receive_abort_interrupt();
+            self.receive_abort_interrupt()
         }
     }
 }
 
-impl<'a> hil::uart::UartData<'a> for Lpuart<'a> {}
-impl<'a> hil::uart::Uart<'a> for Lpuart<'a> {}
 struct LpuartClock<'a>(ccm::PeripheralClock<'a>);
 
 impl ClockInterface for LpuartClock<'_> {

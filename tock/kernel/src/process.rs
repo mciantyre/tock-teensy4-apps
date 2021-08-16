@@ -9,11 +9,19 @@ use core::str;
 use crate::capabilities;
 use crate::errorcode::ErrorCode;
 use crate::ipc;
-use crate::mem::{ReadOnlyAppSlice, ReadWriteAppSlice};
+use crate::kernel::Kernel;
 use crate::platform::mpu::{self};
-use crate::sched::Kernel;
+use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
 use crate::syscall::{self, Syscall, SyscallReturn};
 use crate::upcall::UpcallId;
+
+// Export all process related types via `kernel::process::`.
+pub use crate::process_policies::{
+    PanicFaultPolicy, ProcessFaultPolicy, RestartFaultPolicy, StopFaultPolicy,
+    StopWithDebugFaultPolicy, ThresholdRestartFaultPolicy, ThresholdRestartThenPanicFaultPolicy,
+};
+pub use crate::process_standard::ProcessStandard;
+pub use crate::process_utilities::{load_processes, load_processes_advanced, ProcessLoadError};
 
 /// Userspace process identifier.
 ///
@@ -170,13 +178,14 @@ pub trait Process {
     /// buffer and executed by the scheduler. `Task`s are some function the app
     /// should run, for example a upcall or an IPC call.
     ///
-    /// This function returns `true` if the `Task` was successfully enqueued,
-    /// and `false` otherwise. This is represented as a simple `bool` because
-    /// this is passed to the capsule that tried to schedule the `Task`.
-    ///
-    /// This will fail if the process is no longer active, and therefore cannot
-    /// execute any new tasks.
-    fn enqueue_task(&self, task: Task) -> bool;
+    /// This function returns `Ok(())` if the `Task` was successfully
+    /// enqueued. If the process is no longer alive,
+    /// `Err(ErrorCode::NODEVICE)` is returned. If the task could not
+    /// be enqueued because there is insufficient space in the
+    /// internal task queue, `Err(ErrorCode::NOMEM)` is
+    /// returned. Other return values must be treated as
+    /// kernel-internal errors.
+    fn enqueue_task(&self, task: Task) -> Result<(), ErrorCode>;
 
     /// Returns whether this process is ready to execute.
     fn ready(&self) -> bool;
@@ -317,13 +326,13 @@ pub trait Process {
     /// process memory brk.
     fn app_memory_break(&self) -> *const u8;
 
-    /// Creates a `ReadWriteAppSlice` from the given offset and size
-    /// in process memory.
+    /// Creates a [`ReadWriteProcessBuffer`] from the given offset and
+    /// size in process memory.
     ///
     /// ## Returns
     ///
     /// In case of success, this method returns the created
-    /// [`ReadWriteAppSlice`].
+    /// [`ReadWriteProcessBuffer`].
     ///
     /// In case of an error, an appropriate ErrorCode is returned:
     ///
@@ -333,19 +342,19 @@ pub trait Process {
     ///   accessible to the process), [`ErrorCode::INVAL`]
     /// - if the process is not active: [`ErrorCode::FAIL`]
     /// - for all other errors: [`ErrorCode::FAIL`]
-    fn build_readwrite_appslice(
+    fn build_readwrite_process_buffer(
         &self,
         buf_start_addr: *mut u8,
         size: usize,
-    ) -> Result<ReadWriteAppSlice, ErrorCode>;
+    ) -> Result<ReadWriteProcessBuffer, ErrorCode>;
 
-    /// Creates a [`ReadOnlyAppSlice`] from the given offset and size
-    /// in process memory.
+    /// Creates a [`ReadOnlyProcessBuffer`] from the given offset and
+    /// size in process memory.
     ///
     /// ## Returns
     ///
     /// In case of success, this method returns the created
-    /// [`ReadOnlyAppSlice`].
+    /// [`ReadOnlyProcessBuffer`].
     ///
     /// In case of an error, an appropriate ErrorCode is returned:
     ///
@@ -355,11 +364,11 @@ pub trait Process {
     ///   read-accessible to the process), [`ErrorCode::INVAL`]
     /// - if the process is not active: [`ErrorCode::FAIL`]
     /// - for all other errors: [`ErrorCode::FAIL`]
-    fn build_readonly_appslice(
+    fn build_readonly_process_buffer(
         &self,
         buf_start_addr: *const u8,
         size: usize,
-    ) -> Result<ReadOnlyAppSlice, ErrorCode>;
+    ) -> Result<ReadOnlyProcessBuffer, ErrorCode>;
 
     /// Set a single byte within the process address space at
     /// `addr` to `value`. Return true if `addr` is within the RAM
@@ -417,7 +426,13 @@ pub trait Process {
     /// - There is not enough available memory to do the allocation, or
     /// - The grant_num is invalid, or
     /// - The grant_num already has an allocated grant.
-    fn allocate_grant(&self, grant_num: usize, size: usize, align: usize) -> Option<NonNull<u8>>;
+    fn allocate_grant(
+        &self,
+        grant_num: usize,
+        driver_num: usize,
+        size: usize,
+        align: usize,
+    ) -> Option<NonNull<u8>>;
 
     /// Check if a given grant for this process has been allocated.
     ///
@@ -474,6 +489,19 @@ pub trait Process {
     ///
     /// Useful for debugging/inspecting the system.
     fn grant_allocated_count(&self) -> Option<usize>;
+
+    /// Get the grant number (grant_num) associated with a given driver number if there is a grant
+    /// associated with that driver_num.
+    fn lookup_grant_from_driver_num(&self, driver_num: usize) -> Result<usize, Error>;
+
+    // subscribe
+
+    /// Verify that an Upcall function pointer is within process-accessible
+    /// memory.
+    ///
+    /// Returns `true` if the upcall function pointer is valid for this process,
+    /// and `false` otherwise.
+    fn is_valid_upcall_function_pointer(&self, upcall_fn: NonNull<()>) -> bool;
 
     // functions for processes that are architecture specific
 

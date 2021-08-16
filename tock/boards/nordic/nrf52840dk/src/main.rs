@@ -57,6 +57,7 @@
 //! | P0.19 | P24 9  | SPI CLK  |
 //! | P0.20 | P24 10 | SPI MOSI |
 //! | P0.21 | P24 11 | SPI MISO |
+//! | P0.22 | P24 12 | SPI CS   |
 //! | P0.24 | P24 14 | Button 3 |
 //! | P0.25 | P24 15 | Button 4 |
 //! | P0.26 | P24 16 | I2C SDA  |
@@ -68,18 +69,21 @@
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
 
+use capsules::i2c_master_slave_driver::I2CMasterSlaveDriver;
 use capsules::net::ieee802154::MacAddress;
 use capsules::net::ipv6::ip_utils::IPAddr;
 use capsules::virtual_aes_ccm::MuxAES128CCM;
 use capsules::virtual_alarm::VirtualMuxAlarm;
-use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
-use kernel::hil::i2c::I2CMaster;
+use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
+use kernel::hil::i2c::{I2CMaster, I2CSlave};
 use kernel::hil::led::LedLow;
 use kernel::hil::symmetric_encryption::AES128;
 use kernel::hil::time::Counter;
 #[allow(unused_imports)]
 use kernel::hil::usb::Client;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::round_robin::RoundRobinSched;
 #[allow(unused_imports)]
 use kernel::{capabilities, create_capability, debug, debug_gpio, debug_verbose, static_init};
 use nrf52840::gpio::Pin;
@@ -107,6 +111,7 @@ const UART_RXD: Pin = Pin::P0_08;
 const SPI_MOSI: Pin = Pin::P0_20;
 const SPI_MISO: Pin = Pin::P0_21;
 const SPI_CLK: Pin = Pin::P0_19;
+const SPI_CS: Pin = Pin::P0_22;
 
 const SPI_MX25R6435F_CHIP_SELECT: Pin = Pin::P0_17;
 const SPI_MX25R6435F_WRITE_PROTECT_PIN: Pin = Pin::P0_22;
@@ -133,12 +138,14 @@ const USB_DEBUGGING: bool = false;
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
+const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 8;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] = [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
+    [None; NUM_PROCS];
 
 static mut CHIP: Option<&'static nrf52840::chip::NRF52<Nrf52840DefaultPeripherals>> = None;
 
@@ -168,7 +175,7 @@ pub struct Platform {
     >,
     rng: &'static capsules::rng::RngDriver<'static>,
     temp: &'static capsules::temperature::TemperatureSensor<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
+    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
     analog_comparator: &'static capsules::analog_comparator::AnalogComparator<
         'static,
         nrf52840::acomp::Comparator<'static>,
@@ -179,13 +186,19 @@ pub struct Platform {
     >,
     nonvolatile_storage: &'static capsules::nonvolatile_storage_driver::NonvolatileStorage<'static>,
     udp_driver: &'static capsules::net::udp::UDPDriver<'static>,
-    i2c_master: &'static capsules::i2c_master::I2CMasterDriver<'static, nrf52840::i2c::TWIM>,
+    i2c_master_slave: &'static capsules::i2c_master_slave_driver::I2CMasterSlaveDriver<'static>,
+    spi_controller: &'static capsules::spi_controller::Spi<
+        'static,
+        capsules::virtual_spi::VirtualSpiMasterDevice<'static, nrf52840::spi::SPIM>,
+    >,
+    scheduler: &'static RoundRobinSched<'static>,
+    systick: cortexm4::systick::SysTick,
 }
 
-impl kernel::Platform for Platform {
+impl SyscallDriverLookup for Platform {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
@@ -201,7 +214,8 @@ impl kernel::Platform for Platform {
             capsules::nonvolatile_storage_driver::DRIVER_NUM => f(Some(self.nonvolatile_storage)),
             capsules::net::udp::DRIVER_NUM => f(Some(self.udp_driver)),
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
-            capsules::i2c_master::DRIVER_NUM => f(Some(self.i2c_master)),
+            capsules::i2c_master_slave_driver::DRIVER_NUM => f(Some(self.i2c_master_slave)),
+            capsules::spi_controller::DRIVER_NUM => f(Some(self.spi_controller)),
             _ => f(None),
         }
     }
@@ -219,6 +233,36 @@ unsafe fn get_peripherals() -> &'static mut Nrf52840DefaultPeripherals<'static> 
     );
 
     nrf52840_peripherals
+}
+
+impl KernelResources<nrf52840::chip::NRF52<'static, Nrf52840DefaultPeripherals<'static>>>
+    for Platform
+{
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = RoundRobinSched<'static>;
+    type SchedulerTimer = cortexm4::systick::SysTick;
+    type WatchDog = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
+    }
 }
 
 /// Main function called after RAM initialized.
@@ -251,6 +295,7 @@ pub unsafe fn main() {
 
     let gpio = components::gpio::GpioComponent::new(
         board_kernel,
+        capsules::gpio::DRIVER_NUM,
         components::gpio_component_helper!(
             nrf52840::gpio::GPIOPin,
             0 => &nrf52840_peripherals.gpio_port[Pin::P1_01],
@@ -273,6 +318,7 @@ pub unsafe fn main() {
 
     let button = components::button::ButtonComponent::new(
         board_kernel,
+        capsules::alarm::DRIVER_NUM,
         components::button_component_helper!(
             nrf52840::gpio::GPIOPin,
             (
@@ -342,8 +388,12 @@ pub unsafe fn main() {
     let _ = rtc.start();
     let mux_alarm = components::alarm::AlarmMuxComponent::new(rtc)
         .finalize(components::alarm_mux_component_helper!(nrf52840::rtc::Rtc));
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
-        .finalize(components::alarm_component_helper!(nrf52840::rtc::Rtc));
+    let alarm = components::alarm::AlarmDriverComponent::new(
+        board_kernel,
+        capsules::alarm::DRIVER_NUM,
+        mux_alarm,
+    )
+    .finalize(components::alarm_component_helper!(nrf52840::rtc::Rtc));
 
     let channel = nrf52_components::UartChannelComponent::new(
         uart_channel,
@@ -353,7 +403,7 @@ pub unsafe fn main() {
     .finalize(());
 
     let dynamic_deferred_call_clients =
-        static_init!([DynamicDeferredCallClientState; 3], Default::default());
+        static_init!([DynamicDeferredCallClientState; 4], Default::default());
     let dynamic_deferred_caller = static_init!(
         DynamicDeferredCall,
         DynamicDeferredCall::new(dynamic_deferred_call_clients)
@@ -370,13 +420,22 @@ pub unsafe fn main() {
             .finalize(());
 
     // Setup the console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
-    let ble_radio =
-        nrf52_components::BLEComponent::new(board_kernel, &base_peripherals.ble_radio, mux_alarm)
-            .finalize(());
+    let ble_radio = nrf52_components::BLEComponent::new(
+        board_kernel,
+        capsules::ble_advertising_driver::DRIVER_NUM,
+        &base_peripherals.ble_radio,
+        mux_alarm,
+    )
+    .finalize(());
 
     let aes_mux = static_init!(
         MuxAES128CCM<'static, nrf52840::aes::AesECB>,
@@ -394,6 +453,7 @@ pub unsafe fn main() {
     let src_mac_from_serial_num: MacAddress = MacAddress::Short(serial_num_bottom_16);
     let (ieee802154_radio, mux_mac) = components::ieee802154::Ieee802154Component::new(
         board_kernel,
+        capsules::ieee802154::DRIVER_NUM,
         &base_peripherals.ieee802154_radio,
         aes_mux,
         PAN_ID,
@@ -436,6 +496,7 @@ pub unsafe fn main() {
     // UDP driver initialization happens here
     let udp_driver = components::udp_driver::UDPDriverComponent::new(
         board_kernel,
+        capsules::net::udp::driver::DRIVER_NUM,
         udp_send_mux,
         udp_recv_mux,
         udp_port_table,
@@ -443,15 +504,34 @@ pub unsafe fn main() {
     )
     .finalize(components::udp_driver_component_helper!(nrf52840::rtc::Rtc));
 
-    let temp =
-        components::temperature::TemperatureComponent::new(board_kernel, &base_peripherals.temp)
-            .finalize(());
+    let temp = components::temperature::TemperatureComponent::new(
+        board_kernel,
+        capsules::temperature::DRIVER_NUM,
+        &base_peripherals.temp,
+    )
+    .finalize(());
 
-    let rng = components::rng::RngComponent::new(board_kernel, &base_peripherals.trng).finalize(());
+    let rng = components::rng::RngComponent::new(
+        board_kernel,
+        capsules::rng::DRIVER_NUM,
+        &base_peripherals.trng,
+    )
+    .finalize(());
 
     // SPI
-    let mux_spi = components::spi::SpiMuxComponent::new(&base_peripherals.spim0)
-        .finalize(components::spi_mux_component_helper!(nrf52840::spi::SPIM));
+    let mux_spi =
+        components::spi::SpiMuxComponent::new(&base_peripherals.spim0, dynamic_deferred_caller)
+            .finalize(components::spi_mux_component_helper!(nrf52840::spi::SPIM));
+    // Create the SPI system call capsule.
+    let spi_controller = components::spi::SpiSyscallComponent::new(
+        board_kernel,
+        mux_spi,
+        &gpio_port[SPI_CS],
+        capsules::spi_controller::DRIVER_NUM,
+    )
+    .finalize(components::spi_syscall_component_helper!(
+        nrf52840::spi::SPIM
+    ));
 
     base_peripherals.spim0.configure(
         nrf52840::pinmux::Pinmux::new(SPI_MOSI as u32),
@@ -474,6 +554,7 @@ pub unsafe fn main() {
 
     let nonvolatile_storage = components::nonvolatile_storage::NonvolatileStorageComponent::new(
         board_kernel,
+        capsules::nonvolatile_storage_driver::DRIVER_NUM,
         mx25r6435f,
         0x60000, // Start address for userspace accessible region
         0x20000, // Length of userspace accessible region
@@ -489,21 +570,30 @@ pub unsafe fn main() {
         >
     ));
 
-    let i2c_master = static_init!(
-        capsules::i2c_master::I2CMasterDriver<'static, nrf52840::i2c::TWIM>,
-        capsules::i2c_master::I2CMasterDriver::new(
-            &base_peripherals.twim1,
-            &mut capsules::i2c_master::BUF,
-            board_kernel.create_grant(&memory_allocation_capability)
+    let i2c_master_buffer = static_init!([u8; 32], [0; 32]);
+    let i2c_slave_buffer1 = static_init!([u8; 32], [0; 32]);
+    let i2c_slave_buffer2 = static_init!([u8; 32], [0; 32]);
+
+    let i2c_master_slave = static_init!(
+        I2CMasterSlaveDriver,
+        I2CMasterSlaveDriver::new(
+            &base_peripherals.twi1,
+            i2c_master_buffer,
+            i2c_slave_buffer1,
+            i2c_slave_buffer2,
+            board_kernel.create_grant(
+                capsules::i2c_master_slave_driver::DRIVER_NUM,
+                &memory_allocation_capability
+            ),
         )
     );
-    base_peripherals.twim1.configure(
+    base_peripherals.twi1.configure(
         nrf52840::pinmux::Pinmux::new(I2C_SCL_PIN as u32),
         nrf52840::pinmux::Pinmux::new(I2C_SDA_PIN as u32),
     );
-    base_peripherals.twim1.set_master_client(i2c_master);
-    base_peripherals.twim1.set_speed(nrf52840::i2c::Speed::K400);
-    base_peripherals.twim1.enable();
+    base_peripherals.twi1.set_master_client(i2c_master_slave);
+    base_peripherals.twi1.set_slave_client(i2c_master_slave);
+    base_peripherals.twi1.set_speed(nrf52840::i2c::Speed::K400);
 
     // Initialize AC using AIN5 (P0.29) as VIN+ and VIN- as AIN0 (P0.02)
     // These are hardcoded pin assignments specified in the driver
@@ -514,6 +604,7 @@ pub unsafe fn main() {
             &nrf52840::acomp::CHANNEL_AC0
         ),
         board_kernel,
+        capsules::analog_comparator::DRIVER_NUM,
     )
     .finalize(components::acomp_component_buf!(
         nrf52840::acomp::Comparator
@@ -558,6 +649,9 @@ pub unsafe fn main() {
     // ctap.enable();
     // ctap.attach();
 
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+        .finalize(components::rr_component_helper!(NUM_PROCS));
+
     let platform = Platform {
         button,
         ble_radio,
@@ -572,8 +666,15 @@ pub unsafe fn main() {
         analog_comparator,
         nonvolatile_storage,
         udp_driver,
-        ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
-        i2c_master,
+        ipc: kernel::ipc::IPC::new(
+            board_kernel,
+            kernel::ipc::DRIVER_NUM,
+            &memory_allocation_capability,
+        ),
+        i2c_master_slave,
+        spi_controller,
+        scheduler,
+        systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
     };
 
     let _ = platform.pconsole.start();
@@ -594,7 +695,7 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -614,13 +715,5 @@ pub unsafe fn main() {
         debug!("{:?}", err);
     });
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
-        .finalize(components::rr_component_helper!(NUM_PROCS));
-    board_kernel.kernel_loop(
-        &platform,
-        chip,
-        Some(&platform.ipc),
-        scheduler,
-        &main_loop_capability,
-    );
+    board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
 }

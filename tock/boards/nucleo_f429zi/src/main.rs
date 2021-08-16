@@ -11,10 +11,11 @@
 use capsules::virtual_alarm::VirtualMuxAlarm;
 use components::gpio::GpioComponent;
 use kernel::capabilities;
-use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
+use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::hil::led::LedHigh;
-use kernel::Platform;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::round_robin::RoundRobinSched;
 use kernel::{create_capability, debug, static_init};
 
 use stm32f429zi::interrupt_service::Stm32f429ziDefaultPeripherals;
@@ -28,16 +29,17 @@ mod multi_alarm_test;
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 // Actual memory for holding the active process structures.
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] =
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
     [None, None, None, None];
 
 static mut CHIP: Option<&'static stm32f429zi::chip::Stm32f4xx<Stm32f429ziDefaultPeripherals>> =
     None;
 
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
+const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
@@ -48,7 +50,7 @@ pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 /// capsules for this platform.
 struct NucleoF429ZI {
     console: &'static capsules::console::Console<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
+    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
     led: &'static capsules::led::LedDriver<
         'static,
         LedHigh<'static, stm32f429zi::gpio::Pin<'static>>,
@@ -61,13 +63,16 @@ struct NucleoF429ZI {
     >,
     temperature: &'static capsules::temperature::TemperatureSensor<'static>,
     gpio: &'static capsules::gpio::GPIO<'static, stm32f429zi::gpio::Pin<'static>>,
+
+    scheduler: &'static RoundRobinSched<'static>,
+    systick: cortexm4::systick::SysTick,
 }
 
 /// Mapping of integer syscalls to objects that implement syscalls.
-impl Platform for NucleoF429ZI {
+impl SyscallDriverLookup for NucleoF429ZI {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
@@ -80,6 +85,41 @@ impl Platform for NucleoF429ZI {
             capsules::gpio::DRIVER_NUM => f(Some(self.gpio)),
             _ => f(None),
         }
+    }
+}
+
+impl
+    KernelResources<
+        stm32f429zi::chip::Stm32f4xx<
+            'static,
+            stm32f429zi::interrupt_service::Stm32f429ziDefaultPeripherals<'static>,
+        >,
+    > for NucleoF429ZI
+{
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = RoundRobinSched<'static>;
+    type SchedulerTimer = cortexm4::systick::SysTick;
+    type WatchDog = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
     }
 }
 
@@ -300,7 +340,12 @@ pub unsafe fn main() {
         create_capability!(capabilities::ProcessManagementCapability);
 
     // Setup the console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -342,6 +387,7 @@ pub unsafe fn main() {
     // BUTTONs
     let button = components::button::ButtonComponent::new(
         board_kernel,
+        capsules::button::DRIVER_NUM,
         components::button_component_helper!(
             stm32f429zi::gpio::Pin,
             (
@@ -360,12 +406,17 @@ pub unsafe fn main() {
         components::alarm_mux_component_helper!(stm32f429zi::tim2::Tim2),
     );
 
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
-        .finalize(components::alarm_component_helper!(stm32f429zi::tim2::Tim2));
+    let alarm = components::alarm::AlarmDriverComponent::new(
+        board_kernel,
+        capsules::alarm::DRIVER_NUM,
+        mux_alarm,
+    )
+    .finalize(components::alarm_component_helper!(stm32f429zi::tim2::Tim2));
 
     // GPIO
     let gpio = GpioComponent::new(
         board_kernel,
+        capsules::gpio::DRIVER_NUM,
         components::gpio_component_helper!(
             stm32f429zi::gpio::Pin,
             // Arduino like RX/TX
@@ -478,7 +529,8 @@ pub unsafe fn main() {
             adc_mux
         ));
     let grant_cap = create_capability!(capabilities::MemoryAllocationCapability);
-    let grant_temperature = board_kernel.create_grant(&grant_cap);
+    let grant_temperature =
+        board_kernel.create_grant(capsules::temperature::DRIVER_NUM, &grant_cap);
 
     let temp = static_init!(
         capsules::temperature::TemperatureSensor<'static>,
@@ -510,26 +562,36 @@ pub unsafe fn main() {
         components::adc::AdcComponent::new(&adc_mux, stm32f429zi::adc::Channel::Channel8)
             .finalize(components::adc_component_helper!(stm32f429zi::adc::Adc));
 
-    let adc_syscall = components::adc::AdcVirtualComponent::new(board_kernel).finalize(
-        components::adc_syscall_component_helper!(
-            adc_channel_0,
-            adc_channel_1,
-            adc_channel_2,
-            adc_channel_3,
-            adc_channel_4,
-            adc_channel_5
-        ),
-    );
+    let adc_syscall =
+        components::adc::AdcVirtualComponent::new(board_kernel, capsules::adc::DRIVER_NUM)
+            .finalize(components::adc_syscall_component_helper!(
+                adc_channel_0,
+                adc_channel_1,
+                adc_channel_2,
+                adc_channel_3,
+                adc_channel_4,
+                adc_channel_5
+            ));
+
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+        .finalize(components::rr_component_helper!(NUM_PROCS));
 
     let nucleo_f429zi = NucleoF429ZI {
         console: console,
-        ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
+        ipc: kernel::ipc::IPC::new(
+            board_kernel,
+            kernel::ipc::DRIVER_NUM,
+            &memory_allocation_capability,
+        ),
         adc: adc_syscall,
         led: led,
         temperature: temp,
         button: button,
         alarm: alarm,
         gpio: gpio,
+
+        scheduler,
+        systick: cortexm4::systick::SysTick::new(),
     };
 
     // // Optional kernel tests
@@ -551,7 +613,7 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -571,9 +633,6 @@ pub unsafe fn main() {
         debug!("{:?}", err);
     });
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
-        .finalize(components::rr_component_helper!(NUM_PROCS));
-
     //Uncomment to run multi alarm test
     //multi_alarm_test::run_multi_alarm(mux_alarm);
 
@@ -581,7 +640,6 @@ pub unsafe fn main() {
         &nucleo_f429zi,
         chip,
         Some(&nucleo_f429zi.ipc),
-        scheduler,
         &main_loop_capability,
     );
 }

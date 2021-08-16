@@ -31,12 +31,12 @@
 //! * Date: April 21, 2017
 
 use core::cell::Cell;
-use kernel::common::cells::OptionalCell;
-use kernel::common::cells::TakeCell;
-use kernel::common::registers::interfaces::{Readable, Writeable};
-use kernel::common::registers::{register_bitfields, ReadWrite, WriteOnly};
-use kernel::common::StaticRef;
 use kernel::hil::symmetric_encryption;
+use kernel::utilities::cells::OptionalCell;
+use kernel::utilities::cells::TakeCell;
+use kernel::utilities::registers::interfaces::{Readable, Writeable};
+use kernel::utilities::registers::{register_bitfields, ReadWrite, WriteOnly};
+use kernel::utilities::StaticRef;
 use kernel::ErrorCode;
 
 // DMA buffer that the aes chip will mutate during encryption
@@ -326,14 +326,14 @@ impl<'a> kernel::hil::symmetric_encryption::AES128<'a> for AesECB<'a> {
 
 impl kernel::hil::symmetric_encryption::AES128Ctr for AesECB<'_> {
     // not needed by NRF5x (the configuration is the same for encryption and decryption)
-    fn set_mode_aes128ctr(&self, _encrypting: bool) {
-        ()
+    fn set_mode_aes128ctr(&self, _encrypting: bool) -> Result<(), ErrorCode> {
+        Ok(())
     }
 }
 
 impl kernel::hil::symmetric_encryption::AES128CBC for AesECB<'_> {
-    fn set_mode_aes128cbc(&self, _encrypting: bool) {
-        ()
+    fn set_mode_aes128cbc(&self, _encrypting: bool) -> Result<(), ErrorCode> {
+        Ok(())
     }
 }
 //TODO: replace this placeholder with a proper implementation of the AES system

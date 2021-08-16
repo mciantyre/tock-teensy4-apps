@@ -40,11 +40,13 @@
 use core::convert::TryFrom;
 use core::{cmp, mem};
 
-use kernel::common::cells::{OptionalCell, TakeCell};
+use kernel::grant::Grant;
 use kernel::hil::uart;
-use kernel::{CommandReturn, Driver};
-use kernel::{ErrorCode, Grant, ProcessId, Upcall};
-use kernel::{Read, ReadOnlyAppSlice, ReadWrite, ReadWriteAppSlice};
+use kernel::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
+use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
+use kernel::syscall::{CommandReturn, SyscallDriver};
+use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::{ErrorCode, ProcessId};
 
 /// Syscall driver number.
 use crate::driver;
@@ -52,14 +54,12 @@ pub const DRIVER_NUM: usize = driver::NUM::Console as usize;
 
 #[derive(Default)]
 pub struct App {
-    write_callback: Upcall,
-    write_buffer: ReadOnlyAppSlice,
+    write_buffer: ReadOnlyProcessBuffer,
     write_len: usize,
     write_remaining: usize, // How many bytes didn't fit in the buffer and still need to be printed.
     pending_write: bool,
 
-    read_callback: Upcall,
-    read_buffer: ReadWriteAppSlice,
+    read_buffer: ReadWriteProcessBuffer,
     read_len: usize,
 }
 
@@ -68,7 +68,7 @@ pub static mut READ_BUF: [u8; 64] = [0; 64];
 
 pub struct Console<'a> {
     uart: &'a dyn uart::UartData<'a>,
-    apps: Grant<App>,
+    apps: Grant<App, 3>,
     tx_in_progress: OptionalCell<ProcessId>,
     tx_buffer: TakeCell<'static, [u8]>,
     rx_in_progress: OptionalCell<ProcessId>,
@@ -80,7 +80,7 @@ impl<'a> Console<'a> {
         uart: &'a dyn uart::UartData<'a>,
         tx_buffer: &'static mut [u8],
         rx_buffer: &'static mut [u8],
-        grant: Grant<App>,
+        grant: Grant<App, 3>,
     ) -> Console<'a> {
         Console {
             uart: uart,
@@ -121,25 +121,27 @@ impl<'a> Console<'a> {
         if self.tx_in_progress.is_none() {
             self.tx_in_progress.set(app_id);
             self.tx_buffer.take().map(|buffer| {
-                let len = app.write_buffer.map_or(0, |data| data.len());
+                let len = app.write_buffer.enter(|data| data.len()).unwrap_or(0);
                 if app.write_remaining > len {
                     // A slice has changed under us and is now smaller than
                     // what we need to write -- just write what we can.
                     app.write_remaining = len;
                 }
-                let transaction_len = app.write_buffer.map_or(0, |data| {
-                    for (i, c) in data[data.len() - app.write_remaining..data.len()]
-                        .iter()
-                        .enumerate()
-                    {
-                        if buffer.len() <= i {
-                            return i; // Short circuit on partial send
+                let transaction_len = app
+                    .write_buffer
+                    .enter(|data| {
+                        for (i, c) in data[data.len() - app.write_remaining..data.len()]
+                            .iter()
+                            .enumerate()
+                        {
+                            if buffer.len() <= i {
+                                return i; // Short circuit on partial send
+                            }
+                            buffer[i] = c.get();
                         }
-                        buffer[i] = *c;
-                    }
-                    app.write_remaining
-                });
-
+                        app.write_remaining
+                    })
+                    .unwrap_or(0);
                 app.write_remaining -= transaction_len;
                 let _ = self.uart.transmit_buffer(buffer, transaction_len);
             });
@@ -173,7 +175,7 @@ impl<'a> Console<'a> {
     }
 }
 
-impl Driver for Console<'_> {
+impl SyscallDriver for Console<'_> {
     /// Setup shared buffers.
     ///
     /// ### `allow_num`
@@ -183,12 +185,12 @@ impl Driver for Console<'_> {
         &self,
         appid: ProcessId,
         allow_num: usize,
-        mut slice: ReadWriteAppSlice,
-    ) -> Result<ReadWriteAppSlice, (ReadWriteAppSlice, ErrorCode)> {
+        mut slice: ReadWriteProcessBuffer,
+    ) -> Result<ReadWriteProcessBuffer, (ReadWriteProcessBuffer, ErrorCode)> {
         let res = match allow_num {
             1 => self
                 .apps
-                .enter(appid, |app| {
+                .enter(appid, |app, _| {
                     mem::swap(&mut app.read_buffer, &mut slice);
                 })
                 .map_err(ErrorCode::from),
@@ -211,12 +213,12 @@ impl Driver for Console<'_> {
         &self,
         appid: ProcessId,
         allow_num: usize,
-        mut slice: ReadOnlyAppSlice,
-    ) -> Result<ReadOnlyAppSlice, (ReadOnlyAppSlice, ErrorCode)> {
+        mut slice: ReadOnlyProcessBuffer,
+    ) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
         let res = match allow_num {
             1 => self
                 .apps
-                .enter(appid, |app| {
+                .enter(appid, |app, _| {
                     mem::swap(&mut app.write_buffer, &mut slice);
                 })
                 .map_err(ErrorCode::from),
@@ -229,43 +231,13 @@ impl Driver for Console<'_> {
             Ok(slice)
         }
     }
-    /// Setup callbacks.
-    ///
-    /// ### `subscribe_num`
-    ///
-    /// - `1`: Write buffer completed callback
-    fn subscribe(
-        &self,
-        subscribe_num: usize,
-        mut callback: Upcall,
-        app_id: ProcessId,
-    ) -> Result<Upcall, (Upcall, ErrorCode)> {
-        let res = match subscribe_num {
-            1 => {
-                // putstr/write done
-                self.apps
-                    .enter(app_id, |app| {
-                        mem::swap(&mut app.write_callback, &mut callback);
-                    })
-                    .map_err(ErrorCode::from)
-            }
-            2 => {
-                // getnstr/read done
-                self.apps
-                    .enter(app_id, |app| {
-                        mem::swap(&mut app.read_callback, &mut callback);
-                    })
-                    .map_err(ErrorCode::from)
-            }
-            _ => Err(ErrorCode::NOSUPPORT),
-        };
 
-        if let Err(e) = res {
-            Err((callback, e))
-        } else {
-            Ok(callback)
-        }
-    }
+    // Setup callbacks.
+    //
+    // ### `subscribe_num`
+    //
+    // - `1`: Write buffer completed callback
+    // - `2`: Read buffer completed callback
 
     /// Initiate serial transfers
     ///
@@ -285,14 +257,14 @@ impl Driver for Console<'_> {
                 // putstr
                 let len = arg1;
                 self.apps
-                    .enter(appid, |app| self.send_new(appid, app, len))
+                    .enter(appid, |app, _| self.send_new(appid, app, len))
                     .map_err(ErrorCode::from)
             }
             2 => {
                 // getnstr
                 let len = arg1;
                 self.apps
-                    .enter(appid, |app| self.receive_new(appid, app, len))
+                    .enter(appid, |app, _| self.receive_new(appid, app, len))
                     .map_err(ErrorCode::from)
             }
             3 => {
@@ -313,6 +285,10 @@ impl Driver for Console<'_> {
             Err(e) => CommandReturn::failure(e),
         }
     }
+
+    fn allocate_grant(&self, processid: ProcessId) -> Result<(), kernel::process::Error> {
+        self.apps.enter(processid, |_, _| {})
+    }
 }
 
 impl uart::TransmitClient for Console<'_> {
@@ -326,14 +302,14 @@ impl uart::TransmitClient for Console<'_> {
         // application.
         self.tx_buffer.replace(buffer);
         self.tx_in_progress.take().map(|appid| {
-            self.apps.enter(appid, |app| {
+            self.apps.enter(appid, |app, upcalls| {
                 match self.send_continue(appid, app) {
                     Ok(more_to_send) => {
                         if !more_to_send {
                             // Go ahead and signal the application
                             let written = app.write_len;
                             app.write_len = 0;
-                            app.write_callback.schedule(written, 0, 0);
+                            upcalls.schedule_upcall(1, (written, 0, 0)).ok();
                         }
                     }
                     Err(return_code) => {
@@ -341,8 +317,12 @@ impl uart::TransmitClient for Console<'_> {
                         app.write_len = 0;
                         app.write_remaining = 0;
                         app.pending_write = false;
-                        app.write_callback
-                            .schedule(kernel::into_statuscode(return_code), 0, 0);
+                        upcalls
+                            .schedule_upcall(
+                                1,
+                                (kernel::errorcode::into_statuscode(return_code), 0, 0),
+                            )
+                            .ok();
                     }
                 }
             })
@@ -353,7 +333,7 @@ impl uart::TransmitClient for Console<'_> {
         if self.tx_in_progress.is_none() {
             for cntr in self.apps.iter() {
                 let appid = cntr.processid();
-                let started_tx = cntr.enter(|app| {
+                let started_tx = cntr.enter(|app, upcalls| {
                     if app.pending_write {
                         app.pending_write = false;
                         match self.send_continue(appid, app) {
@@ -363,11 +343,12 @@ impl uart::TransmitClient for Console<'_> {
                                 app.write_len = 0;
                                 app.write_remaining = 0;
                                 app.pending_write = false;
-                                app.write_callback.schedule(
-                                    kernel::into_statuscode(return_code),
-                                    0,
-                                    0,
-                                );
+                                upcalls
+                                    .schedule_upcall(
+                                        1,
+                                        (kernel::errorcode::into_statuscode(return_code), 0, 0),
+                                    )
+                                    .ok();
                                 false
                             }
                         }
@@ -395,21 +376,24 @@ impl uart::ReceiveClient for Console<'_> {
             .take()
             .map(|appid| {
                 self.apps
-                    .enter(appid, |app| {
+                    .enter(appid, |app, upcalls| {
                         // An iterator over the returned buffer yielding only the first `rx_len`
                         // bytes
                         let rx_buffer = buffer.iter().take(rx_len);
                         match error {
                             uart::Error::None | uart::Error::Aborted => {
                                 // Receive some bytes, signal error type and return bytes to process buffer
-                                let count = app.read_buffer.mut_map_or(-1, |data| {
-                                    let mut c = 0;
-                                    for (a, b) in data.iter_mut().zip(rx_buffer) {
-                                        c = c + 1;
-                                        *a = *b;
-                                    }
-                                    c
-                                });
+                                let count = app
+                                    .read_buffer
+                                    .mut_enter(|data| {
+                                        let mut c = 0;
+                                        for (a, b) in data.iter().zip(rx_buffer) {
+                                            c = c + 1;
+                                            a.set(*b);
+                                        }
+                                        c
+                                    })
+                                    .unwrap_or(-1);
 
                                 // Make sure we report the same number
                                 // of bytes that we actually copied into
@@ -444,19 +428,31 @@ impl uart::ReceiveClient for Console<'_> {
                                     (rcode, rx_len)
                                 };
 
-                                app.read_callback.schedule(
-                                    kernel::into_statuscode(ret),
-                                    received_length,
-                                    0,
-                                );
+                                upcalls
+                                    .schedule_upcall(
+                                        2,
+                                        (
+                                            kernel::errorcode::into_statuscode(ret),
+                                            received_length,
+                                            0,
+                                        ),
+                                    )
+                                    .ok();
                             }
                             _ => {
                                 // Some UART error occurred
-                                app.read_callback.schedule(
-                                    kernel::into_statuscode(Err(ErrorCode::FAIL)),
-                                    0,
-                                    0,
-                                );
+                                upcalls
+                                    .schedule_upcall(
+                                        2,
+                                        (
+                                            kernel::errorcode::into_statuscode(Err(
+                                                ErrorCode::FAIL,
+                                            )),
+                                            0,
+                                            0,
+                                        ),
+                                    )
+                                    .ok();
                             }
                         }
                     })

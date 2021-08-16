@@ -13,9 +13,13 @@
 
 use core::convert::From;
 use core::{cmp, mem};
-use kernel::common::cells::{OptionalCell, TakeCell};
+
+use kernel::grant::Grant;
 use kernel::hil;
-use kernel::{CommandReturn, Driver, ErrorCode, Grant, ProcessId, Read, ReadOnlyAppSlice, Upcall};
+use kernel::processbuffer::{ReadOnlyProcessBuffer, ReadableProcessBuffer};
+use kernel::syscall::{CommandReturn, SyscallDriver};
+use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::{ErrorCode, ProcessId};
 
 /// Syscall driver number.
 use crate::driver;
@@ -38,9 +42,8 @@ enum TextScreenCommand {
 }
 
 pub struct App {
-    callback: Upcall,
     pending_command: bool,
-    shared: ReadOnlyAppSlice,
+    shared: ReadOnlyProcessBuffer,
     write_len: usize,
     command: TextScreenCommand,
     data1: usize,
@@ -50,9 +53,8 @@ pub struct App {
 impl Default for App {
     fn default() -> App {
         App {
-            callback: Upcall::default(),
             pending_command: false,
-            shared: ReadOnlyAppSlice::default(),
+            shared: ReadOnlyProcessBuffer::default(),
             write_len: 0,
             command: TextScreenCommand::Idle,
             data1: 1,
@@ -63,7 +65,7 @@ impl Default for App {
 
 pub struct TextScreen<'a> {
     text_screen: &'a dyn hil::text_screen::TextScreen<'static>,
-    apps: Grant<App>,
+    apps: Grant<App, 1>,
     current_app: OptionalCell<ProcessId>,
     buffer: TakeCell<'static, [u8]>,
 }
@@ -72,7 +74,7 @@ impl<'a> TextScreen<'a> {
     pub fn new(
         text_screen: &'static dyn hil::text_screen::TextScreen,
         buffer: &'static mut [u8],
-        grant: Grant<App>,
+        grant: Grant<App, 1>,
     ) -> TextScreen<'a> {
         TextScreen {
             text_screen: text_screen,
@@ -91,15 +93,13 @@ impl<'a> TextScreen<'a> {
     ) -> CommandReturn {
         let res = self
             .apps
-            .enter(appid, |app| {
+            .enter(appid, |app, _| {
                 if self.current_app.is_none() {
                     self.current_app.set(appid);
+                    app.data1 = data1;
+                    app.data2 = data2;
                     app.command = command;
-                    let r = self.do_command(command, data1, data2, appid);
-                    if r != Ok(()) {
-                        self.current_app.clear();
-                    }
-                    r
+                    Ok(true)
                 } else {
                     if app.pending_command == true {
                         Err(ErrorCode::BUSY)
@@ -108,67 +108,94 @@ impl<'a> TextScreen<'a> {
                         app.command = command;
                         app.data1 = data1;
                         app.data2 = data2;
-                        Ok(())
+                        Ok(false)
                     }
                 }
             })
             .map_err(ErrorCode::from);
-        if let Err(err) = res {
-            CommandReturn::failure(err)
-        } else {
-            CommandReturn::success()
+        let res = match res {
+            Ok(value) => value,
+            Err(err) => Err(err),
+        };
+        match res {
+            Ok(execute_now) => {
+                if execute_now {
+                    match self.do_command() {
+                        Ok(()) => CommandReturn::success(),
+                        Err(err) => {
+                            self.current_app.clear();
+                            CommandReturn::failure(err)
+                        }
+                    }
+                } else {
+                    CommandReturn::success()
+                }
+            }
+            Err(err) => CommandReturn::failure(err),
         }
     }
 
-    fn do_command(
-        &self,
-        command: TextScreenCommand,
-        data1: usize,
-        data2: usize,
-        appid: ProcessId,
-    ) -> Result<(), ErrorCode> {
-        match command {
-            TextScreenCommand::GetResolution => {
-                let (x, y) = self.text_screen.get_size();
-                self.schedule_callback(kernel::into_statuscode(Ok(())), x, y);
-                self.run_next_command();
-                Ok(())
-            }
-            TextScreenCommand::Display => self.text_screen.display_on(),
-            TextScreenCommand::NoDisplay => self.text_screen.display_off(),
-            TextScreenCommand::Blink => self.text_screen.blink_cursor_on(),
-            TextScreenCommand::NoBlink => self.text_screen.blink_cursor_off(),
-            TextScreenCommand::SetCursor => self.text_screen.set_cursor(data1, data2),
-            TextScreenCommand::NoCursor => self.text_screen.hide_cursor(),
-            TextScreenCommand::Write => self
-                .apps
-                .enter(appid, |app| {
-                    if data1 > 0 {
-                        app.write_len = data1;
-                        app.shared.map_or(Err(ErrorCode::NOMEM), |to_write_buffer| {
-                            self.buffer.take().map_or(Err(ErrorCode::BUSY), |buffer| {
-                                let len = cmp::min(app.write_len, buffer.len());
-                                for n in 0..len {
-                                    buffer[n] = to_write_buffer[n];
-                                }
-                                match self.text_screen.print(buffer, len) {
-                                    Ok(()) => Ok(()),
-                                    Err((ecode, buffer)) => {
-                                        self.buffer.replace(buffer);
-                                        Err(ecode)
-                                    }
-                                }
-                            })
-                        })
-                    } else {
-                        Err(ErrorCode::NOMEM)
+    fn do_command(&self) -> Result<(), ErrorCode> {
+        let mut run_next = false;
+        let res = self.current_app.map_or(Err(ErrorCode::FAIL), |app| {
+            self.apps
+                .enter(*app, |app, upcalls| match app.command {
+                    TextScreenCommand::GetResolution => {
+                        let (x, y) = self.text_screen.get_size();
+                        app.pending_command = false;
+                        let _ = upcalls
+                            .schedule_upcall(0, (kernel::errorcode::into_statuscode(Ok(())), x, y));
+                        run_next = true;
+                        Ok(())
                     }
+                    TextScreenCommand::Display => self.text_screen.display_on(),
+                    TextScreenCommand::NoDisplay => self.text_screen.display_off(),
+                    TextScreenCommand::Blink => self.text_screen.blink_cursor_on(),
+                    TextScreenCommand::NoBlink => self.text_screen.blink_cursor_off(),
+                    TextScreenCommand::SetCursor => {
+                        self.text_screen.set_cursor(app.data1, app.data2)
+                    }
+                    TextScreenCommand::NoCursor => self.text_screen.hide_cursor(),
+                    TextScreenCommand::Write => {
+                        if app.data1 > 0 {
+                            app.write_len = app.data1;
+                            let res = app.shared.enter(|to_write_buffer| {
+                                self.buffer.take().map_or(Err(ErrorCode::BUSY), |buffer| {
+                                    let len = cmp::min(app.write_len, buffer.len());
+                                    for n in 0..len {
+                                        buffer[n] = to_write_buffer[n].get();
+                                    }
+                                    match self.text_screen.print(buffer, len) {
+                                        Ok(()) => Ok(()),
+                                        Err((ecode, buffer)) => {
+                                            self.buffer.replace(buffer);
+                                            Err(ecode)
+                                        }
+                                    }
+                                })
+                            });
+                            match res {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(err)) => Err(err),
+                                Err(err) => err.into(),
+                            }
+                        } else {
+                            Err(ErrorCode::NOMEM)
+                        }
+                    }
+                    TextScreenCommand::Clear => self.text_screen.clear(),
+                    TextScreenCommand::Home => self.text_screen.clear(),
+                    TextScreenCommand::ShowCursor => self.text_screen.show_cursor(),
+                    _ => Err(ErrorCode::NOSUPPORT),
                 })
-                .unwrap_or_else(|err| err.into()),
-            TextScreenCommand::Clear => self.text_screen.clear(),
-            TextScreenCommand::Home => self.text_screen.clear(),
-            TextScreenCommand::ShowCursor => self.text_screen.show_cursor(),
-            _ => Err(ErrorCode::NOSUPPORT),
+                .map_err(ErrorCode::from)
+        });
+        if run_next {
+            self.run_next_command();
+        }
+        match res {
+            Ok(value) => value,
+            Err(err) => Err(err),
         }
     }
 
@@ -176,60 +203,36 @@ impl<'a> TextScreen<'a> {
         // Check for pending events.
         for app in self.apps.iter() {
             let appid = app.processid();
-            let current_command = app.enter(|app| {
+            let current_command = app.enter(|app, _| {
                 if app.pending_command {
                     app.pending_command = false;
                     self.current_app.set(appid);
-                    let r = self.do_command(app.command, app.data1, app.data2, appid);
-                    if r != Ok(()) {
-                        self.current_app.clear();
-                    }
-                    r == Ok(())
+                    true
                 } else {
                     false
                 }
             });
             if current_command {
-                break;
+                if self.do_command() != Ok(()) {
+                    self.current_app.clear();
+                } else {
+                    break;
+                }
             }
         }
     }
 
     fn schedule_callback(&self, data1: usize, data2: usize, data3: usize) {
         self.current_app.take().map(|appid| {
-            let _ = self.apps.enter(appid, |app| {
+            let _ = self.apps.enter(appid, |app, upcalls| {
                 app.pending_command = false;
-                app.callback.schedule(data1, data2, data3);
+                upcalls.schedule_upcall(0, (data1, data2, data3)).ok();
             });
         });
     }
 }
 
-impl<'a> Driver for TextScreen<'a> {
-    fn subscribe(
-        &self,
-        subscribe_num: usize,
-        mut callback: Upcall,
-        app_id: ProcessId,
-    ) -> Result<Upcall, (Upcall, ErrorCode)> {
-        match subscribe_num {
-            0 => {
-                let res = self
-                    .apps
-                    .enter(app_id, |app| {
-                        mem::swap(&mut app.callback, &mut callback);
-                    })
-                    .map_err(ErrorCode::from);
-                if let Err(e) = res {
-                    Err((callback, e))
-                } else {
-                    Ok(callback)
-                }
-            }
-            _ => Err((callback, ErrorCode::NOSUPPORT)),
-        }
-    }
-
+impl<'a> SyscallDriver for TextScreen<'a> {
     fn command(
         &self,
         command_num: usize,
@@ -271,13 +274,13 @@ impl<'a> Driver for TextScreen<'a> {
         &self,
         appid: ProcessId,
         allow_num: usize,
-        mut slice: ReadOnlyAppSlice,
-    ) -> Result<ReadOnlyAppSlice, (ReadOnlyAppSlice, ErrorCode)> {
+        mut slice: ReadOnlyProcessBuffer,
+    ) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
         match allow_num {
             0 => {
                 let res = self
                     .apps
-                    .enter(appid, |app| {
+                    .enter(appid, |app, _| {
                         mem::swap(&mut app.shared, &mut slice);
                     })
                     .map_err(ErrorCode::from);
@@ -290,17 +293,21 @@ impl<'a> Driver for TextScreen<'a> {
             _ => Err((slice, ErrorCode::NOSUPPORT)),
         }
     }
+
+    fn allocate_grant(&self, processid: ProcessId) -> Result<(), kernel::process::Error> {
+        self.apps.enter(processid, |_, _| {})
+    }
 }
 
 impl<'a> hil::text_screen::TextScreenClient for TextScreen<'a> {
     fn command_complete(&self, r: Result<(), ErrorCode>) {
-        self.schedule_callback(kernel::into_statuscode(r), 0, 0);
+        self.schedule_callback(kernel::errorcode::into_statuscode(r), 0, 0);
         self.run_next_command();
     }
 
     fn write_complete(&self, buffer: &'static mut [u8], len: usize, r: Result<(), ErrorCode>) {
         self.buffer.replace(buffer);
-        self.schedule_callback(kernel::into_statuscode(r), len, 0);
+        self.schedule_callback(kernel::errorcode::into_statuscode(r), len, 0);
         self.run_next_command();
     }
 }

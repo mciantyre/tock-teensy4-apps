@@ -6,50 +6,72 @@
 // Disable this attribute when documenting, as a workaround for
 // https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
+#![feature(custom_test_frameworks)]
+#![test_runner(test_runner)]
+#![reexport_test_harness_main = "test_main"]
 
 use capsules::virtual_alarm::{MuxAlarm, VirtualMuxAlarm};
 use capsules::virtual_hmac::VirtualMuxHmac;
+use capsules::virtual_sha::VirtualMuxSha;
 use earlgrey::chip::EarlGreyDefaultPeripherals;
 use kernel::capabilities;
-use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
-use kernel::common::registers::interfaces::ReadWriteable;
 use kernel::component::Component;
+use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::hil;
+use kernel::hil::digest::Digest;
 use kernel::hil::i2c::I2CMaster;
 use kernel::hil::led::LedHigh;
 use kernel::hil::time::Alarm;
-use kernel::mpu::KernelMPU;
-use kernel::Platform;
+use kernel::platform::mpu;
+use kernel::platform::mpu::KernelMPU;
+use kernel::platform::scheduler_timer::VirtualSchedulerTimer;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::priority::PrioritySched;
+use kernel::utilities::registers::interfaces::ReadWriteable;
 use kernel::{create_capability, debug, static_init};
-use kernel::{mpu, Chip};
 use rv32i::csr;
 
-#[allow(dead_code)]
-mod aes_test;
-#[allow(dead_code)]
-mod multi_alarm_test;
-#[allow(dead_code)]
-mod tickv_test;
+#[cfg(test)]
+mod tests;
 
 pub mod io;
+mod otbn;
 pub mod usb;
 
 const NUM_PROCS: usize = 4;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 //
 // Actual memory for holding the active process structures. Need an empty list
 // at least.
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; 4] = [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; 4] = [None; NUM_PROCS];
 
-static mut CHIP: Option<
-    &'static earlgrey::chip::EarlGrey<
-        VirtualMuxAlarm<'static, earlgrey::timer::RvTimer>,
-        EarlGreyDefaultPeripherals,
+// Test access to the peripherals
+#[cfg(test)]
+static mut PERIPHERALS: Option<&'static EarlGreyDefaultPeripherals> = None;
+// Test access to board
+#[cfg(test)]
+static mut BOARD: Option<&'static kernel::Kernel> = None;
+// Test access to platform
+#[cfg(test)]
+static mut PLATFORM: Option<&'static EarlGreyNexysVideo> = None;
+// Test access to main loop capability
+#[cfg(test)]
+static mut MAIN_CAP: Option<&dyn kernel::capabilities::MainLoopCapability> = None;
+// Test access to alarm
+static mut ALARM: Option<&'static MuxAlarm<'static, earlgrey::timer::RvTimer<'static>>> = None;
+// Test access to TicKV
+static mut TICKV: Option<
+    &capsules::tickv::TicKVStore<
+        'static,
+        capsules::virtual_flash::FlashUser<'static, lowrisc::flash_ctrl::FlashCtrl<'static>>,
     >,
 > = None;
 
+static mut CHIP: Option<&'static earlgrey::chip::EarlGrey<EarlGreyDefaultPeripherals>> = None;
+
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
+const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
@@ -71,7 +93,20 @@ struct EarlGreyNexysVideo {
     >,
     hmac: &'static capsules::hmac::HmacDriver<
         'static,
-        VirtualMuxHmac<'static, lowrisc::hmac::Hmac<'static>, 32>,
+        VirtualMuxHmac<
+            'static,
+            capsules::virtual_digest::VirtualMuxDigest<'static, lowrisc::hmac::Hmac<'static>, 32>,
+            32,
+        >,
+        32,
+    >,
+    sha: &'static capsules::sha::ShaDriver<
+        'static,
+        VirtualMuxSha<
+            'static,
+            capsules::virtual_digest::VirtualMuxDigest<'static, lowrisc::hmac::Hmac<'static>, 32>,
+            32,
+        >,
         32,
     >,
     lldb: &'static capsules::low_level_debug::LowLevelDebug<
@@ -79,17 +114,21 @@ struct EarlGreyNexysVideo {
         capsules::virtual_uart::UartDevice<'static>,
     >,
     i2c_master: &'static capsules::i2c_master::I2CMasterDriver<'static, lowrisc::i2c::I2c<'static>>,
+    scheduler: &'static PrioritySched,
+    scheduler_timer:
+        &'static VirtualSchedulerTimer<VirtualMuxAlarm<'static, earlgrey::timer::RvTimer<'static>>>,
 }
 
 /// Mapping of integer syscalls to objects that implement syscalls.
-impl Platform for EarlGreyNexysVideo {
+impl SyscallDriverLookup for EarlGreyNexysVideo {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::led::DRIVER_NUM => f(Some(self.led)),
             capsules::hmac::DRIVER_NUM => f(Some(self.hmac)),
+            capsules::sha::DRIVER_NUM => f(Some(self.sha)),
             capsules::gpio::DRIVER_NUM => f(Some(self.gpio)),
             capsules::console::DRIVER_NUM => f(Some(self.console)),
             capsules::alarm::DRIVER_NUM => f(Some(self.alarm)),
@@ -100,35 +139,64 @@ impl Platform for EarlGreyNexysVideo {
     }
 }
 
-/// Main function.
-///
-/// This function is called from the arch crate after some very basic RISC-V
-/// setup and RAM initialization.
-#[no_mangle]
-pub unsafe fn main() {
+impl KernelResources<earlgrey::chip::EarlGrey<'static, EarlGreyDefaultPeripherals<'static>>>
+    for EarlGreyNexysVideo
+{
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = PrioritySched;
+    type SchedulerTimer =
+        VirtualSchedulerTimer<VirtualMuxAlarm<'static, earlgrey::timer::RvTimer<'static>>>;
+    type WatchDog = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.scheduler_timer
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
+    }
+}
+
+unsafe fn setup() -> (
+    &'static kernel::Kernel,
+    &'static EarlGreyNexysVideo,
+    &'static earlgrey::chip::EarlGrey<'static, EarlGreyDefaultPeripherals<'static>>,
+    &'static EarlGreyDefaultPeripherals<'static>,
+) {
     // Ibex-specific handler
     earlgrey::chip::configure_trap_handler();
-
-    let peripherals = static_init!(
-        EarlGreyDefaultPeripherals,
-        EarlGreyDefaultPeripherals::new()
-    );
 
     // initialize capabilities
     let process_mgmt_cap = create_capability!(capabilities::ProcessManagementCapability);
     let memory_allocation_cap = create_capability!(capabilities::MemoryAllocationCapability);
 
-    let main_loop_cap = create_capability!(capabilities::MainLoopCapability);
-
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&PROCESSES));
 
     let dynamic_deferred_call_clients =
-        static_init!([DynamicDeferredCallClientState; 1], Default::default());
+        static_init!([DynamicDeferredCallClientState; 3], Default::default());
     let dynamic_deferred_caller = static_init!(
         DynamicDeferredCall,
         DynamicDeferredCall::new(dynamic_deferred_call_clients)
     );
     DynamicDeferredCall::set_global_instance(dynamic_deferred_caller);
+
+    let peripherals = static_init!(
+        EarlGreyDefaultPeripherals,
+        EarlGreyDefaultPeripherals::new(dynamic_deferred_caller)
+    );
 
     // Configure kernel debug gpios as early as possible
     kernel::debug::assign_gpios(
@@ -164,6 +232,7 @@ pub unsafe fn main() {
 
     let gpio = components::gpio::GpioComponent::new(
         board_kernel,
+        capsules::gpio::DRIVER_NUM,
         components::gpio_component_helper!(
             earlgrey::gpio::GpioPin,
             0 => &peripherals.gpio_port[0],
@@ -189,6 +258,8 @@ pub unsafe fn main() {
     );
     hil::time::Alarm::set_alarm_client(hardware_alarm, mux_alarm);
 
+    ALARM = Some(mux_alarm);
+
     // Alarm
     let virtual_alarm_user = static_init!(
         VirtualMuxAlarm<'static, earlgrey::timer::RvTimer>,
@@ -202,19 +273,23 @@ pub unsafe fn main() {
         capsules::alarm::AlarmDriver<'static, VirtualMuxAlarm<'static, earlgrey::timer::RvTimer>>,
         capsules::alarm::AlarmDriver::new(
             virtual_alarm_user,
-            board_kernel.create_grant(&memory_allocation_cap)
+            board_kernel.create_grant(capsules::alarm::DRIVER_NUM, &memory_allocation_cap)
         )
     );
     hil::time::Alarm::set_alarm_client(virtual_alarm_user, alarm);
 
+    let scheduler_timer = static_init!(
+        VirtualSchedulerTimer<VirtualMuxAlarm<'static, earlgrey::timer::RvTimer<'static>>>,
+        VirtualSchedulerTimer::new(scheduler_timer_virtual_alarm)
+    );
+    scheduler_timer_virtual_alarm.set_alarm_client(scheduler_timer);
+
     let chip = static_init!(
         earlgrey::chip::EarlGrey<
-            VirtualMuxAlarm<'static, earlgrey::timer::RvTimer>,
             EarlGreyDefaultPeripherals,
         >,
-        earlgrey::chip::EarlGrey::new(scheduler_timer_virtual_alarm, peripherals, hardware_alarm)
+        earlgrey::chip::EarlGrey::new(peripherals, hardware_alarm)
     );
-    scheduler_timer_virtual_alarm.set_alarm_client(chip.scheduler_timer());
     CHIP = Some(chip);
 
     // Need to enable all interrupts for Tock Kernel
@@ -226,37 +301,91 @@ pub unsafe fn main() {
     csr::CSR.mstatus.modify(csr::mstatus::mstatus::mie::SET);
 
     // Setup the console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
-    let lldb = components::lldb::LowLevelDebugComponent::new(board_kernel, uart_mux).finalize(());
+    let lldb = components::lldb::LowLevelDebugComponent::new(
+        board_kernel,
+        capsules::low_level_debug::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
 
+    let mux_digest = components::digest::DigestMuxComponent::new(&peripherals.hmac).finalize(
+        components::digest_mux_component_helper!(lowrisc::hmac::Hmac, 32),
+    );
+
+    let digest_key_buffer = static_init!([u8; 32], [0; 32]);
+
+    let digest = components::digest::DigestComponent::new(&mux_digest, digest_key_buffer).finalize(
+        components::digest_component_helper!(lowrisc::hmac::Hmac, 32,),
+    );
+
+    peripherals.hmac.set_client(digest);
+
+    let hmac_key_buffer = static_init!([u8; 32], [0; 32]);
     let hmac_data_buffer = static_init!([u8; 64], [0; 64]);
     let hmac_dest_buffer = static_init!([u8; 32], [0; 32]);
 
-    let mux_hmac = components::hmac::HmacMuxComponent::new(&peripherals.hmac).finalize(
-        components::hmac_mux_component_helper!(lowrisc::hmac::Hmac, 32),
+    let mux_hmac = components::hmac::HmacMuxComponent::new(digest).finalize(
+        components::hmac_mux_component_helper!(capsules::virtual_digest::VirtualMuxDigest<lowrisc::hmac::Hmac, 32>, 32),
     );
 
     let hmac = components::hmac::HmacComponent::new(
         board_kernel,
+        capsules::hmac::DRIVER_NUM,
         &mux_hmac,
+        hmac_key_buffer,
         hmac_data_buffer,
         hmac_dest_buffer,
     )
-    .finalize(components::hmac_component_helper!(lowrisc::hmac::Hmac, 32,));
+    .finalize(components::hmac_component_helper!(
+        capsules::virtual_digest::VirtualMuxDigest<lowrisc::hmac::Hmac, 32>,
+        32,
+    ));
+
+    digest.set_hmac_client(hmac);
+
+    let sha_data_buffer = static_init!([u8; 64], [0; 64]);
+    let sha_dest_buffer = static_init!([u8; 32], [0; 32]);
+
+    let mux_sha = components::sha::ShaMuxComponent::new(digest).finalize(
+        components::sha_mux_component_helper!(capsules::virtual_digest::VirtualMuxDigest<lowrisc::hmac::Hmac, 32>, 32),
+    );
+
+    let sha = components::sha::ShaComponent::new(
+        board_kernel,
+        capsules::sha::DRIVER_NUM,
+        &mux_sha,
+        sha_data_buffer,
+        sha_dest_buffer,
+    )
+    .finalize(components::sha_component_helper!(capsules::virtual_digest::VirtualMuxDigest<lowrisc::hmac::Hmac, 32>, 32));
+
+    digest.set_sha_client(sha);
 
     let i2c_master = static_init!(
         capsules::i2c_master::I2CMasterDriver<'static, lowrisc::i2c::I2c<'static>>,
         capsules::i2c_master::I2CMasterDriver::new(
             &peripherals.i2c0,
             &mut capsules::i2c_master::BUF,
-            board_kernel.create_grant(&memory_allocation_cap)
+            board_kernel.create_grant(capsules::i2c_master::DRIVER_NUM, &memory_allocation_cap)
         )
     );
 
     peripherals.i2c0.set_master_client(i2c_master);
+
+    peripherals.aes.initialise(
+        dynamic_deferred_caller
+            .register(&peripherals.aes)
+            .expect("dynamic deferred caller out of slots"),
+    );
 
     // USB support is currently broken in the OpenTitan hardware
     // See https://github.com/lowRISC/opentitan/issues/2598 for more details
@@ -280,12 +409,12 @@ pub unsafe fn main() {
         lowrisc::flash_ctrl::LowRiscPage::default()
     );
 
-    let mux_flash = components::tickv::FlashMuxComponent::new(&peripherals.flash_ctrl).finalize(
-        components::flash_user_component_helper!(lowrisc::flash_ctrl::FlashCtrl),
+    let mux_flash = components::flash::FlashMuxComponent::new(&peripherals.flash_ctrl).finalize(
+        components::flash_mux_component_helper!(lowrisc::flash_ctrl::FlashCtrl),
     );
 
     // TicKV
-    let _tickv = components::tickv::TicKVComponent::new(
+    let tickv = components::tickv::TicKVComponent::new(
         &mux_flash,                                  // Flash controller
         0x20040000 / lowrisc::flash_ctrl::PAGE_SIZE, // Region offset (size / page_size)
         0x40000,                                     // Region size
@@ -296,6 +425,19 @@ pub unsafe fn main() {
         lowrisc::flash_ctrl::FlashCtrl
     ));
     hil::flash::HasClient::set_client(&peripherals.flash_ctrl, mux_flash);
+    TICKV = Some(tickv);
+
+    // Newer FPGA builds of OpenTitan don't include the OTBN, so any accesses
+    // to the OTBN hardware will hang.
+    // OTBN is still connected though as it works on simulation runs
+    let _mux_otbn = crate::otbn::AccelMuxComponent::new(&peripherals.otbn)
+        .finalize(otbn_mux_component_helper!(1024));
+
+    peripherals.otbn.initialise(
+        dynamic_deferred_caller
+            .register(&peripherals.otbn)
+            .expect("dynamic deferred caller out of slots"),
+    );
 
     /// These symbols are defined in the linker script.
     extern "C" {
@@ -327,15 +469,23 @@ pub unsafe fn main() {
         static _ezero: u8;
     }
 
-    let earlgrey_nexysvideo = EarlGreyNexysVideo {
-        gpio: gpio,
-        led: led,
-        console: console,
-        alarm: alarm,
-        hmac,
-        lldb: lldb,
-        i2c_master,
-    };
+    let scheduler = components::sched::priority::PriorityComponent::new(board_kernel).finalize(());
+
+    let earlgrey_nexysvideo = static_init!(
+        EarlGreyNexysVideo,
+        EarlGreyNexysVideo {
+            gpio: gpio,
+            led: led,
+            console: console,
+            alarm: alarm,
+            hmac,
+            sha,
+            lldb: lldb,
+            i2c_master,
+            scheduler,
+            scheduler_timer,
+        }
+    );
 
     let mut mpu_config = rv32i::epmp::PMPConfig::default();
     // The kernel stack
@@ -383,7 +533,7 @@ pub unsafe fn main() {
 
     chip.pmp.enable_kernel_mpu(&mut mpu_config);
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -404,12 +554,55 @@ pub unsafe fn main() {
     });
     debug!("OpenTitan initialisation complete. Entering main loop");
 
-    let scheduler = components::sched::priority::PriorityComponent::new(board_kernel).finalize(());
-    board_kernel.kernel_loop(
-        &earlgrey_nexysvideo,
-        chip,
-        None::<&kernel::ipc::IPC<NUM_PROCS>>,
-        scheduler,
-        &main_loop_cap,
-    );
+    (board_kernel, earlgrey_nexysvideo, chip, peripherals)
+}
+
+/// Main function.
+///
+/// This function is called from the arch crate after some very basic RISC-V
+/// setup and RAM initialization.
+#[no_mangle]
+pub unsafe fn main() {
+    #[cfg(test)]
+    test_main();
+
+    #[cfg(not(test))]
+    {
+        let (board_kernel, earlgrey_nexysvideo, chip, _peripherals) = setup();
+
+        let main_loop_cap = create_capability!(capabilities::MainLoopCapability);
+
+        board_kernel.kernel_loop(
+            earlgrey_nexysvideo,
+            chip,
+            None::<&kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>>,
+            &main_loop_cap,
+        );
+    }
+}
+
+#[cfg(test)]
+use kernel::platform::watchdog::WatchDog;
+
+#[cfg(test)]
+fn test_runner(tests: &[&dyn Fn()]) {
+    unsafe {
+        let (board_kernel, earlgrey_nexysvideo, _chip, peripherals) = setup();
+
+        BOARD = Some(board_kernel);
+        PLATFORM = Some(&earlgrey_nexysvideo);
+        PERIPHERALS = Some(peripherals);
+        MAIN_CAP = Some(&create_capability!(capabilities::MainLoopCapability));
+
+        PLATFORM.map(|p| {
+            p.watchdog().setup();
+        });
+
+        for test in tests {
+            test();
+        }
+    }
+
+    // Exit QEMU with a return code of 0
+    crate::tests::semihost_command_exit_success()
 }

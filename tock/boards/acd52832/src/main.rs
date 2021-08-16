@@ -8,15 +8,18 @@
 
 use capsules::virtual_alarm::VirtualMuxAlarm;
 use kernel::capabilities;
-use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
+use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::hil;
 use kernel::hil::adc::Adc;
 use kernel::hil::entropy::Entropy32;
 use kernel::hil::gpio::{Configure, InterruptWithValue, Output};
+use kernel::hil::i2c::I2CMaster;
 use kernel::hil::led::LedLow;
 use kernel::hil::rng::Rng;
 use kernel::hil::time::{Alarm, Counter};
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::round_robin::RoundRobinSched;
 #[allow(unused_imports)]
 use kernel::{create_capability, debug, debug_gpio, static_init};
 use nrf52832::gpio::Pin;
@@ -41,12 +44,14 @@ pub mod io;
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
+const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] = [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
+    [None; NUM_PROCS];
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
@@ -69,7 +74,7 @@ pub struct Platform {
     >,
     rng: &'static capsules::rng::RngDriver<'static>,
     temp: &'static capsules::temperature::TemperatureSensor<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
+    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
         VirtualMuxAlarm<'static, nrf52832::rtc::Rtc<'static>>,
@@ -81,12 +86,14 @@ pub struct Platform {
         'static,
         capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52832::rtc::Rtc<'static>>,
     >,
+    scheduler: &'static RoundRobinSched<'static>,
+    systick: cortexm4::systick::SysTick,
 }
 
-impl kernel::Platform for Platform {
+impl SyscallDriverLookup for Platform {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
@@ -103,6 +110,36 @@ impl kernel::Platform for Platform {
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
+    }
+}
+
+impl KernelResources<nrf52832::chip::NRF52<'static, Nrf52832DefaultPeripherals<'static>>>
+    for Platform
+{
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = RoundRobinSched<'static>;
+    type SchedulerTimer = cortexm4::systick::SysTick;
+    type WatchDog = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
     }
 }
 
@@ -169,6 +206,7 @@ pub unsafe fn main() {
     //
     let gpio = components::gpio::GpioComponent::new(
         board_kernel,
+        capsules::gpio::DRIVER_NUM,
         components::gpio_component_helper!(
             nrf52832::gpio::GPIOPin,
             0 => &nrf52832_peripherals.gpio_port[Pin::P0_25],
@@ -201,6 +239,7 @@ pub unsafe fn main() {
     //
     let button = components::button::ButtonComponent::new(
         board_kernel,
+        capsules::button::DRIVER_NUM,
         components::button_component_helper!(
             nrf52832::gpio::GPIOPin,
             // 13
@@ -260,7 +299,7 @@ pub unsafe fn main() {
         >,
         capsules::alarm::AlarmDriver::new(
             alarm_driver_virtual_alarm,
-            board_kernel.create_grant(&memory_allocation_capability)
+            board_kernel.create_grant(capsules::alarm::DRIVER_NUM, &memory_allocation_capability)
         )
     );
     alarm_driver_virtual_alarm.set_alarm_client(alarm);
@@ -283,7 +322,12 @@ pub unsafe fn main() {
         .finalize(());
 
     // Setup the console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -294,13 +338,13 @@ pub unsafe fn main() {
     // Create shared mux for the I2C bus
     let i2c_mux = static_init!(
         capsules::virtual_i2c::MuxI2C<'static>,
-        capsules::virtual_i2c::MuxI2C::new(&base_peripherals.twim0, None, dynamic_deferred_caller)
+        capsules::virtual_i2c::MuxI2C::new(&base_peripherals.twi0, None, dynamic_deferred_caller)
     );
-    base_peripherals.twim0.configure(
+    base_peripherals.twi0.configure(
         nrf52832::pinmux::Pinmux::new(21),
         nrf52832::pinmux::Pinmux::new(20),
     );
-    base_peripherals.twim0.set_client(i2c_mux);
+    base_peripherals.twi0.set_master_client(i2c_mux);
 
     // Configure the MCP23017. Device address 0x20.
     let mcp_pin0 = static_init!(
@@ -345,7 +389,10 @@ pub unsafe fn main() {
         capsules::gpio_async::GPIOAsync<'static, capsules::mcp230xx::MCP230xx<'static>>,
         capsules::gpio_async::GPIOAsync::new(
             async_gpio_ports,
-            board_kernel.create_grant(&memory_allocation_capability)
+            board_kernel.create_grant(
+                capsules::gpio_async::DRIVER_NUM,
+                &memory_allocation_capability,
+            ),
         ),
     );
     // Setup the clients correctly.
@@ -357,8 +404,13 @@ pub unsafe fn main() {
     // BLE
     //
 
-    let ble_radio =
-        BLEComponent::new(board_kernel, &base_peripherals.ble_radio, mux_alarm).finalize(());
+    let ble_radio = BLEComponent::new(
+        board_kernel,
+        capsules::ble_advertising_driver::DRIVER_NUM,
+        &base_peripherals.ble_radio,
+        mux_alarm,
+    )
+    .finalize(());
 
     //
     // Temperature
@@ -369,7 +421,10 @@ pub unsafe fn main() {
         capsules::temperature::TemperatureSensor<'static>,
         capsules::temperature::TemperatureSensor::new(
             &base_peripherals.temp,
-            board_kernel.create_grant(&memory_allocation_capability)
+            board_kernel.create_grant(
+                capsules::temperature::DRIVER_NUM,
+                &memory_allocation_capability
+            )
         )
     );
     kernel::hil::sensors::TemperatureDriver::set_client(&base_peripherals.temp, temp);
@@ -390,7 +445,7 @@ pub unsafe fn main() {
         capsules::rng::RngDriver<'static>,
         capsules::rng::RngDriver::new(
             entropy_to_random,
-            board_kernel.create_grant(&memory_allocation_capability)
+            board_kernel.create_grant(capsules::rng::DRIVER_NUM, &memory_allocation_capability)
         )
     );
     entropy_to_random.set_client(rng);
@@ -420,7 +475,10 @@ pub unsafe fn main() {
         capsules::ambient_light::AmbientLight<'static>,
         capsules::ambient_light::AmbientLight::new(
             analog_light_sensor,
-            board_kernel.create_grant(&memory_allocation_capability)
+            board_kernel.create_grant(
+                capsules::ambient_light::DRIVER_NUM,
+                &memory_allocation_capability
+            )
         )
     );
     hil::sensors::AmbientLight::set_client(analog_light_sensor, light);
@@ -454,7 +512,10 @@ pub unsafe fn main() {
             virtual_pwm_buzzer,
             virtual_alarm_buzzer,
             capsules::buzzer_driver::DEFAULT_MAX_BUZZ_TIME_MS,
-            board_kernel.create_grant(&memory_allocation_capability)
+            board_kernel.create_grant(
+                capsules::buzzer_driver::DRIVER_NUM,
+                &memory_allocation_capability
+            )
         )
     );
     virtual_alarm_buzzer.set_alarm_client(buzzer);
@@ -472,6 +533,9 @@ pub unsafe fn main() {
     while !base_peripherals.clock.low_started() {}
     while !base_peripherals.clock.high_started() {}
 
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+        .finalize(components::rr_component_helper!(NUM_PROCS));
+
     let platform = Platform {
         button: button,
         ble_radio: ble_radio,
@@ -484,7 +548,13 @@ pub unsafe fn main() {
         gpio_async: gpio_async,
         light: light,
         buzzer: buzzer,
-        ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
+        ipc: kernel::ipc::IPC::new(
+            board_kernel,
+            kernel::ipc::DRIVER_NUM,
+            &memory_allocation_capability,
+        ),
+        scheduler,
+        systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
     };
 
     let chip = static_init!(
@@ -510,7 +580,7 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -530,13 +600,5 @@ pub unsafe fn main() {
         debug!("{:?}", err);
     });
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
-        .finalize(components::rr_component_helper!(NUM_PROCS));
-    board_kernel.kernel_loop(
-        &platform,
-        chip,
-        Some(&platform.ipc),
-        scheduler,
-        &main_loop_capability,
-    );
+    board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
 }

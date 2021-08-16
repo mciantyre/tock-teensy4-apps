@@ -1,7 +1,7 @@
-use kernel::common::registers::interfaces::{ReadWriteable, Readable, Writeable};
-use kernel::common::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite};
-use kernel::common::StaticRef;
-use kernel::ClockInterface;
+use kernel::platform::chip::ClockInterface;
+use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
+use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite};
+use kernel::utilities::StaticRef;
 
 register_structs! {
     /// Clock Controller Module
@@ -611,7 +611,7 @@ impl Ccm {
         self.registers.ccgr[5].modify(CCGR::CG3.val(0b00));
     }
 
-    /// Indicates if the DCDC clock gate is enabled
+    /// Indicates if the DMA clock gate is enabled
     pub fn is_enabled_dma_clock(&self) -> bool {
         self.registers.ccgr[5].read(CCGR::CG3) != 0
     }
