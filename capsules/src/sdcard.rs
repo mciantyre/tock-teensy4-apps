@@ -44,11 +44,14 @@ use core::cell::Cell;
 use core::cmp;
 use core::mem;
 
-use kernel::common::cells::{OptionalCell, TakeCell};
+use kernel::grant::Grant;
 use kernel::hil;
-use kernel::ErrorCode;
-use kernel::{CommandReturn, Driver, Grant, ProcessId, Upcall};
-use kernel::{Read, ReadOnlyAppSlice, ReadWrite, ReadWriteAppSlice};
+use kernel::hil::time::ConvertTicks;
+use kernel::processbuffer::{ReadOnlyProcessBuffer, ReadableProcessBuffer};
+use kernel::processbuffer::{ReadWriteProcessBuffer, WriteableProcessBuffer};
+use kernel::syscall::{CommandReturn, SyscallDriver};
+use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::{ErrorCode, ProcessId};
 
 /// Syscall driver number.
 use crate::driver;
@@ -247,24 +250,24 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
         }
     }
 
-    fn set_spi_slow_mode(&self) {
+    fn set_spi_slow_mode(&self) -> Result<(), ErrorCode> {
         // need to be in slow mode while initializing the SD card
         // set to CPHA=0, CPOL=0, 400 kHZ
         self.spi.configure(
             hil::spi::ClockPolarity::IdleLow,
             hil::spi::ClockPhase::SampleLeading,
             400000,
-        );
+        )
     }
 
-    fn set_spi_fast_mode(&self) {
+    fn set_spi_fast_mode(&self) -> Result<(), ErrorCode> {
         // can read/write in fast mode after the SD card is initialized
         // set to CPHA=0, CPOL=0, 4 MHz
         self.spi.configure(
             hil::spi::ClockPolarity::IdleLow,
             hil::spi::ClockPhase::SampleLeading,
             4000000,
-        );
+        )
     }
 
     /// send a command over SPI and collect the response
@@ -284,10 +287,12 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
 
         if self.is_initialized() {
             // device is already initialized
-            self.set_spi_fast_mode();
+            // TODO verify SPI return value
+            let _ = self.set_spi_fast_mode();
         } else {
             // device is still being initialized
-            self.set_spi_slow_mode();
+            // TODO verify SPI return value
+            let _ = self.set_spi_slow_mode();
         }
 
         // send dummy bytes to start
@@ -338,7 +343,8 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
         read_buffer: &'static mut [u8],
         recv_len: usize,
     ) {
-        self.set_spi_fast_mode();
+        // TODO verify SPI return value
+        let _ = self.set_spi_fast_mode();
 
         // set write buffer to null transactions
         // Limit to minimum length between write_buffer and recv_len.
@@ -360,8 +366,10 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
         read_buffer: &'static mut [u8],
         recv_len: usize,
     ) {
-        self.set_spi_fast_mode();
+        // TODO verify SPI return value
+        let _ = self.set_spi_fast_mode();
 
+        // TODO verify SPI return value
         let _ = self
             .spi
             .read_write_bytes(write_buffer, Some(read_buffer), recv_len);
@@ -515,7 +523,7 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
 
                     // try again after 10 ms
                     self.alarm_state.set(AlarmState::RepeatHCSInit);
-                    let delay = A::ticks_from_ms(10);
+                    let delay = self.alarm.ticks_from_ms(10);
                     self.alarm.set_alarm(self.alarm.now(), delay);
                 } else {
                     // error, send callback and quit
@@ -611,7 +619,7 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
 
                     // try again after 10 ms
                     self.alarm_state.set(AlarmState::RepeatAppSpecificInit);
-                    let delay = A::ticks_from_ms(10);
+                    let delay = self.alarm.ticks_from_ms(10);
                     self.alarm.set_alarm(self.alarm.now(), delay);
                 } else {
                     // error, send callback and quit
@@ -649,7 +657,7 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
 
                     // try again after 10 ms
                     self.alarm_state.set(AlarmState::RepeatGenericInit);
-                    let delay = A::ticks_from_ms(10);
+                    let delay = self.alarm.ticks_from_ms(10);
                     self.alarm.set_alarm(self.alarm.now(), delay);
                 } else {
                     // error, send callback and quit
@@ -791,7 +799,7 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
 
                     // try again after 1 ms
                     self.alarm_state.set(AlarmState::WaitForDataBlock);
-                    let delay = A::ticks_from_ms(1);
+                    let delay = self.alarm.ticks_from_ms(1);
                     self.alarm.set_alarm(self.alarm.now(), delay);
                 } else {
                     // error, send callback and quit
@@ -849,7 +857,7 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
                     // try again after 1 ms
                     self.alarm_state
                         .set(AlarmState::WaitForDataBlocks { count: count });
-                    let delay = A::ticks_from_ms(1);
+                    let delay = self.alarm.ticks_from_ms(1);
                     self.alarm.set_alarm(self.alarm.now(), delay);
                 } else {
                     // error, send callback and quit
@@ -1036,7 +1044,7 @@ impl<'a, A: hil::time::Alarm<'a>> SDCard<'a, A> {
 
                     // try again after 1 ms
                     self.alarm_state.set(AlarmState::WaitForWriteBusy);
-                    let delay = A::ticks_from_ms(1);
+                    let delay = self.alarm.ticks_from_ms(1);
                     self.alarm.set_alarm(self.alarm.now(), delay);
                 }
             }
@@ -1355,6 +1363,7 @@ impl<'a, A: hil::time::Alarm<'a>> hil::spi::SpiMasterClient for SDCard<'a, A> {
         write_buffer: &'static mut [u8],
         read_buffer: Option<&'static mut [u8]>,
         len: usize,
+        _status: Result<(), ErrorCode>,
     ) {
         // unrwap so we don't have to deal with options everywhere
         read_buffer.map(move |read_buffer| {
@@ -1394,7 +1403,7 @@ impl<'a, A: hil::time::Alarm<'a>> hil::gpio::Client for SDCard<'a, A> {
 
         // run a timer for 500 ms in order to let the sd card settle
         self.alarm_state.set(AlarmState::DetectionChange);
-        let delay = A::ticks_from_ms(500);
+        let delay = self.alarm.ticks_from_ms(500);
         self.alarm.set_alarm(self.alarm.now(), delay);
     }
 }
@@ -1406,16 +1415,15 @@ impl<'a, A: hil::time::Alarm<'a>> hil::gpio::Client for SDCard<'a, A> {
 pub struct SDCardDriver<'a, A: hil::time::Alarm<'a>> {
     sdcard: &'a SDCard<'a, A>,
     kernel_buf: TakeCell<'static, [u8]>,
-    grants: Grant<App>,
+    grants: Grant<App, 1>,
     current_process: OptionalCell<ProcessId>,
 }
 
 /// Holds buffers and whatnot that the application has passed us.
 #[derive(Default)]
 pub struct App {
-    callback: Upcall,
-    write_buffer: ReadOnlyAppSlice,
-    read_buffer: ReadWriteAppSlice,
+    write_buffer: ReadOnlyProcessBuffer,
+    read_buffer: ReadWriteProcessBuffer,
 }
 
 /// Buffer for SD card driver, assigned in board `main.rs` files
@@ -1431,7 +1439,7 @@ impl<'a, A: hil::time::Alarm<'a>> SDCardDriver<'a, A> {
     pub fn new(
         sdcard: &'a SDCard<'a, A>,
         kernel_buf: &'static mut [u8; 512],
-        grants: Grant<App>,
+        grants: Grant<App, 1>,
     ) -> SDCardDriver<'a, A> {
         // return new SDCardDriver
         SDCardDriver {
@@ -1447,17 +1455,19 @@ impl<'a, A: hil::time::Alarm<'a>> SDCardDriver<'a, A> {
 impl<'a, A: hil::time::Alarm<'a>> SDCardClient for SDCardDriver<'a, A> {
     fn card_detection_changed(&self, installed: bool) {
         self.current_process.map(|process_id| {
-            let _ = self.grants.enter(*process_id, |app| {
-                app.callback.schedule(0, installed as usize, 0);
+            let _ = self.grants.enter(*process_id, |_app, upcalls| {
+                upcalls.schedule_upcall(0, (0, installed as usize, 0)).ok();
             });
         });
     }
 
     fn init_done(&self, block_size: u32, total_size: u64) {
         self.current_process.map(|process_id| {
-            let _ = self.grants.enter(*process_id, |app| {
+            let _ = self.grants.enter(*process_id, |_app, upcalls| {
                 let size_in_kb = ((total_size >> 10) & 0xFFFFFFFF) as usize;
-                app.callback.schedule(1, block_size as usize, size_in_kb);
+                upcalls
+                    .schedule_upcall(0, (1, block_size as usize, size_in_kb))
+                    .ok();
             });
         });
     }
@@ -1466,28 +1476,30 @@ impl<'a, A: hil::time::Alarm<'a>> SDCardClient for SDCardDriver<'a, A> {
         self.kernel_buf.replace(data);
 
         self.current_process.map(|process_id| {
-            let _ = self.grants.enter(*process_id, |app| {
+            let _ = self.grants.enter(*process_id, |app, upcalls| {
                 let mut read_len = 0;
                 self.kernel_buf.map(|data| {
-                    app.read_buffer.mut_map_or(0, |read_buffer| {
-                        let read_buffer = read_buffer;
-                        // copy bytes to user buffer
-                        // Limit to minimum length between read_buffer, data, and
-                        // len field
-                        for (read_byte, &data_byte) in
-                            read_buffer.iter_mut().zip(data.iter()).take(len)
-                        {
-                            *read_byte = data_byte;
-                        }
-                        read_len = cmp::min(read_buffer.len(), cmp::min(data.len(), len));
-                        read_len
-                    });
+                    app.read_buffer
+                        .mut_enter(|read_buffer| {
+                            let read_buffer = read_buffer;
+                            // copy bytes to user buffer
+                            // Limit to minimum length between read_buffer, data, and
+                            // len field
+                            for (read_byte, &data_byte) in
+                                read_buffer.iter().zip(data.iter()).take(len)
+                            {
+                                read_byte.set(data_byte);
+                            }
+                            read_len = cmp::min(read_buffer.len(), cmp::min(data.len(), len));
+                            read_len
+                        })
+                        .unwrap_or(0);
                 });
 
                 // perform callback
                 // Note that we are explicitly performing the callback even if no
                 // data was read or if the app's read_buffer doesn't exist
-                app.callback.schedule(2, read_len, 0);
+                upcalls.schedule_upcall(0, (2, read_len, 0)).ok();
             });
         });
     }
@@ -1496,32 +1508,32 @@ impl<'a, A: hil::time::Alarm<'a>> SDCardClient for SDCardDriver<'a, A> {
         self.kernel_buf.replace(buffer);
 
         self.current_process.map(|process_id| {
-            let _ = self.grants.enter(*process_id, |app| {
-                app.callback.schedule(3, 0, 0);
+            let _ = self.grants.enter(*process_id, |_app, upcalls| {
+                upcalls.schedule_upcall(0, (3, 0, 0)).ok();
             });
         });
     }
 
     fn error(&self, error: u32) {
         self.current_process.map(|process_id| {
-            let _ = self.grants.enter(*process_id, |app| {
-                app.callback.schedule(4, error as usize, 0);
+            let _ = self.grants.enter(*process_id, |_app, upcalls| {
+                upcalls.schedule_upcall(0, (4, error as usize, 0)).ok();
             });
         });
     }
 }
 
 /// Connections to userspace syscalls
-impl<'a, A: hil::time::Alarm<'a>> Driver for SDCardDriver<'a, A> {
+impl<'a, A: hil::time::Alarm<'a>> SyscallDriver for SDCardDriver<'a, A> {
     fn allow_readwrite(
         &self,
         process_id: ProcessId,
         allow_num: usize,
-        mut slice: ReadWriteAppSlice,
-    ) -> Result<ReadWriteAppSlice, (ReadWriteAppSlice, ErrorCode)> {
+        mut slice: ReadWriteProcessBuffer,
+    ) -> Result<ReadWriteProcessBuffer, (ReadWriteProcessBuffer, ErrorCode)> {
         let res = self
             .grants
-            .enter(process_id, |grant| {
+            .enter(process_id, |grant, _| {
                 match allow_num {
                     // Pass read buffer in from application
                     0 => {
@@ -1543,11 +1555,11 @@ impl<'a, A: hil::time::Alarm<'a>> Driver for SDCardDriver<'a, A> {
         &self,
         process_id: ProcessId,
         allow_num: usize,
-        mut slice: ReadOnlyAppSlice,
-    ) -> Result<ReadOnlyAppSlice, (ReadOnlyAppSlice, ErrorCode)> {
+        mut slice: ReadOnlyProcessBuffer,
+    ) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
         let res = self
             .grants
-            .enter(process_id, |grant| {
+            .enter(process_id, |grant, _| {
                 match allow_num {
                     // Pass write buffer in from application
                     0 => {
@@ -1562,32 +1574,6 @@ impl<'a, A: hil::time::Alarm<'a>> Driver for SDCardDriver<'a, A> {
         match res {
             Ok(()) => Ok(slice),
             Err(e) => Err((slice, e)),
-        }
-    }
-
-    fn subscribe(
-        &self,
-        subscribe_num: usize,
-        mut callback: Upcall,
-        process_id: ProcessId,
-    ) -> Result<Upcall, (Upcall, ErrorCode)> {
-        let res = self
-            .grants
-            .enter(process_id, |grant| {
-                match subscribe_num {
-                    // Set callback
-                    0 => {
-                        mem::swap(&mut grant.callback, &mut callback);
-                        Ok(())
-                    }
-                    _ => Err(ErrorCode::NOSUPPORT),
-                }
-            })
-            .unwrap_or_else(|e| e.into());
-
-        match res {
-            Ok(()) => Ok(callback),
-            Err(e) => Err((callback, e)),
         }
     }
 
@@ -1606,7 +1592,7 @@ impl<'a, A: hil::time::Alarm<'a>> Driver for SDCardDriver<'a, A> {
         // Check if this driver is free, or already dedicated to this process.
         let match_or_empty_or_nonexistant = self.current_process.map_or(true, |current_process| {
             self.grants
-                .enter(*current_process, |_| current_process == &process_id)
+                .enter(*current_process, |_, _| current_process == &process_id)
                 .unwrap_or(true)
         });
         if match_or_empty_or_nonexistant {
@@ -1640,25 +1626,26 @@ impl<'a, A: hil::time::Alarm<'a>> Driver for SDCardDriver<'a, A> {
             4 => {
                 let result: Result<(), ErrorCode> = self
                     .grants
-                    .enter(process_id, |app| {
+                    .enter(process_id, |app, _| {
                         app.write_buffer
-                            .map_or(Err(ErrorCode::NOMEM), |write_buffer| {
+                            .enter(|write_buffer| {
                                 self.kernel_buf
                                     .take()
                                     .map_or(Err(ErrorCode::BUSY), |kernel_buf| {
                                         // copy over write data from application
                                         // Limit to minimum length between kernel_buf,
                                         // write_buffer, and 512 (block size)
-                                        for (kernel_byte, &write_byte) in
+                                        for (kernel_byte, ref write_byte) in
                                             kernel_buf.iter_mut().zip(write_buffer.iter()).take(512)
                                         {
-                                            *kernel_byte = write_byte;
+                                            *kernel_byte = write_byte.get();
                                         }
 
                                         // begin writing
                                         self.sdcard.write_blocks(kernel_buf, data as u32, 1)
                                     })
                             })
+                            .unwrap_or(Err(ErrorCode::NOMEM))
                     })
                     .unwrap_or(Err(ErrorCode::NOMEM));
                 CommandReturn::from(result)
@@ -1666,5 +1653,9 @@ impl<'a, A: hil::time::Alarm<'a>> Driver for SDCardDriver<'a, A> {
 
             _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
         }
+    }
+
+    fn allocate_grant(&self, processid: ProcessId) -> Result<(), kernel::process::Error> {
+        self.grants.enter(processid, |_, _| {})
     }
 }

@@ -2,9 +2,9 @@
 
 use core::fmt::Write;
 use kernel;
-use kernel::common::registers::interfaces::{ReadWriteable, Readable, Writeable};
-use kernel::hil::time::Alarm;
-use kernel::{Chip, InterruptService};
+use kernel::dynamic_deferred_call::DynamicDeferredCall;
+use kernel::platform::chip::{Chip, InterruptService};
+use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use rv32i::csr::{mcause, mie::mie, mip::mip, mtvec::mtvec, CSR};
 use rv32i::epmp::PMP;
 use rv32i::syscall::SysCall;
@@ -14,11 +14,10 @@ use crate::interrupts;
 use crate::plic::Plic;
 use crate::plic::PLIC;
 
-pub struct EarlGrey<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> {
+pub struct EarlGrey<'a, I: InterruptService<()> + 'a> {
     userspace_kernel_boundary: SysCall,
     pub pmp: PMP<8>,
     plic: &'a Plic,
-    scheduler_timer: kernel::VirtualSchedulerTimer<A>,
     timer: &'static crate::timer::RvTimer<'static>,
     pwrmgr: lowrisc::pwrmgr::PwrMgr,
     plic_interrupt_service: &'a I,
@@ -29,18 +28,20 @@ pub struct EarlGreyDefaultPeripherals<'a> {
     pub hmac: lowrisc::hmac::Hmac<'a>,
     pub usb: lowrisc::usbdev::Usb<'a>,
     pub uart0: lowrisc::uart::Uart<'a>,
+    pub otbn: lowrisc::otbn::Otbn<'a>,
     pub gpio_port: crate::gpio::Port<'a>,
     pub i2c0: lowrisc::i2c::I2c<'a>,
     pub flash_ctrl: lowrisc::flash_ctrl::FlashCtrl<'a>,
 }
 
 impl<'a> EarlGreyDefaultPeripherals<'a> {
-    pub fn new() -> Self {
+    pub fn new(deferred_caller: &'static DynamicDeferredCall) -> Self {
         Self {
-            aes: crate::aes::Aes::new(),
+            aes: crate::aes::Aes::new(deferred_caller),
             hmac: lowrisc::hmac::Hmac::new(crate::hmac::HMAC0_BASE),
             usb: lowrisc::usbdev::Usb::new(crate::usbdev::USB0_BASE),
             uart0: lowrisc::uart::Uart::new(crate::uart::UART0_BASE, CONFIG.peripheral_freq),
+            otbn: lowrisc::otbn::Otbn::new(crate::otbn::OTBN_BASE, deferred_caller),
             gpio_port: crate::gpio::Port::new(),
             i2c0: lowrisc::i2c::I2c::new(
                 crate::i2c::I2C0_BASE,
@@ -76,6 +77,7 @@ impl<'a> InterruptService<()> for EarlGreyDefaultPeripherals<'a> {
             interrupts::I2C0_FMTWATERMARK..=interrupts::I2C0_HOSTTIMEOUT => {
                 self.i2c0.handle_interrupt()
             }
+            interrupts::OTBN_DONE => self.otbn.handle_interrupt(),
             _ => return false,
         }
         true
@@ -86,9 +88,8 @@ impl<'a> InterruptService<()> for EarlGreyDefaultPeripherals<'a> {
     }
 }
 
-impl<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> EarlGrey<'a, A, I> {
+impl<'a, I: InterruptService<()> + 'a> EarlGrey<'a, I> {
     pub unsafe fn new(
-        virtual_alarm: &'static A,
         plic_interrupt_service: &'a I,
         timer: &'static crate::timer::RvTimer,
     ) -> Self {
@@ -96,7 +97,6 @@ impl<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> EarlGrey<'a,
             userspace_kernel_boundary: SysCall::new(),
             pmp: PMP::new(),
             plic: &PLIC,
-            scheduler_timer: kernel::VirtualSchedulerTimer::new(virtual_alarm),
             pwrmgr: lowrisc::pwrmgr::PwrMgr::new(crate::pwrmgr::PWRMGR_BASE),
             timer,
             plic_interrupt_service,
@@ -193,24 +193,12 @@ impl<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> EarlGrey<'a,
     }
 }
 
-impl<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> kernel::Chip
-    for EarlGrey<'a, A, I>
-{
+impl<'a, I: InterruptService<()> + 'a> kernel::platform::chip::Chip for EarlGrey<'a, I> {
     type MPU = PMP<8>;
     type UserspaceKernelBoundary = SysCall;
-    type SchedulerTimer = kernel::VirtualSchedulerTimer<A>;
-    type WatchDog = ();
 
     fn mpu(&self) -> &Self::MPU {
         &self.pmp
-    }
-
-    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
-        &self.scheduler_timer
-    }
-
-    fn watchdog(&self) -> &Self::WatchDog {
-        &()
     }
 
     fn userspace_kernel_boundary(&self) -> &SysCall {
@@ -275,10 +263,12 @@ fn handle_exception(exception: mcause::Exception) {
     match exception {
         mcause::Exception::UserEnvCall | mcause::Exception::SupervisorEnvCall => (),
 
+        // Breakpoints occur from the tests running on hardware
+        mcause::Exception::Breakpoint => loop {},
+
         mcause::Exception::InstructionMisaligned
         | mcause::Exception::InstructionFault
         | mcause::Exception::IllegalInstruction
-        | mcause::Exception::Breakpoint
         | mcause::Exception::LoadMisaligned
         | mcause::Exception::LoadFault
         | mcause::Exception::StoreMisaligned

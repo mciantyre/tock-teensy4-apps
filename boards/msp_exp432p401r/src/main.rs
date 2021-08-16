@@ -10,11 +10,12 @@
 
 use components::gpio::GpioComponent;
 use kernel::capabilities;
-use kernel::common::dynamic_deferred_call::DynamicDeferredCall;
-use kernel::common::dynamic_deferred_call::DynamicDeferredCallClientState;
 use kernel::component::Component;
+use kernel::dynamic_deferred_call::DynamicDeferredCall;
+use kernel::dynamic_deferred_call::DynamicDeferredCallClientState;
 use kernel::hil::gpio::Configure;
-use kernel::Platform;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::round_robin::RoundRobinSched;
 use kernel::{create_capability, debug, static_init};
 
 /// Support routines for debugging I/O.
@@ -25,16 +26,18 @@ mod multi_alarm_test;
 
 /// Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 /// Actual memory for holding the active process structures.
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] = [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
+    [None; NUM_PROCS];
 
 /// Static reference to chip for panic dumps.
 static mut CHIP: Option<&'static msp432::chip::Msp432<msp432::chip::Msp432DefaultPeripherals>> =
     None;
 
 /// How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
+const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
@@ -55,15 +58,48 @@ struct MspExp432P401R {
         'static,
         capsules::virtual_alarm::VirtualMuxAlarm<'static, msp432::timer::TimerA<'static>>,
     >,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
+    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
     adc: &'static capsules::adc::AdcDedicated<'static, msp432::adc::Adc<'static>>,
+    wdt: &'static msp432::wdt::Wdt,
+    scheduler: &'static RoundRobinSched<'static>,
+    systick: cortexm4::systick::SysTick,
+}
+
+impl KernelResources<msp432::chip::Msp432<'static, msp432::chip::Msp432DefaultPeripherals<'static>>>
+    for MspExp432P401R
+{
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = RoundRobinSched<'static>;
+    type SchedulerTimer = cortexm4::systick::SysTick;
+    type WatchDog = msp432::wdt::Wdt;
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &self.wdt
+    }
 }
 
 /// Mapping of integer syscalls to objects that implement syscalls.
-impl Platform for MspExp432P401R {
+impl SyscallDriverLookup for MspExp432P401R {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::led::DRIVER_NUM => f(Some(self.led)),
@@ -140,6 +176,17 @@ unsafe fn setup_adc_pins(gpio: &msp432::gpio::GpioManager) {
     // gpio.pins[PinNr::P08_2 as usize].enable_tertiary_function(); // A23
 }
 
+/// This is in a separate, inline(never) function so that its stack frame is
+/// removed when this function returns. Otherwise, the stack space used for
+/// these static_inits is wasted.
+#[inline(never)]
+unsafe fn get_peripherals() -> &'static mut msp432::chip::Msp432DefaultPeripherals<'static> {
+    static_init!(
+        msp432::chip::Msp432DefaultPeripherals,
+        msp432::chip::Msp432DefaultPeripherals::new()
+    )
+}
+
 /// Main function.
 ///
 /// This is called after RAM initialization is complete.
@@ -147,10 +194,7 @@ unsafe fn setup_adc_pins(gpio: &msp432::gpio::GpioManager) {
 pub unsafe fn main() {
     startup_intilialisation();
 
-    let peripherals = static_init!(
-        msp432::chip::Msp432DefaultPeripherals,
-        msp432::chip::Msp432DefaultPeripherals::new()
-    );
+    let peripherals = get_peripherals();
     peripherals.init();
 
     // Setup the GPIO pins to use the HFXT (high frequency external) oscillator (48MHz)
@@ -191,6 +235,7 @@ pub unsafe fn main() {
     // Setup buttons
     let button = components::button::ButtonComponent::new(
         board_kernel,
+        capsules::button::DRIVER_NUM,
         components::button_component_helper!(
             msp432::gpio::IntPin,
             (
@@ -227,6 +272,7 @@ pub unsafe fn main() {
     // Setup user-GPIOs
     let gpio = GpioComponent::new(
         board_kernel,
+        capsules::gpio::DRIVER_NUM,
         components::gpio_component_helper!(
             msp432::gpio::IntPin<'static>,
             // Left outer connector, top to bottom
@@ -295,7 +341,12 @@ pub unsafe fn main() {
     .finalize(());
 
     // Setup the console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -304,8 +355,12 @@ pub unsafe fn main() {
     let mux_alarm = components::alarm::AlarmMuxComponent::new(timer0).finalize(
         components::alarm_mux_component_helper!(msp432::timer::TimerA),
     );
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
-        .finalize(components::alarm_component_helper!(msp432::timer::TimerA));
+    let alarm = components::alarm::AlarmDriverComponent::new(
+        board_kernel,
+        capsules::alarm::DRIVER_NUM,
+        mux_alarm,
+    )
+    .finalize(components::alarm_component_helper!(msp432::timer::TimerA));
 
     // Setup ADC
 
@@ -342,7 +397,7 @@ pub unsafe fn main() {
     );
 
     let grant_cap = create_capability!(capabilities::MemoryAllocationCapability);
-    let grant_adc = board_kernel.create_grant(&grant_cap);
+    let grant_adc = board_kernel.create_grant(capsules::adc::DRIVER_NUM, &grant_cap);
     let adc = static_init!(
         capsules::adc::AdcDedicated<'static, msp432::adc::Adc>,
         capsules::adc::AdcDedicated::new(
@@ -364,14 +419,24 @@ pub unsafe fn main() {
     // Enable the internal temperature sensor on ADC Channel 22
     peripherals.adc_ref.enable_temp_sensor(true);
 
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+        .finalize(components::rr_component_helper!(NUM_PROCS));
+
     let msp_exp432p4014 = MspExp432P401R {
         led: leds,
         console: console,
         button: button,
         gpio: gpio,
         alarm: alarm,
-        ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
+        ipc: kernel::ipc::IPC::new(
+            board_kernel,
+            kernel::ipc::DRIVER_NUM,
+            &memory_allocation_capability,
+        ),
         adc: adc,
+        scheduler,
+        systick: cortexm4::systick::SysTick::new_with_calibration(48_000_000),
+        wdt: &peripherals.wdt,
     };
 
     debug!("Initialization complete. Entering main loop");
@@ -388,7 +453,7 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -405,9 +470,6 @@ pub unsafe fn main() {
     )
     .unwrap();
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
-        .finalize(components::rr_component_helper!(NUM_PROCS));
-
     //Uncomment to run multi alarm test
     //multi_alarm_test::run_multi_alarm(mux_alarm);
 
@@ -415,7 +477,6 @@ pub unsafe fn main() {
         &msp_exp432p4014,
         chip,
         Some(&msp_exp432p4014.ipc),
-        scheduler,
         &main_loop_capability,
     );
 }

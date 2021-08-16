@@ -5,12 +5,12 @@
 
 use crate::capabilities::MemoryAllocationCapability;
 use crate::grant::Grant;
-use crate::mem::Read;
+use crate::kernel::Kernel;
 use crate::process;
 use crate::process::ProcessId;
-use crate::sched::Kernel;
-use crate::upcall::Upcall;
-use crate::{CommandReturn, Driver, ErrorCode, ReadOnlyAppSlice, ReadWriteAppSlice};
+use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer, ReadableProcessBuffer};
+use crate::syscall_driver::{CommandReturn, SyscallDriver};
+use crate::ErrorCode;
 
 /// Syscall number
 pub const DRIVER_NUM: usize = 0x10000;
@@ -28,39 +28,58 @@ pub enum IPCUpcallType {
 
 /// State that is stored in each process's grant region to support IPC.
 struct IPCData<const NUM_PROCS: usize> {
-    /// An array of app slices that this application has shared with other
-    /// applications.
-    shared_memory: [ReadWriteAppSlice; NUM_PROCS],
-    search_slice: ReadOnlyAppSlice,
-    /// An array of upcalls this process has registered to receive upcalls
-    /// from other services.
-    client_upcalls: [Upcall; NUM_PROCS],
-    /// The upcall setup by a service. Each process can only be one service.
-    upcall: Upcall,
+    /// An array of process buffers that this application has shared
+    /// with other applications.
+    shared_memory: [ReadWriteProcessBuffer; NUM_PROCS],
+    search_buf: ReadOnlyProcessBuffer,
 }
 
 impl<const NUM_PROCS: usize> Default for IPCData<NUM_PROCS> {
     fn default() -> IPCData<NUM_PROCS> {
-        const DEFAULT_RW_APP_SLICE: ReadWriteAppSlice = ReadWriteAppSlice::const_default();
+        const DEFAULT_RW_PROC_BUF: ReadWriteProcessBuffer = ReadWriteProcessBuffer::const_default();
         IPCData {
-            shared_memory: [DEFAULT_RW_APP_SLICE; NUM_PROCS],
-            search_slice: ReadOnlyAppSlice::default(),
-            client_upcalls: [Upcall::default(); NUM_PROCS],
-            upcall: Upcall::default(),
+            shared_memory: [DEFAULT_RW_PROC_BUF; NUM_PROCS],
+            search_buf: ReadOnlyProcessBuffer::default(),
         }
     }
 }
 
+/// The upcall setup by a service. Each process can only be one service.
+/// Subscribe with subscribe_num == 0 is how a process registers
+/// itself as an IPC service. Each process can only register as a
+/// single IPC service. The identifier for the IPC service is the
+/// application name stored in the TBF header of the application.
+/// The upcall that is passed to subscribe is called when another
+/// process notifies the server process.
+const SERVICE_UPCALL_NUM: usize = 0;
+
+/// This const specifies the subscribe_num of the first upcall
+/// in the array of client upcalls.
+/// Subscribe with subscribe_num >= 1 is how a client registers
+/// a upcall for a given service. The service number (passed
+/// as subscribe_num) is returned from the allow() call.
+/// Once subscribed, the client will receive upcalls when the
+/// service process calls notify_client().
+
+const CLIENT_UPCALL_NUM_BASE: usize = 1;
+
 /// The IPC mechanism struct.
-pub struct IPC<const NUM_PROCS: usize> {
+/// NUM_UPCALLS should always equal NUM_PROCS + 1. The extra upcall
+/// is so processes can register as a service. Once const_evaluatable_checked
+/// is stable we will not need two separate const generic parameters.
+pub struct IPC<const NUM_PROCS: usize, const NUM_UPCALLS: usize> {
     /// The grant regions for each process that holds the per-process IPC data.
-    data: Grant<IPCData<NUM_PROCS>>,
+    data: Grant<IPCData<NUM_PROCS>, NUM_UPCALLS>,
 }
 
-impl<const NUM_PROCS: usize> IPC<NUM_PROCS> {
-    pub fn new(kernel: &'static Kernel, capability: &dyn MemoryAllocationCapability) -> Self {
+impl<const NUM_PROCS: usize, const NUM_UPCALLS: usize> IPC<NUM_PROCS, NUM_UPCALLS> {
+    pub fn new(
+        kernel: &'static Kernel,
+        driver_num: usize,
+        capability: &dyn MemoryAllocationCapability,
+    ) -> Self {
         Self {
-            data: kernel.create_grant(capability),
+            data: kernel.create_grant(driver_num, capability),
         }
     }
 
@@ -73,120 +92,71 @@ impl<const NUM_PROCS: usize> IPC<NUM_PROCS> {
         cb_type: IPCUpcallType,
     ) -> Result<(), process::Error> {
         self.data
-            .enter(schedule_on, |mydata| {
-                let mut upcall = match cb_type {
-                    IPCUpcallType::Service => mydata.upcall,
+            .enter(schedule_on, |_mydata, my_upcalls| {
+                let to_schedule: usize = match cb_type {
+                    IPCUpcallType::Service => SERVICE_UPCALL_NUM,
                     IPCUpcallType::Client => match called_from.index() {
-                        Some(i) => *mydata.client_upcalls.get(i).unwrap_or(&Upcall::default()),
-                        None => Upcall::default(),
+                        Some(i) => i + CLIENT_UPCALL_NUM_BASE,
+                        None => panic!("Invalid app issued IPC request"), //TODO: return Error instead
                     },
                 };
-                self.data.enter(called_from, |called_from_data| {
-                    // If the other app shared a buffer with us, make
-                    // sure we have access to that slice and then call
-                    // the upcall. If no slice was shared then just
-                    // call the upcall.
-                    match schedule_on.index() {
-                        Some(i) => {
-                            if i >= called_from_data.shared_memory.len() {
-                                return;
-                            }
+                self.data
+                    .enter(called_from, |called_from_data, _called_from_upcalls| {
+                        // If the other app shared a buffer with us, make
+                        // sure we have access to that slice and then call
+                        // the upcall. If no slice was shared then just
+                        // call the upcall.
+                        match schedule_on.index() {
+                            Some(i) => {
+                                if i >= called_from_data.shared_memory.len() {
+                                    return;
+                                }
 
-                            match called_from_data.shared_memory.get(i) {
-                                Some(slice) => {
-                                    self.data
-                                        .kernel
-                                        .process_map_or(None, schedule_on, |process| {
-                                            process.add_mpu_region(
-                                                slice.ptr(),
-                                                slice.len(),
-                                                slice.len(),
+                                match called_from_data.shared_memory.get(i) {
+                                    Some(slice) => {
+                                        self.data.kernel.process_map_or(
+                                            None,
+                                            schedule_on,
+                                            |process| {
+                                                process.add_mpu_region(
+                                                    slice.ptr(),
+                                                    slice.len(),
+                                                    slice.len(),
+                                                )
+                                            },
+                                        );
+                                        my_upcalls
+                                            .schedule_upcall(
+                                                to_schedule,
+                                                (
+                                                    called_from.id() + 1,
+                                                    ReadableProcessBuffer::len(slice),
+                                                    ReadableProcessBuffer::ptr(slice) as usize,
+                                                ),
                                             )
-                                        });
-                                    upcall.schedule(
-                                        called_from.id() + 1,
-                                        crate::mem::Read::len(slice),
-                                        crate::mem::Read::ptr(slice) as usize,
-                                    );
-                                }
-                                None => {
-                                    upcall.schedule(called_from.id() + 1, 0, 0);
+                                            .ok();
+                                    }
+                                    None => {
+                                        my_upcalls
+                                            .schedule_upcall(
+                                                to_schedule,
+                                                (called_from.id() + 1, 0, 0),
+                                            )
+                                            .ok();
+                                    }
                                 }
                             }
+                            None => {}
                         }
-                        None => {}
-                    }
-                })
+                    })
             })
             .and_then(|x| x)
     }
 }
 
-impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
-    /// subscribe enables processes using IPC to register upcalls that fire
-    /// when notify() is called.
-    fn subscribe(
-        &self,
-        subscribe_num: usize,
-        mut upcall: Upcall,
-        app_id: ProcessId,
-    ) -> Result<Upcall, (Upcall, ErrorCode)> {
-        match subscribe_num {
-            // subscribe(0)
-            //
-            // Subscribe with subscribe_num == 0 is how a process registers
-            // itself as an IPC service. Each process can only register as a
-            // single IPC service. The identifier for the IPC service is the
-            // application name stored in the TBF header of the application.
-            // The upcall that is passed to subscribe is called when another
-            // process notifies the server process.
-            0 => self
-                .data
-                .enter(app_id, |data| {
-                    core::mem::swap(&mut data.upcall, &mut upcall);
-                    upcall
-                })
-                .map_err(|e| (upcall, e.into())),
-
-            // subscribe(>=1)
-            //
-            // Subscribe with subscribe_num >= 1 is how a client registers
-            // a upcall for a given service. The service number (passed
-            // here as subscribe_num) is returned from the allow() call.
-            // Once subscribed, the client will receive upcalls when the
-            // service process calls notify_client().
-            svc_id => {
-                // The app passes in a number which is the app identifier of the
-                // other app (shifted by one).
-                let app_identifier = svc_id - 1;
-                // We first have to see if that identifier corresponds to a
-                // valid application by asking the kernel to do a lookup for us.
-                let otherapp = self.data.kernel.lookup_app_by_identifier(app_identifier);
-
-                // This type annotation is here for documentation, it's not actually necessary
-                let result: Result<Result<Upcall, ErrorCode>, process::Error> =
-                    self.data.enter(app_id, |data| {
-                        match otherapp.map_or(None, |oa| oa.index()) {
-                            Some(i) => {
-                                if i >= NUM_PROCS {
-                                    Err(ErrorCode::INVAL)
-                                } else {
-                                    core::mem::swap(&mut data.client_upcalls[i], &mut upcall);
-                                    Ok(upcall)
-                                }
-                            }
-                            None => Err(ErrorCode::INVAL),
-                        }
-                    });
-                // OK, some type sorcery to transform result into what we want
-                result
-                    .map_err(|e| e.into()) // transform the outer Result's process::Error into an ErrorCode
-                    .and_then(|x| x) // Flatten the Result<Result<T,E>, E> into a Result<T,E>
-                    .map_err(|e| (upcall, e)) // Add `upcall` to the Error case
-            }
-        }
-    }
-
+impl<const NUM_PROCS: usize, const NUM_UPCALLS: usize> SyscallDriver
+    for IPC<NUM_PROCS, NUM_UPCALLS>
+{
     /// command is how notify() is implemented.
     /// Notifying an IPC service is done by setting client_or_svc to 0,
     /// and notifying an IPC client is done by setting client_or_svc to 1.
@@ -221,17 +191,18 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
             /* Discover */
             {
                 self.data
-                    .enter(appid, |data| {
-                        data.search_slice.map_or(
-                            CommandReturn::failure(ErrorCode::INVAL),
-                            |slice| {
+                    .enter(appid, |data, _upcalls| {
+                        data.search_buf
+                            .enter(|slice| {
                                 self.data
                                     .kernel
                                     .process_until(|p| {
                                         let s = p.get_process_name().as_bytes();
                                         // are slices equal?
                                         if s.len() == slice.len()
-                                            && s.iter().zip(slice.iter()).all(|(c1, c2)| c1 == c2)
+                                            && s.iter()
+                                                .zip(slice.iter())
+                                                .all(|(c1, c2)| *c1 == c2.get())
                                         {
                                             Some(CommandReturn::success_u32(
                                                 p.processid().id() as u32 + 1,
@@ -241,8 +212,8 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
                                         }
                                     })
                                     .unwrap_or(CommandReturn::failure(ErrorCode::NODEVICE))
-                            },
-                        )
+                            })
+                            .unwrap_or(CommandReturn::failure(ErrorCode::INVAL))
                     })
                     .unwrap_or(CommandReturn::failure(ErrorCode::NOMEM))
             }
@@ -262,8 +233,12 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
                             |target| {
                                 let ret = target.enqueue_task(process::Task::IPC((appid, cb_type)));
                                 match ret {
-                                    true => CommandReturn::success(),
-                                    false => CommandReturn::failure(ErrorCode::FAIL),
+                                    Ok(()) => CommandReturn::success(),
+                                    Err(e) => match e {
+                                        // The other side has a null upcall, choosing to ignore
+                                        ErrorCode::OFF => CommandReturn::success(),
+                                        _ => CommandReturn::failure(e),
+                                    },
                                 }
                             },
                         )
@@ -285,8 +260,12 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
                             |target| {
                                 let ret = target.enqueue_task(process::Task::IPC((appid, cb_type)));
                                 match ret {
-                                    true => CommandReturn::success(),
-                                    false => CommandReturn::failure(ErrorCode::FAIL),
+                                    Ok(()) => CommandReturn::success(),
+                                    Err(e) => match e {
+                                        // The other side has a null upcall, choosing to ignore
+                                        ErrorCode::OFF => CommandReturn::success(),
+                                        _ => CommandReturn::failure(e),
+                                    },
                                 }
                             },
                         )
@@ -302,19 +281,19 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
         &self,
         appid: ProcessId,
         subdriver: usize,
-        mut slice: ReadOnlyAppSlice,
-    ) -> Result<ReadOnlyAppSlice, (ReadOnlyAppSlice, ErrorCode)> {
+        mut buffer: ReadOnlyProcessBuffer,
+    ) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
         if subdriver == 0 {
             // Package name for discovery
-            let res = self.data.enter(appid, |data| {
-                core::mem::swap(&mut data.search_slice, &mut slice);
+            let res = self.data.enter(appid, |data, _upcalls| {
+                core::mem::swap(&mut data.search_buf, &mut buffer);
             });
             match res {
-                Ok(_) => Ok(slice),
-                Err(e) => Err((slice, e.into())),
+                Ok(_) => Ok(buffer),
+                Err(e) => Err((buffer, e.into())),
             }
         } else {
-            Err((slice, ErrorCode::NOSUPPORT))
+            Err((buffer, ErrorCode::NOSUPPORT))
         }
     }
 
@@ -331,12 +310,12 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
         &self,
         appid: ProcessId,
         target_id: usize,
-        mut slice: ReadWriteAppSlice,
-    ) -> Result<ReadWriteAppSlice, (ReadWriteAppSlice, ErrorCode)> {
+        mut buffer: ReadWriteProcessBuffer,
+    ) -> Result<ReadWriteProcessBuffer, (ReadWriteProcessBuffer, ErrorCode)> {
         if target_id == 0 {
-            Err((slice, ErrorCode::NOSUPPORT))
+            Err((buffer, ErrorCode::NOSUPPORT))
         } else {
-            match self.data.enter(appid, |data| {
+            match self.data.enter(appid, |data, _upcalls| {
                 // Lookup the index of the app based on the passed in
                 // identifier. This also let's us check that the other app is
                 // actually valid.
@@ -345,7 +324,7 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
                 if let Some(oa) = otherapp {
                     if let Some(i) = oa.index() {
                         if let Some(smem) = data.shared_memory.get_mut(i) {
-                            core::mem::swap(smem, &mut slice);
+                            core::mem::swap(smem, &mut buffer);
                             Ok(())
                         } else {
                             Err(ErrorCode::INVAL)
@@ -357,9 +336,13 @@ impl<const NUM_PROCS: usize> Driver for IPC<NUM_PROCS> {
                     Err(ErrorCode::BUSY)
                 }
             }) {
-                Ok(_) => Ok(slice),
-                Err(e) => Err((slice, e.into())),
+                Ok(_) => Ok(buffer),
+                Err(e) => Err((buffer, e.into())),
             }
         }
+    }
+
+    fn allocate_grant(&self, processid: ProcessId) -> Result<(), crate::process::Error> {
+        self.data.enter(processid, |_, _| {})
     }
 }

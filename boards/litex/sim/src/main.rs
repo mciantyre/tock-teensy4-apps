@@ -7,14 +7,15 @@
 
 use capsules::virtual_alarm::{MuxAlarm, VirtualMuxAlarm};
 use kernel::capabilities;
-use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
-use kernel::common::registers::interfaces::ReadWriteable;
-use kernel::common::StaticRef;
 use kernel::component::Component;
+use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::hil::time::{Alarm, Timer};
-use kernel::Chip;
-use kernel::InterruptService;
-use kernel::Platform;
+use kernel::platform::chip::InterruptService;
+use kernel::platform::scheduler_timer::VirtualSchedulerTimer;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::cooperative::CooperativeSched;
+use kernel::utilities::registers::interfaces::ReadWriteable;
+use kernel::utilities::StaticRef;
 use kernel::{create_capability, debug, static_init};
 use rv32i::csr;
 
@@ -71,27 +72,16 @@ impl InterruptService<()> for LiteXSimInterruptablePeripherals {
 }
 
 const NUM_PROCS: usize = 4;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 // Actual memory for holding the active process structures. Need an
 // empty list at least.
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] = [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
+    [None; NUM_PROCS];
 
 // Reference to the chip and UART hardware for panic dumps
 struct LiteXSimPanicReferences {
-    chip: Option<
-        &'static litex_vexriscv::chip::LiteXVexRiscv<
-            VirtualMuxAlarm<
-                'static,
-                litex_vexriscv::timer::LiteXAlarm<
-                    'static,
-                    'static,
-                    socc::SoCRegisterFmt,
-                    socc::ClockFrequency,
-                >,
-            >,
-            LiteXSimInterruptablePeripherals,
-        >,
-    >,
+    chip: Option<&'static litex_vexriscv::chip::LiteXVexRiscv<LiteXSimInterruptablePeripherals>>,
     uart: Option<&'static litex_vexriscv::uart::LiteXUart<'static, socc::SoCRegisterFmt>>,
 }
 static mut PANIC_REFERENCES: LiteXSimPanicReferences = LiteXSimPanicReferences {
@@ -100,7 +90,7 @@ static mut PANIC_REFERENCES: LiteXSimPanicReferences = LiteXSimPanicReferences {
 };
 
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
+const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
@@ -127,13 +117,25 @@ struct LiteXSim {
             >,
         >,
     >,
+    scheduler: &'static CooperativeSched<'static>,
+    scheduler_timer: &'static VirtualSchedulerTimer<
+        VirtualMuxAlarm<
+            'static,
+            litex_vexriscv::timer::LiteXAlarm<
+                'static,
+                'static,
+                socc::SoCRegisterFmt,
+                socc::ClockFrequency,
+            >,
+        >,
+    >,
 }
 
 /// Mapping of integer syscalls to objects that implement syscalls.
-impl Platform for LiteXSim {
+impl SyscallDriverLookup for LiteXSim {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
@@ -141,6 +143,46 @@ impl Platform for LiteXSim {
             capsules::low_level_debug::DRIVER_NUM => f(Some(self.lldb)),
             _ => f(None),
         }
+    }
+}
+
+impl KernelResources<litex_vexriscv::chip::LiteXVexRiscv<LiteXSimInterruptablePeripherals>>
+    for LiteXSim
+{
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = CooperativeSched<'static>;
+    type SchedulerTimer = VirtualSchedulerTimer<
+        VirtualMuxAlarm<
+            'static,
+            litex_vexriscv::timer::LiteXAlarm<
+                'static,
+                'static,
+                socc::SoCRegisterFmt,
+                socc::ClockFrequency,
+            >,
+        >,
+    >;
+    type WatchDog = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.scheduler_timer
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
     }
 }
 
@@ -248,7 +290,7 @@ pub unsafe fn main() {
         >,
         capsules::alarm::AlarmDriver::new(
             virtual_alarm_user,
-            board_kernel.create_grant(&memory_allocation_cap)
+            board_kernel.create_grant(capsules::alarm::DRIVER_NUM, &memory_allocation_cap)
         )
     );
     virtual_alarm_user.set_alarm_client(alarm);
@@ -266,6 +308,22 @@ pub unsafe fn main() {
         >,
         VirtualMuxAlarm::new(mux_alarm)
     );
+
+    let scheduler_timer = static_init!(
+        VirtualSchedulerTimer<
+            VirtualMuxAlarm<
+                'static,
+                litex_vexriscv::timer::LiteXAlarm<
+                    'static,
+                    'static,
+                    socc::SoCRegisterFmt,
+                    socc::ClockFrequency,
+                >,
+            >,
+        >,
+        VirtualSchedulerTimer::new(systick_virtual_alarm)
+    );
+    systick_virtual_alarm.set_alarm_client(scheduler_timer);
 
     // ---------- UART ----------
 
@@ -335,24 +393,13 @@ pub unsafe fn main() {
 
     let chip = static_init!(
         litex_vexriscv::chip::LiteXVexRiscv<
-            VirtualMuxAlarm<
-                'static,
-                litex_vexriscv::timer::LiteXAlarm<
-                    'static,
-                    'static,
-                    socc::SoCRegisterFmt,
-                    socc::ClockFrequency,
-                >,
-            >,
             LiteXSimInterruptablePeripherals,
         >,
         litex_vexriscv::chip::LiteXVexRiscv::new(
             "Verilated LiteX on VexRiscv",
-            systick_virtual_alarm,
             interrupt_service
         )
     );
-    systick_virtual_alarm.set_alarm_client(chip.scheduler_timer());
 
     PANIC_REFERENCES.chip = Some(chip);
 
@@ -366,11 +413,21 @@ pub unsafe fn main() {
     chip.unmask_interrupts();
 
     // Setup the console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
-    let lldb = components::lldb::LowLevelDebugComponent::new(board_kernel, uart_mux).finalize(());
+    let lldb = components::lldb::LowLevelDebugComponent::new(
+        board_kernel,
+        capsules::low_level_debug::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
 
     debug!("Verilated LiteX+VexRiscv: initialization complete, entering main loop.");
 
@@ -386,13 +443,18 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
+    let scheduler = components::sched::cooperative::CooperativeComponent::new(&PROCESSES)
+        .finalize(components::coop_component_helper!(NUM_PROCS));
+
     let litex_sim = LiteXSim {
         console: console,
         alarm: alarm,
         lldb: lldb,
+        scheduler,
+        scheduler_timer,
     };
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -412,13 +474,10 @@ pub unsafe fn main() {
         debug!("{:?}", err);
     });
 
-    let scheduler = components::sched::cooperative::CooperativeComponent::new(&PROCESSES)
-        .finalize(components::coop_component_helper!(NUM_PROCS));
     board_kernel.kernel_loop(
         &litex_sim,
         chip,
-        None::<&kernel::ipc::IPC<NUM_PROCS>>,
-        scheduler,
+        None::<&kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>>,
         &main_loop_cap,
     );
 }

@@ -13,13 +13,14 @@ use capsules::virtual_alarm::VirtualMuxAlarm;
 use capsules::virtual_i2c::{I2CDevice, MuxI2C};
 use capsules::virtual_spi::VirtualSpiMasterDevice;
 use kernel::capabilities;
-use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
+use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::hil;
 use kernel::hil::i2c::I2CMaster;
 use kernel::hil::led::LedLow;
 use kernel::hil::Controller;
-use kernel::Platform;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::round_robin::RoundRobinSched;
 #[allow(unused_imports)]
 use kernel::{create_capability, debug, debug_gpio, static_init};
 use sam4l::adc::Channel;
@@ -36,9 +37,11 @@ mod test_take_map_cell;
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 20;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 // Actual memory for holding the active process structures.
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] = [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
+    [None; NUM_PROCS];
 
 static mut CHIP: Option<&'static sam4l::chip::Sam4l<Sam4lDefaultPeripherals>> = None;
 
@@ -69,16 +72,18 @@ struct Hail {
     led: &'static capsules::led::LedDriver<'static, LedLow<'static, sam4l::gpio::GPIOPin<'static>>>,
     button: &'static capsules::button::Button<'static, sam4l::gpio::GPIOPin<'static>>,
     rng: &'static capsules::rng::RngDriver<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
-    crc: &'static capsules::crc::Crc<'static, sam4l::crccu::Crccu<'static>>,
+    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
+    crc: &'static capsules::crc::CrcDriver<'static, sam4l::crccu::Crccu<'static>>,
     dac: &'static capsules::dac::Dac<'static>,
+    scheduler: &'static RoundRobinSched<'static>,
+    systick: cortexm4::systick::SysTick,
 }
 
 /// Mapping of integer syscalls to objects that implement syscalls.
-impl Platform for Hail {
+impl SyscallDriverLookup for Hail {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
@@ -104,6 +109,34 @@ impl Platform for Hail {
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
+    }
+}
+
+impl KernelResources<sam4l::chip::Sam4l<Sam4lDefaultPeripherals>> for Hail {
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = RoundRobinSched<'static>;
+    type SchedulerTimer = cortexm4::systick::SysTick;
+    type WatchDog = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
     }
 }
 
@@ -168,6 +201,16 @@ unsafe fn set_pin_primary_functions(peripherals: &Sam4lDefaultPeripherals) {
     peripherals.pb[15].configure(None); //... D1
 }
 
+/// This is in a separate, inline(never) function so that its stack frame is
+/// removed when this function returns. Otherwise, the stack space used for
+/// these static_inits is wasted.
+#[inline(never)]
+unsafe fn get_peripherals(
+    pm: &'static sam4l::pm::PowerManager,
+) -> &'static Sam4lDefaultPeripherals {
+    static_init!(Sam4lDefaultPeripherals, Sam4lDefaultPeripherals::new(pm))
+}
+
 /// Board's main function.
 ///
 /// This is called from the reset handler after memory initialization is
@@ -175,8 +218,9 @@ unsafe fn set_pin_primary_functions(peripherals: &Sam4lDefaultPeripherals) {
 #[no_mangle]
 pub unsafe fn main() {
     sam4l::init();
+
     let pm = static_init!(sam4l::pm::PowerManager, sam4l::pm::PowerManager::new());
-    let peripherals = static_init!(Sam4lDefaultPeripherals, Sam4lDefaultPeripherals::new(pm));
+    let peripherals = get_peripherals(pm);
 
     pm.setup_system_clock(
         sam4l::pm::SystemClockSource::PllExternalOscillatorAt48MHz {
@@ -214,7 +258,7 @@ pub unsafe fn main() {
     );
 
     let dynamic_deferred_call_clients =
-        static_init!([DynamicDeferredCallClientState; 2], Default::default());
+        static_init!([DynamicDeferredCallClientState; 3], Default::default());
     let dynamic_deferred_caller = static_init!(
         DynamicDeferredCall,
         DynamicDeferredCall::new(dynamic_deferred_call_clients)
@@ -237,7 +281,12 @@ pub unsafe fn main() {
     hil::uart::Receive::set_receive_client(&peripherals.usart0, uart_mux);
 
     // Setup the console and the process inspection console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     let process_console =
         components::process_console::ProcessConsoleComponent::new(board_kernel, uart_mux)
             .finalize(());
@@ -248,9 +297,10 @@ pub unsafe fn main() {
     // Create the Nrf51822Serialization driver for passing BLE commands
     // over UART to the nRF51822 radio.
     let nrf_serialization = components::nrf51822::Nrf51822Component::new(
+        board_kernel,
+        capsules::nrf51822_serialization::DRIVER_NUM,
         &peripherals.usart3,
         &peripherals.pa[17],
-        board_kernel,
     )
     .finalize(());
 
@@ -267,18 +317,35 @@ pub unsafe fn main() {
     // SI7021 Temperature / Humidity Sensor, address: 0x40
     let si7021 = components::si7021::SI7021Component::new(sensors_i2c, mux_alarm, 0x40)
         .finalize(components::si7021_component_helper!(sam4l::ast::Ast));
-    let temp =
-        components::temperature::TemperatureComponent::new(board_kernel, si7021).finalize(());
-    let humidity = components::si7021::HumidityComponent::new(board_kernel, si7021).finalize(());
+    let temp = components::temperature::TemperatureComponent::new(
+        board_kernel,
+        capsules::temperature::DRIVER_NUM,
+        si7021,
+    )
+    .finalize(());
+    let humidity = components::si7021::HumidityComponent::new(
+        board_kernel,
+        capsules::humidity::DRIVER_NUM,
+        si7021,
+    )
+    .finalize(());
 
     // Configure the ISL29035, device address 0x44
-    let ambient_light =
-        components::isl29035::AmbientLightComponent::new(board_kernel, sensors_i2c, mux_alarm)
-            .finalize(components::isl29035_component_helper!(sam4l::ast::Ast));
+    let ambient_light = components::isl29035::AmbientLightComponent::new(
+        board_kernel,
+        capsules::ambient_light::DRIVER_NUM,
+        sensors_i2c,
+        mux_alarm,
+    )
+    .finalize(components::isl29035_component_helper!(sam4l::ast::Ast));
 
     // Alarm
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
-        .finalize(components::alarm_component_helper!(sam4l::ast::Ast));
+    let alarm = components::alarm::AlarmDriverComponent::new(
+        board_kernel,
+        capsules::alarm::DRIVER_NUM,
+        mux_alarm,
+    )
+    .finalize(components::alarm_component_helper!(sam4l::ast::Ast));
 
     // FXOS8700CQ accelerometer, device address 0x1e
     let fxos8700_i2c = static_init!(I2CDevice, I2CDevice::new(sensors_i2c, 0x1e));
@@ -293,16 +360,22 @@ pub unsafe fn main() {
     fxos8700_i2c.set_client(fxos8700);
     peripherals.pa[9].set_client(fxos8700);
 
-    let ninedof = components::ninedof::NineDofComponent::new(board_kernel)
-        .finalize(components::ninedof_component_helper!(fxos8700));
+    let ninedof =
+        components::ninedof::NineDofComponent::new(board_kernel, capsules::ninedof::DRIVER_NUM)
+            .finalize(components::ninedof_component_helper!(fxos8700));
 
     // SPI
     // Set up a SPI MUX, so there can be multiple clients.
-    let mux_spi = components::spi::SpiMuxComponent::new(&peripherals.spi)
+    let mux_spi = components::spi::SpiMuxComponent::new(&peripherals.spi, dynamic_deferred_caller)
         .finalize(components::spi_mux_component_helper!(sam4l::spi::SpiHw));
     // Create the SPI system call capsule.
-    let spi_syscalls = components::spi::SpiSyscallComponent::new(board_kernel, mux_spi, 0)
-        .finalize(components::spi_syscall_component_helper!(sam4l::spi::SpiHw));
+    let spi_syscalls = components::spi::SpiSyscallComponent::new(
+        board_kernel,
+        mux_spi,
+        0,
+        capsules::spi_controller::DRIVER_NUM,
+    )
+    .finalize(components::spi_syscall_component_helper!(sam4l::spi::SpiHw));
 
     // LEDs
     let led = components::led::LedsComponent::new(components::led_component_helper!(
@@ -318,6 +391,7 @@ pub unsafe fn main() {
     // BUTTONs
     let button = components::button::ButtonComponent::new(
         board_kernel,
+        capsules::button::DRIVER_NUM,
         components::button_component_helper!(
             sam4l::gpio::GPIOPin,
             (
@@ -358,7 +432,7 @@ pub unsafe fn main() {
         capsules::adc::AdcDedicated<'static, sam4l::adc::Adc>,
         capsules::adc::AdcDedicated::new(
             &peripherals.adc,
-            board_kernel.create_grant(&memory_allocation_capability),
+            board_kernel.create_grant(capsules::adc::DRIVER_NUM, &memory_allocation_capability),
             ref_channels,
             &mut capsules::adc::ADC_BUFFER1,
             &mut capsules::adc::ADC_BUFFER2,
@@ -368,11 +442,17 @@ pub unsafe fn main() {
     peripherals.adc.set_client(adc);
 
     // Setup RNG
-    let rng = components::rng::RngComponent::new(board_kernel, &peripherals.trng).finalize(());
+    let rng = components::rng::RngComponent::new(
+        board_kernel,
+        capsules::rng::DRIVER_NUM,
+        &peripherals.trng,
+    )
+    .finalize(());
 
     // set GPIO driver controlling remaining GPIO pins
     let gpio = components::gpio::GpioComponent::new(
         board_kernel,
+        capsules::gpio::DRIVER_NUM,
         components::gpio_component_helper!(
             sam4l::gpio::GPIOPin,
             0 => &peripherals.pb[14], // D0
@@ -384,8 +464,12 @@ pub unsafe fn main() {
     .finalize(components::gpio_component_buf!(sam4l::gpio::GPIOPin));
 
     // CRC
-    let crc = components::crc::CrcComponent::new(board_kernel, &peripherals.crccu)
-        .finalize(components::crc_component_helper!(sam4l::crccu::Crccu));
+    let crc = components::crc::CrcComponent::new(
+        board_kernel,
+        capsules::crc::DRIVER_NUM,
+        &peripherals.crccu,
+    )
+    .finalize(components::crc_component_helper!(sam4l::crccu::Crccu));
 
     // DAC
     let dac = static_init!(
@@ -415,9 +499,12 @@ pub unsafe fn main() {
 
     // Configure application fault policy
     let fault_policy = static_init!(
-        kernel::procs::ThresholdRestartThenPanicFaultPolicy,
-        kernel::procs::ThresholdRestartThenPanicFaultPolicy::new(4)
+        kernel::process::ThresholdRestartThenPanicFaultPolicy,
+        kernel::process::ThresholdRestartThenPanicFaultPolicy::new(4)
     );
+
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+        .finalize(components::rr_component_helper!(NUM_PROCS));
 
     let hail = Hail {
         console,
@@ -433,9 +520,15 @@ pub unsafe fn main() {
         led,
         button,
         rng,
-        ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
+        ipc: kernel::ipc::IPC::new(
+            board_kernel,
+            kernel::ipc::DRIVER_NUM,
+            &memory_allocation_capability,
+        ),
         crc,
         dac,
+        scheduler,
+        systick: cortexm4::systick::SysTick::new(),
     };
 
     // Setup the UART bus for nRF51 serialization..
@@ -460,7 +553,7 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -480,13 +573,5 @@ pub unsafe fn main() {
         debug!("{:?}", err);
     });
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
-        .finalize(components::rr_component_helper!(NUM_PROCS));
-    board_kernel.kernel_loop(
-        &hail,
-        chip,
-        Some(&hail.ipc),
-        scheduler,
-        &main_loop_capability,
-    );
+    board_kernel.kernel_loop(&hail, chip, Some(&hail.ipc), &main_loop_capability);
 }

@@ -15,8 +15,18 @@
 //! - No minor loop mapping, assuming we don't need to change addresses on minor loop runs.
 //! - The driver exposes 32 DMA channels. This applies for nearly all i.MX RT 10xx chips, except for the 1011.
 //!   Accessing any DMA channel beyond 15 will index into reserved memory.
+//!
+//! When assigning DMA channels to peripherals, consider:
+//!
+//! - How you could use channels that are 16 channel IDs apart, and complete DMA transfers with signaling
+//!   from one DMA interrupt, instead of two separate interrupts.
+//! - The first four DMA channels can be periodically scheduled from the four periodic interrupt timer (PIT)
+//!   channels. Consider reserving those first four channels if you need to regularly schedule DMA transfers
+//!   without CPU intervention.
+//! - Channel priorities may come into play when preferring DMA channels. See the reference manual for more
+//!   information on channel priorities, and how the DMA controller use priorities for scheduling.
 
-use kernel::common::{
+use kernel::utilities::{
     cells::OptionalCell,
     registers::{
         self,
@@ -400,13 +410,23 @@ pub struct DmaChannel {
 }
 
 /// Describes a type that can be transferred via DMA.
+///
+/// This trait is sealed and cannot be implemented outside of this
+/// crate. However, it may be used outside of this crate.
 pub trait DmaElement: private::Sealed {
     /// An identifier describing the data transfer size
     ///
-    /// See TCD[SSIZE] and TCD[DSIZE] for more information.
+    /// See TCD\[SSIZE\] and TCD\[DSIZE\] for more information.
+    #[doc(hidden)] // Crate implementation detail
     const DATA_TRANSFER_ID: u16;
 }
 
+/// Details for the sealed `DmaElement` trait.
+///
+/// See the Rust API Guidelines, and the Sealed trait pattern,
+/// for more information.
+///
+/// <https://rust-lang.github.io/api-guidelines/future-proofing.html#sealed-traits-protect-against-downstream-implementations-c-sealed>
 mod private {
     pub trait Sealed {}
     impl Sealed for u8 {}
@@ -702,6 +722,8 @@ pub struct Dma<'a> {
     pub channels: [DmaChannel; 32],
     /// DMA clock gate
     clock_gate: ccm::PeripheralClock<'a>,
+    /// DMA registers.
+    registers: StaticRef<DmaRegisters>,
 }
 
 impl<'a> Dma<'a> {
@@ -710,11 +732,12 @@ impl<'a> Dma<'a> {
         Dma {
             channels: DMA_CHANNELS,
             clock_gate: ccm::PeripheralClock::ccgr5(ccm, ccm::HCLK5::DMA),
+            registers: DMA_BASE,
         }
     }
 
     /// Returns the interface that controls the DMA clock
-    pub fn clock(&self) -> &(impl kernel::ClockInterface + '_) {
+    pub fn clock(&self) -> &(impl kernel::platform::chip::ClockInterface + '_) {
         &self.clock_gate
     }
 
@@ -726,6 +749,21 @@ impl<'a> Dma<'a> {
         for channel in &self.channels {
             channel.reset_tcd();
         }
+    }
+
+    /// Returns a DMA channel that has an error.
+    ///
+    /// This will be faster than searching all DMA channels
+    /// for an error flag. However, if more than one DMA channel
+    /// has an error, there's no guarantee which will be returned
+    /// first. You should continue calling, and clearing errors,
+    /// until this returns `None`.
+    pub fn error_channel(&self) -> Option<&DmaChannel> {
+        let es = self.registers.es.extract();
+        es.is_set(ErrorStatus::VLD).then(|| {
+            let idx = es.read(ErrorStatus::ERRCHN) as usize;
+            &self.channels[idx]
+        })
     }
 }
 

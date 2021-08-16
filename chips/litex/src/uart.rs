@@ -4,12 +4,12 @@
 //! [`litex/soc/cores/uart.py`](https://github.com/enjoy-digital/litex/blob/master/litex/soc/cores/uart.py).
 
 use core::cell::Cell;
-use kernel::common::cells::{OptionalCell, TakeCell};
-use kernel::common::dynamic_deferred_call::{
+use kernel::dynamic_deferred_call::{
     DeferredCallHandle, DynamicDeferredCall, DynamicDeferredCallClient,
 };
-use kernel::common::StaticRef;
 use kernel::hil::uart;
+use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::utilities::StaticRef;
 use kernel::ErrorCode;
 
 use crate::event_manager::LiteXEventManager;
@@ -522,9 +522,6 @@ impl<'a, R: LiteXSoCRegisterConfiguration> uart::Receive<'a> for LiteXUart<'a, R
         }
     }
 }
-
-impl<'a, R: LiteXSoCRegisterConfiguration> uart::Uart<'a> for LiteXUart<'a, R> {}
-impl<'a, R: LiteXSoCRegisterConfiguration> uart::UartData<'a> for LiteXUart<'a, R> {}
 
 impl<'a, R: LiteXSoCRegisterConfiguration> DynamicDeferredCallClient for LiteXUart<'a, R> {
     fn call(&self, _handle: DeferredCallHandle) {

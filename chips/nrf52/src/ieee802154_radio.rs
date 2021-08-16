@@ -3,12 +3,12 @@
 use core::cell::Cell;
 use core::convert::TryFrom;
 use kernel;
-use kernel::common::cells::{OptionalCell, TakeCell};
-use kernel::common::registers::interfaces::{Readable, Writeable};
-use kernel::common::registers::{register_bitfields, ReadOnly, ReadWrite, WriteOnly};
-use kernel::common::StaticRef;
 use kernel::hil::radio::{self, PowerClient};
 use kernel::hil::time::{Alarm, AlarmClient};
+use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::utilities::registers::interfaces::{Readable, Writeable};
+use kernel::utilities::registers::{register_bitfields, ReadOnly, ReadWrite, WriteOnly};
+use kernel::utilities::StaticRef;
 use kernel::ErrorCode;
 
 use nrf5x;
@@ -1015,8 +1015,6 @@ impl<'p> Radio<'p> {
         self.random_nonce.get()
     }
 }
-
-impl<'p> kernel::hil::radio::Radio for Radio<'p> {}
 
 impl<'p> kernel::hil::radio::RadioConfig for Radio<'p> {
     fn initialize(

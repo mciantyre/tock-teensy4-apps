@@ -36,6 +36,12 @@ usage:
 	@echo "and usually 'make program' or 'make flash' to load Tock onto hardware."
 	@echo "Check out the README in your board's folder for more information."
 	@echo
+	@echo "There are a few helpful targets that can be run for all individual boards."
+	@echo "To run these, run 'make {target}' from the board directory for any of the"
+	@echo "following targets:"
+	@echo "        cargobloat: Runs the cargo-bloat tool for attributing binary size"
+	@echo "        stack-analysis: Prints the 5 largest stack frames for the board"
+	@echo
 	@echo "This root Makefile has a few useful targets as well:"
 	@echo "        allaudit: Audit Cargo dependencies for all kernel sources"
 	@echo "       allboards: Compiles Tock for all supported boards"
@@ -451,6 +457,9 @@ define ci_setup_tools
 	elif command -v brew > /dev/null; then\
 		echo "Running: brew install libusb-compat pkg-config";\
 		brew install libusb-compat pkg-config;\
+	elif command -v dnf > /dev/null; then\
+		echo "Running: sudo dnf install libusb-devel";\
+		sudo dnf install libusb-devel;\
 	else\
 		echo "";\
 		echo "ERR: Do not know how to install libusb on this platform.";\
@@ -501,7 +510,7 @@ ci-job-miri: ci-setup-miri
 
 ### ci-runner-github-qemu jobs:
 
-QEMU_COMMIT_HASH=3e9f48bcdabe57f8f90cf19f01bbbf3c86937267
+QEMU_COMMIT_HASH=e77c8b8b8e933414ef07dbed04e02973fccffeb0
 define ci_setup_qemu_riscv
 	$(call banner,CI-Setup: Build QEMU)
 	@# Use the latest QEMU as it has OpenTitan support
@@ -509,7 +518,7 @@ define ci_setup_qemu_riscv
 	@git clone https://github.com/qemu/qemu ./tools/qemu 2>/dev/null || echo "qemu already cloned, checking out"
 	@cd tools/qemu; git checkout ${QEMU_COMMIT_HASH}; ../qemu/configure --target-list=riscv32-softmmu --disable-linux-io-uring --disable-libdaxctl;
 	@# Build qemu
-	@$(MAKE) -C "tools/qemu/build" || (echo "You might need to install some missing packages" || exit 127)
+	@$(MAKE) -C "tools/qemu/build" -j2 || (echo "You might need to install some missing packages" || exit 127)
 endef
 
 define ci_setup_qemu_opentitan
@@ -522,10 +531,10 @@ define ci_setup_qemu_opentitan
 	@pwd=$$(pwd) && \
 		temp=$$(mktemp -d) && \
 		cd $$temp && \
-		curl 'https://storage.googleapis.com/artifacts.opentitan.org/opentitan-snapshot-20191101-1-3845-g000a18cb6.tar.xz' \
+		curl 'https://storage.googleapis.com/artifacts.opentitan.org/opentitan-earlgrey_silver_release_v5-157-ga28c280bb.tar.xz' \
 			--output opentitan-dist.tar.xz; \
 		tar -xf opentitan-dist.tar.xz; \
-		mv opentitan-snapshot-20191101-*/sw/device/boot_rom/boot_rom_fpga_nexysvideo.elf $$pwd/tools/qemu-runner/opentitan-boot-rom.elf
+		mv opentitan-earlgrey_silver_release_*/sw/device/boot_rom/boot_rom_fpga_nexysvideo.elf $$pwd/tools/qemu-runner/opentitan-boot-rom.elf
 endef
 
 .PHONY: ci-setup-qemu

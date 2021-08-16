@@ -1,14 +1,13 @@
 use crate::deferred_call_tasks::DeferredCallTask;
 use core::fmt::Write;
 use cortexm4::{self, nvic};
-use kernel::common::deferred_call;
+use kernel::deferred_call;
 use kernel::hil::time::Alarm;
-use kernel::InterruptService;
+use kernel::platform::chip::InterruptService;
 
 pub struct NRF52<'a, I: InterruptService<DeferredCallTask> + 'a> {
     mpu: cortexm4::mpu::MPU,
     userspace_kernel_boundary: cortexm4::syscall::SysCall,
-    scheduler_timer: cortexm4::systick::SysTick,
     interrupt_service: &'a I,
 }
 
@@ -17,9 +16,6 @@ impl<'a, I: InterruptService<DeferredCallTask> + 'a> NRF52<'a, I> {
         Self {
             mpu: cortexm4::mpu::MPU::new(),
             userspace_kernel_boundary: cortexm4::syscall::SysCall::new(),
-            // The NRF52's systick is uncalibrated, but is clocked from the
-            // 64Mhz CPU clock.
-            scheduler_timer: cortexm4::systick::SysTick::new_with_calibration(64000000),
             interrupt_service,
         }
     }
@@ -43,9 +39,9 @@ pub struct Nrf52DefaultPeripherals<'a> {
     pub timer2: crate::timer::Timer,
     pub uarte0: crate::uart::Uarte<'a>,
     pub spim0: crate::spi::SPIM,
-    pub twim0: crate::i2c::TWIM,
+    pub twi0: crate::i2c::TWI,
     pub spim1: crate::spi::SPIM,
-    pub twim1: crate::i2c::TWIM,
+    pub twi1: crate::i2c::TWI,
     pub spim2: crate::spi::SPIM,
     pub adc: crate::adc::Adc,
     pub nvmc: crate::nvmc::Nvmc,
@@ -69,9 +65,9 @@ impl<'a> Nrf52DefaultPeripherals<'a> {
             timer2: crate::timer::Timer::new(2),
             uarte0: crate::uart::Uarte::new(),
             spim0: crate::spi::SPIM::new(0),
-            twim0: crate::i2c::TWIM::new_twim0(),
+            twi0: crate::i2c::TWI::new_twi0(),
             spim1: crate::spi::SPIM::new(1),
-            twim1: crate::i2c::TWIM::new_twim1(),
+            twi1: crate::i2c::TWI::new_twi1(),
             spim2: crate::spi::SPIM::new(2),
             adc: crate::adc::Adc::new(),
             nvmc: crate::nvmc::Nvmc::new(),
@@ -85,7 +81,9 @@ impl<'a> Nrf52DefaultPeripherals<'a> {
         self.timer0.set_alarm_client(&self.ieee802154_radio);
     }
 }
-impl<'a> kernel::InterruptService<DeferredCallTask> for Nrf52DefaultPeripherals<'a> {
+impl<'a> kernel::platform::chip::InterruptService<DeferredCallTask>
+    for Nrf52DefaultPeripherals<'a>
+{
     unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
         match interrupt {
             crate::peripheral_interrupts::COMP => self.acomp.handle_interrupt(),
@@ -114,10 +112,10 @@ impl<'a> kernel::InterruptService<DeferredCallTask> for Nrf52DefaultPeripherals<
             crate::peripheral_interrupts::SPI0_TWI0 => {
                 // SPI0 and TWI0 share interrupts.
                 // Dispatch the correct handler.
-                match (self.spim0.is_enabled(), self.twim0.is_enabled()) {
+                match (self.spim0.is_enabled(), self.twi0.is_enabled()) {
                     (false, false) => (),
                     (true, false) => self.spim0.handle_interrupt(),
-                    (false, true) => self.twim0.handle_interrupt(),
+                    (false, true) => self.twi0.handle_interrupt(),
                     (true, true) => debug_assert!(
                         false,
                         "SPIM0 and TWIM0 cannot be \
@@ -128,10 +126,10 @@ impl<'a> kernel::InterruptService<DeferredCallTask> for Nrf52DefaultPeripherals<
             crate::peripheral_interrupts::SPI1_TWI1 => {
                 // SPI1 and TWI1 share interrupts.
                 // Dispatch the correct handler.
-                match (self.spim1.is_enabled(), self.twim1.is_enabled()) {
+                match (self.spim1.is_enabled(), self.twi1.is_enabled()) {
                     (false, false) => (),
                     (true, false) => self.spim1.handle_interrupt(),
-                    (false, true) => self.twim1.handle_interrupt(),
+                    (false, true) => self.twi1.handle_interrupt(),
                     (true, true) => debug_assert!(
                         false,
                         "SPIM1 and TWIM1 cannot be \
@@ -153,22 +151,12 @@ impl<'a> kernel::InterruptService<DeferredCallTask> for Nrf52DefaultPeripherals<
     }
 }
 
-impl<'a, I: InterruptService<DeferredCallTask> + 'a> kernel::Chip for NRF52<'a, I> {
+impl<'a, I: InterruptService<DeferredCallTask> + 'a> kernel::platform::chip::Chip for NRF52<'a, I> {
     type MPU = cortexm4::mpu::MPU;
     type UserspaceKernelBoundary = cortexm4::syscall::SysCall;
-    type SchedulerTimer = cortexm4::systick::SysTick;
-    type WatchDog = ();
 
     fn mpu(&self) -> &Self::MPU {
         &self.mpu
-    }
-
-    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
-        &self.scheduler_timer
-    }
-
-    fn watchdog(&self) -> &Self::WatchDog {
-        &()
     }
 
     fn userspace_kernel_boundary(&self) -> &Self::UserspaceKernelBoundary {

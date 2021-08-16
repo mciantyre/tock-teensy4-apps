@@ -3,9 +3,10 @@
 use core::convert::TryFrom;
 use core::fmt::Write;
 
-use crate::driver::CommandReturn;
 use crate::errorcode::ErrorCode;
 use crate::process;
+
+pub use crate::syscall_driver::{CommandReturn, SyscallDriver};
 
 /// Helper function to split a u64 into a higher and lower u32.
 ///
@@ -221,10 +222,11 @@ pub enum SyscallReturnVariant {
 /// [`encode_syscall_return`](SyscallReturn::encode_syscall_return)
 /// method.
 ///
-/// Capsules do not use this struct. Capsules use higher level Rust types
-/// (e.g. [`ReadWriteAppSlice`](crate::ReadWriteAppSlice) and
-/// [`Upcall`](crate::Upcall)) or wrappers around this struct
-/// ([`CommandReturn`](crate::CommandReturn)) which limit the
+/// Capsules do not use this struct. Capsules use higher level Rust
+/// types
+/// (e.g. [`ReadWriteProcessBuffer`](crate::processbuffer::ReadWriteProcessBuffer)
+/// and `GrantUpcallTable`) or wrappers around this struct
+/// ([`CommandReturn`](crate::syscall_driver::CommandReturn)) which limit the
 /// available constructors to safely constructable variants.
 #[derive(Copy, Clone, Debug)]
 pub enum SyscallReturn {
@@ -253,14 +255,13 @@ pub enum SyscallReturn {
     // These following types are used by the scheduler so that it can
     // return values to userspace in an architecture (pointer-width)
     // independent way. The kernel passes these types (rather than
-    // AppSlice or Upcall) for two reasons. First, since the
+    // ProcessBuffer or Upcall) for two reasons. First, since the
     // kernel/scheduler makes promises about the lifetime and safety
-    // of these types (e.g., an accepted allow does not overlap with
-    // an existing accepted AppSlice), it does not want to leak them
-    // to other code. Second, if subscribe or allow calls pass invalid
-    // values (pointers out of valid memory), the kernel cannot
-    // construct an AppSlice or Upcall type but needs to be able to
-    // return a failure. -pal 11/24/20
+    // of these types, it does not want to leak them to other
+    // code. Second, if subscribe or allow calls pass invalid values
+    // (pointers out of valid memory), the kernel cannot construct an
+    // ProcessBuffer or Upcall type but needs to be able to return a
+    // failure. -pal 11/24/20
     /// Read/Write allow success case, returns the previous allowed
     /// buffer and size to the process.
     AllowReadWriteSuccess(*mut u8, usize),
@@ -277,10 +278,10 @@ pub enum SyscallReturn {
 
     /// Subscribe success case, returns the previous upcall function
     /// pointer and application data.
-    SubscribeSuccess(*const u8, usize),
+    SubscribeSuccess(*const (), usize),
     /// Subscribe failure case, returns the passed upcall function
     /// pointer and application data.
-    SubscribeFailure(ErrorCode, *const u8, usize),
+    SubscribeFailure(ErrorCode, *const (), usize),
 }
 
 impl SyscallReturn {
@@ -292,6 +293,28 @@ impl SyscallReturn {
     /// handle it as a SyscallReturn for more generic code paths.
     pub(crate) fn from_command_return(res: CommandReturn) -> Self {
         res.into_inner()
+    }
+
+    /// Returns true if the `SyscallReturn` is any success type.
+    pub(crate) fn is_success(&self) -> bool {
+        match self {
+            SyscallReturn::Success => true,
+            SyscallReturn::SuccessU32(_) => true,
+            SyscallReturn::SuccessU32U32(_, _) => true,
+            SyscallReturn::SuccessU32U32U32(_, _, _) => true,
+            SyscallReturn::SuccessU64(_) => true,
+            SyscallReturn::SuccessU64U32(_, _) => true,
+            SyscallReturn::AllowReadWriteSuccess(_, _) => true,
+            SyscallReturn::AllowReadOnlySuccess(_, _) => true,
+            SyscallReturn::SubscribeSuccess(_, _) => true,
+            SyscallReturn::Failure(_) => false,
+            SyscallReturn::FailureU32(_, _) => false,
+            SyscallReturn::FailureU32U32(_, _, _) => false,
+            SyscallReturn::FailureU64(_, _) => false,
+            SyscallReturn::AllowReadWriteFailure(_, _, _) => false,
+            SyscallReturn::AllowReadOnlyFailure(_, _, _) => false,
+            SyscallReturn::SubscribeFailure(_, _, _) => false,
+        }
     }
 
     /// Encode the system call return value into 4 registers, following

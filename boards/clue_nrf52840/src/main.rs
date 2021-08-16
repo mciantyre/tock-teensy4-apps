@@ -12,8 +12,8 @@ use capsules::virtual_aes_ccm::MuxAES128CCM;
 use capsules::virtual_alarm::VirtualMuxAlarm;
 
 use kernel::capabilities;
-use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::component::Component;
+use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 use kernel::hil::gpio::Interrupt;
 use kernel::hil::i2c::I2CMaster;
 use kernel::hil::led::LedHigh;
@@ -21,8 +21,10 @@ use kernel::hil::symmetric_encryption::AES128;
 use kernel::hil::time::Alarm;
 use kernel::hil::time::Counter;
 use kernel::hil::usb::Client;
-use kernel::mpu::MPU;
-use kernel::Chip;
+use kernel::platform::chip::Chip;
+use kernel::platform::mpu::MPU;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::scheduler::round_robin::RoundRobinSched;
 #[allow(unused_imports)]
 use kernel::{create_capability, debug, debug_gpio, debug_verbose, static_init};
 
@@ -81,12 +83,14 @@ pub mod io;
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::procs::PanicFaultPolicy = kernel::procs::PanicFaultPolicy {};
+const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 8;
+const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
-static mut PROCESSES: [Option<&'static dyn kernel::procs::Process>; NUM_PROCS] = [None; NUM_PROCS];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
+    [None; NUM_PROCS];
 
 static mut CHIP: Option<&'static nrf52840::chip::NRF52<Nrf52840DefaultPeripherals>> = None;
 static mut CDC_REF_FOR_PANIC: Option<
@@ -118,7 +122,7 @@ pub struct Platform {
     button: &'static capsules::button::Button<'static, nrf52::gpio::GPIOPin<'static>>,
     screen: &'static capsules::screen::Screen<'static>,
     rng: &'static capsules::rng::RngDriver<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS>,
+    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
         capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
@@ -129,12 +133,14 @@ pub struct Platform {
     >,
     temperature: &'static capsules::temperature::TemperatureSensor<'static>,
     humidity: &'static capsules::humidity::HumiditySensor<'static>,
+    scheduler: &'static RoundRobinSched<'static>,
+    systick: cortexm4::systick::SysTick,
 }
 
-impl kernel::Platform for Platform {
+impl SyscallDriverLookup for Platform {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
-        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+        F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
@@ -153,6 +159,36 @@ impl kernel::Platform for Platform {
             capsules::humidity::DRIVER_NUM => f(Some(self.humidity)),
             _ => f(None),
         }
+    }
+}
+
+impl KernelResources<nrf52::chip::NRF52<'static, Nrf52840DefaultPeripherals<'static>>>
+    for Platform
+{
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    type Scheduler = RoundRobinSched<'static>;
+    type SchedulerTimer = cortexm4::systick::SysTick;
+    type WatchDog = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        &self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &self.systick
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
     }
 }
 
@@ -214,6 +250,7 @@ pub unsafe fn main() {
 
     let gpio = components::gpio::GpioComponent::new(
         board_kernel,
+        capsules::gpio::DRIVER_NUM,
         components::gpio_component_helper!(
             nrf52840::gpio::GPIOPin,
             2 => &nrf52840_peripherals.gpio_port[GPIO_D2],
@@ -247,6 +284,7 @@ pub unsafe fn main() {
     //--------------------------------------------------------------------------
     let button = components::button::ButtonComponent::new(
         board_kernel,
+        capsules::button::DRIVER_NUM,
         components::button_component_helper!(
             nrf52840::gpio::GPIOPin,
             (
@@ -268,7 +306,7 @@ pub unsafe fn main() {
     //--------------------------------------------------------------------------
 
     let dynamic_deferred_call_clients =
-        static_init!([DynamicDeferredCallClientState; 4], Default::default());
+        static_init!([DynamicDeferredCallClientState; 5], Default::default());
     let dynamic_deferred_caller = static_init!(
         DynamicDeferredCall,
         DynamicDeferredCall::new(dynamic_deferred_call_clients)
@@ -284,8 +322,12 @@ pub unsafe fn main() {
 
     let mux_alarm = components::alarm::AlarmMuxComponent::new(rtc)
         .finalize(components::alarm_mux_component_helper!(nrf52::rtc::Rtc));
-    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
-        .finalize(components::alarm_component_helper!(nrf52::rtc::Rtc));
+    let alarm = components::alarm::AlarmDriverComponent::new(
+        board_kernel,
+        capsules::alarm::DRIVER_NUM,
+        mux_alarm,
+    )
+    .finalize(components::alarm_component_helper!(nrf52::rtc::Rtc));
 
     //--------------------------------------------------------------------------
     // PWM & BUZZER
@@ -317,7 +359,10 @@ pub unsafe fn main() {
             virtual_pwm_buzzer,
             virtual_alarm_buzzer,
             capsules::buzzer_driver::DEFAULT_MAX_BUZZ_TIME_MS,
-            board_kernel.create_grant(&memory_allocation_capability)
+            board_kernel.create_grant(
+                capsules::buzzer_driver::DRIVER_NUM,
+                &memory_allocation_capability
+            )
         )
     );
     virtual_alarm_buzzer.set_alarm_client(buzzer);
@@ -364,7 +409,12 @@ pub unsafe fn main() {
         .finalize(());
 
     // Setup the console.
-    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    let console = components::console::ConsoleComponent::new(
+        board_kernel,
+        capsules::console::DRIVER_NUM,
+        uart_mux,
+    )
+    .finalize(());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -372,7 +422,12 @@ pub unsafe fn main() {
     // RANDOM NUMBERS
     //--------------------------------------------------------------------------
 
-    let rng = components::rng::RngComponent::new(board_kernel, &base_peripherals.trng).finalize(());
+    let rng = components::rng::RngComponent::new(
+        board_kernel,
+        capsules::rng::DRIVER_NUM,
+        &base_peripherals.trng,
+    )
+    .finalize(());
 
     //--------------------------------------------------------------------------
     // SENSORS
@@ -380,13 +435,13 @@ pub unsafe fn main() {
 
     let sensors_i2c_bus = static_init!(
         capsules::virtual_i2c::MuxI2C<'static>,
-        capsules::virtual_i2c::MuxI2C::new(&base_peripherals.twim1, None, dynamic_deferred_caller)
+        capsules::virtual_i2c::MuxI2C::new(&base_peripherals.twi1, None, dynamic_deferred_caller)
     );
-    base_peripherals.twim1.configure(
+    base_peripherals.twi1.configure(
         nrf52840::pinmux::Pinmux::new(I2C_SCL_PIN as u32),
         nrf52840::pinmux::Pinmux::new(I2C_SDA_PIN as u32),
     );
-    base_peripherals.twim1.set_master_client(sensors_i2c_bus);
+    base_peripherals.twi1.set_master_client(sensors_i2c_bus);
 
     let apds9960_i2c = static_init!(
         capsules::virtual_i2c::I2CDevice,
@@ -408,7 +463,10 @@ pub unsafe fn main() {
 
     let proximity = static_init!(
         capsules::proximity::ProximitySensor<'static>,
-        capsules::proximity::ProximitySensor::new(apds9960, board_kernel.create_grant(&grant_cap))
+        capsules::proximity::ProximitySensor::new(
+            apds9960,
+            board_kernel.create_grant(capsules::proximity::DRIVER_NUM, &grant_cap)
+        )
     );
 
     kernel::hil::sensors::ProximityDriver::set_client(apds9960, proximity);
@@ -417,17 +475,27 @@ pub unsafe fn main() {
         components::sht3x_component_helper!(nrf52::rtc::Rtc<'static>, capsules::sht3x::BASE_ADDR),
     );
 
-    let temperature =
-        components::temperature::TemperatureComponent::new(board_kernel, sht3x).finalize(());
+    let temperature = components::temperature::TemperatureComponent::new(
+        board_kernel,
+        capsules::temperature::DRIVER_NUM,
+        sht3x,
+    )
+    .finalize(());
 
-    let humidity = components::humidity::HumidityComponent::new(board_kernel, sht3x).finalize(());
+    let humidity = components::humidity::HumidityComponent::new(
+        board_kernel,
+        capsules::humidity::DRIVER_NUM,
+        sht3x,
+    )
+    .finalize(());
 
     //--------------------------------------------------------------------------
     // TFT
     //--------------------------------------------------------------------------
 
-    let spi_mux = components::spi::SpiMuxComponent::new(&base_peripherals.spim0)
-        .finalize(components::spi_mux_component_helper!(nrf52840::spi::SPIM));
+    let spi_mux =
+        components::spi::SpiMuxComponent::new(&base_peripherals.spim0, dynamic_deferred_caller)
+            .finalize(components::spi_mux_component_helper!(nrf52840::spi::SPIM));
 
     base_peripherals.spim0.configure(
         nrf52840::pinmux::Pinmux::new(ST7789H2_MOSI as u32),
@@ -464,22 +532,31 @@ pub unsafe fn main() {
             // dc
             Some(&nrf52840_peripherals.gpio_port[ST7789H2_DC]),
             // reset
-            &nrf52840_peripherals.gpio_port[ST7789H2_RESET]
+            Some(&nrf52840_peripherals.gpio_port[ST7789H2_RESET])
         ),
     );
 
     let _ = tft.init();
 
-    let screen = components::screen::ScreenComponent::new(board_kernel, tft, Some(tft))
-        .finalize(components::screen_buffer_size!(57600));
+    let screen = components::screen::ScreenComponent::new(
+        board_kernel,
+        capsules::screen::DRIVER_NUM,
+        tft,
+        Some(tft),
+    )
+    .finalize(components::screen_buffer_size!(57600));
 
     //--------------------------------------------------------------------------
     // WIRELESS
     //--------------------------------------------------------------------------
 
-    let ble_radio =
-        nrf52_components::BLEComponent::new(board_kernel, &base_peripherals.ble_radio, mux_alarm)
-            .finalize(());
+    let ble_radio = nrf52_components::BLEComponent::new(
+        board_kernel,
+        capsules::ble_advertising_driver::DRIVER_NUM,
+        &base_peripherals.ble_radio,
+        mux_alarm,
+    )
+    .finalize(());
 
     let aes_mux = static_init!(
         MuxAES128CCM<'static, nrf52840::aes::AesECB>,
@@ -498,6 +575,7 @@ pub unsafe fn main() {
 
     let (ieee802154_radio, _mux_mac) = components::ieee802154::Ieee802154Component::new(
         board_kernel,
+        capsules::ieee802154::DRIVER_NUM,
         &base_peripherals.ieee802154_radio,
         aes_mux,
         PAN_ID,
@@ -517,6 +595,9 @@ pub unsafe fn main() {
     // approach than this.
     nrf52_components::NrfClockComponent::new(&base_peripherals.clock).finalize(());
 
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+        .finalize(components::rr_component_helper!(NUM_PROCS));
+
     let platform = Platform {
         ble_radio: ble_radio,
         ieee802154_radio: ieee802154_radio,
@@ -529,9 +610,15 @@ pub unsafe fn main() {
         rng: rng,
         buzzer: buzzer,
         alarm: alarm,
-        ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
+        ipc: kernel::ipc::IPC::new(
+            board_kernel,
+            kernel::ipc::DRIVER_NUM,
+            &memory_allocation_capability,
+        ),
         temperature: temperature,
         humidity: humidity,
+        scheduler,
+        systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
     };
 
     let chip = static_init!(
@@ -565,7 +652,7 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
-    kernel::procs::load_processes(
+    kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -585,13 +672,5 @@ pub unsafe fn main() {
         debug!("{:?}", err);
     });
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
-        .finalize(components::rr_component_helper!(NUM_PROCS));
-    board_kernel.kernel_loop(
-        &platform,
-        chip,
-        Some(&platform.ipc),
-        scheduler,
-        &main_loop_capability,
-    );
+    board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
 }

@@ -1,6 +1,6 @@
 //! Interface for Digest
 
-use crate::common::leasable_buffer::LeasableBuffer;
+use crate::utilities::leasable_buffer::LeasableBuffer;
 use crate::ErrorCode;
 
 /// Implement this trait and use `set_client()` in order to receive callbacks.
@@ -61,6 +61,26 @@ pub trait Digest<'a, const L: usize> {
     /// This won't clear the buffers provided to this API, that is up to the
     /// user to clear.
     fn clear_data(&self);
+}
+
+pub trait Sha224 {
+    /// Call before `Digest::run()` to perform Sha224
+    fn set_mode_sha224(&self) -> Result<(), ErrorCode>;
+}
+
+pub trait Sha256 {
+    /// Call before `Digest::run()` to perform Sha256
+    fn set_mode_sha256(&self) -> Result<(), ErrorCode>;
+}
+
+pub trait Sha384 {
+    /// Call before `Digest::run()` to perform Sha384
+    fn set_mode_sha384(&self) -> Result<(), ErrorCode>;
+}
+
+pub trait Sha512 {
+    /// Call before `Digest::run()` to perform Sha512
+    fn set_mode_sha512(&self) -> Result<(), ErrorCode>;
 }
 
 pub trait HMACSha256 {
