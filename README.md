@@ -36,11 +36,11 @@ To re-run these tests, see the hacky Tock 2.0 section in the Makefile.
 - [x] `examples/c_hello` and `examples/tests/printf_long`
   - uart_tx_small and uart_tx_large: applications that write to console with small and large buffers; run both in parallel to properly test virtualization
 - [x] `examples/tests/console_recv_short` and `examples/tests/console_recv_long`
-  - We expect this fail for 1.6 (console capsule not fully virtualized), and might work for 2.0. **mciantyre: testing together failed; known issue. Tests pass individually**.
+  - We expect this fail for 1.6 (console capsule not fully virtualized), and might work for 2.0.
+  - *Passed when run separately; known issues when running concurrently.*
 - [x] `examples/blink`
-  - blink: blinks LEDs
-- [ ] ❌ `examples/rot13_client` and `examples/rot13_service`
-  - rot_ipc: tests IPC with a simple service **mciantyre: see rot13-test-panic.log.**
+- [x] `examples/rot13_client` and `examples/rot13_service`
+  - *Requires #2779, otherwise panics (see [`rot13-test-panic.log`](./rot13-test-panic.log)).*
 - [x] `examples/blink` and `examples/c_hello` ~~and `examples/buttons`~~
   - No buttons available at the moment.
 - [x] `examples/lua-hello`
@@ -50,7 +50,7 @@ To re-run these tests, see the hacky Tock 2.0 section in the Makefile.
 - [x] `examples/tests/stack_size_test02`
 - [x] `examples/tests/mpu_stack_growth`
 - [x] `examples/tests/mpu_walk_region`
-  - **mciantyre: didn't press a button to force overrun**
+  - *Didn't press a button to force overrun.*
 - [x] `examples/tests/multi_alarm_test`
-  - **mciantyre: only one configured LED on board; combined with `whileone` to make it intersting**
+  - *Only one configured LED on board; combined with `whileone` to make it interesting.*
 - [x] `examples/tests/whileone`
