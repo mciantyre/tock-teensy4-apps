@@ -31,25 +31,26 @@ Teensy 4. You should observe
 
 ## Additional testing
 
-- [ ] `examples/c_hello` and `examples/tests/printf_long`
+To re-run these tests, see the hacky Tock 2.0 section in the Makefile.
+
+- [x] `examples/c_hello` and `examples/tests/printf_long`
   - uart_tx_small and uart_tx_large: applications that write to console with small and large buffers; run both in parallel to properly test virtualization
-- [ ] `examples/tests/console_recv_short` and `examples/tests/console_recv_long`
-  - We expect this fail for 1.6 (console capsule not fully virtualized), and might work for 2.0.
-- [ ] `examples/blink`
+- [x] `examples/tests/console_recv_short` and `examples/tests/console_recv_long`
+  - We expect this fail for 1.6 (console capsule not fully virtualized), and might work for 2.0. **mciantyre: testing together failed; known issue. Tests pass individually**.
+- [x] `examples/blink`
   - blink: blinks LEDs
-- [ ] `examples/rot_client` and `examples/rot_service`
-  - rot_ipc: tests IPC with a simple service
-- [ ] `examples/blink` and `examples/c_hello` and `examples/buttons`
-- [ ] `examples/lua-hello`
-- [ ] `examples/tests/console_timeout`
-- [ ] `examples/tests/malloc_test01`
-- [ ] `examples/tests/stack_size_test01`
-- [ ] `examples/tests/stack_size_test02`
-- [ ] `examples/tests/mpu_stack_growth`
-- [ ] `examples/tests/mpu_walk_region`
-- [ ] `examples/tests/multi_alarm_test`
-- [ ] `examples/tests/adc`
-- [ ] `examples/tests/adc_continuous`
-- [ ] `examples/tutorials/05_ipc/led` and `examples/tutorials/05_ipc/rng` and `examples/tutorials/05_ipc/logic`
-- [ ] `examples/tests/gpio` with mode set to 0
-- [ ] `examples/tests/whileone`
+- [ ] ❌ `examples/rot13_client` and `examples/rot13_service`
+  - rot_ipc: tests IPC with a simple service **mciantyre: see rot13-test-panic.log.**
+- [x] `examples/blink` and `examples/c_hello` ~~and `examples/buttons`~~
+  - No buttons available at the moment.
+- [x] `examples/lua-hello`
+- [x] `examples/tests/console_timeout`
+- [x] `examples/tests/malloc_test01`
+- [x] `examples/tests/stack_size_test01`
+- [x] `examples/tests/stack_size_test02`
+- [x] `examples/tests/mpu_stack_growth`
+- [x] `examples/tests/mpu_walk_region`
+  - **mciantyre: didn't press a button to force overrun**
+- [x] `examples/tests/multi_alarm_test`
+  - **mciantyre: only one configured LED on board; combined with `whileone` to make it intersting**
+- [x] `examples/tests/whileone`

@@ -1,0 +1,192 @@
+
+panicked at 'Process rot13_client had a fault', kernel/src/process_standard.rs:323:17
+	Kernel version 61d0bd52a
+
+---| No debug queue found. You can set it with the DebugQueue component.
+
+---| Cortex-M Fault Status |---
+Data Access Violation:              true
+Forced Hard Fault:                  true
+Faulting Memory Address:            0x00000000
+Fault Status Register (CFSR):       0x00000082
+Hard Fault Status Register (HFSR):  0x40000000
+
+---| App Status |---
+𝐀𝐩𝐩: rot13_client   -   [Faulted]
+ Events Queued: 0   Syscall Count: 14   Dropped Upcall Count: 0
+ Restart Count: 0
+ Last Syscall: Some(Memop { operand: 1, arg0: 436 })
+
+
+ ╔═══════════╤══════════════════════════════════════════╗
+ ║  Address  │ Region Name    Used | Allocated (bytes)  ║
+ ╚0x20206000═╪══════════════════════════════════════════╝
+             │ ▼ Grant        1404 |   1404          
+  0x20205A84 ┼───────────────────────────────────────────
+             │ Unused
+  0x20204AE8 ┼───────────────────────────────────────────
+             │ ▲ Heap            0 |   3996               S
+  0x20204AE8 ┼─────────────────────────────────────────── R
+             │ Data            744 |    744               A
+  0x20204800 ┼─────────────────────────────────────────── M
+             │ ▼ Stack        2048 |   2048          
+  0x20204000 ┼───────────────────────────────────────────
+             │ Unused
+  0x20204000 ┴───────────────────────────────────────────
+             .....
+  0x60082000 ┬─────────────────────────────────────────── F
+             │ App Flash      8136                        L
+  0x60080038 ┼─────────────────────────────────────────── A
+             │ Protected        56                        S
+  0x60080000 ┴─────────────────────────────────────────── H
+
+  R0 : 0x00000001    R6 : 0x202048A4
+  R1 : 0x00000018    R7 : 0x20204800
+  R2 : 0x00000018    R8 : 0x00000047
+  R3 : 0x202045E0    R10: 0x00000000
+  R4 : 0x202048A4    R11: 0x00000000
+  R5 : 0x20204AE4    R12: 0x202047E8
+  R9 : 0x20204800 (Static Base Register)
+  SP : 0x202045B8 (Process Stack Pointer)
+  LR : 0x60081973
+  PC : 0x60080654
+ YPC : 0x60080654
+
+ APSR: N 0 Z 0 C 1 V 0 Q 0
+       GE 0 0 0 0
+ EPSR: ICI.IT 0x00
+       ThumbBit true 
+
+ Total number of grant regions defined: 3
+  Grant  0 : --          Grant  1 : --          Grant  2 0x10000: 0x20205a84
+
+ Cortex-M MPU
+  Region 0: [0x20204000:0x20206000], length: 8192 bytes; ReadWrite (0x3)
+    Sub-region 0: [0x20204000:0x20204400], Enabled
+    Sub-region 1: [0x20204400:0x20204800], Enabled
+    Sub-region 2: [0x20204800:0x20204C00], Enabled
+    Sub-region 3: [0x20204C00:0x20205000], Disabled
+    Sub-region 4: [0x20205000:0x20205400], Disabled
+    Sub-region 5: [0x20205400:0x20205800], Disabled
+    Sub-region 6: [0x20205800:0x20205C00], Disabled
+    Sub-region 7: [0x20205C00:0x20206000], Disabled
+  Region 1: [0x60080000:0x60082000], length: 8192 bytes; UnprivilegedReadOnly (0x2)
+    Sub-region 0: [0x60080000:0x60080400], Enabled
+    Sub-region 1: [0x60080400:0x60080800], Enabled
+    Sub-region 2: [0x60080800:0x60080C00], Enabled
+    Sub-region 3: [0x60080C00:0x60081000], Enabled
+    Sub-region 4: [0x60081000:0x60081400], Enabled
+    Sub-region 5: [0x60081400:0x60081800], Enabled
+    Sub-region 6: [0x60081800:0x60081C00], Enabled
+    Sub-region 7: [0x60081C00:0x60082000], Enabled
+  Region 2: Unused
+  Region 3: Unused
+  Region 4: Unused
+  Region 5: Unused
+  Region 6: Unused
+  Region 7: Unused
+  Region 8: Unused
+  Region 9: Unused
+  Region 10: Unused
+  Region 11: Unused
+  Region 12: Unused
+  Region 13: Unused
+  Region 14: Unused
+  Region 15: Unused
+
+To debug, run `make debug RAM_START=0x20204000 FLASH_INIT=0x60080061`
+in the app's folder and open the .lst file.
+
+𝐀𝐩𝐩: org.tockos.examples.rot13   -   [Yielded]
+ Events Queued: 0   Syscall Count: 7   Dropped Upcall Count: 0
+ Restart Count: 0
+ Last Syscall: Some(Yield { which: 1, address: 0x0 })
+
+
+ ╔═══════════╤══════════════════════════════════════════╗
+ ║  Address  │ Region Name    Used | Allocated (bytes)  ║
+ ╚0x20208000═╪══════════════════════════════════════════╝
+             │ ▼ Grant        1404 |   1404          
+  0x20207A84 ┼───────────────────────────────────────────
+             │ Unused
+  0x202069F0 ┼───────────────────────────────────────────
+             │ ▲ Heap            0 |   4244               S
+  0x202069F0 ┼─────────────────────────────────────────── R
+             │ Data            496 |    496               A
+  0x20206800 ┼─────────────────────────────────────────── M
+             │ ▼ Stack        2048 |   2048          
+  0x20206000 ┼───────────────────────────────────────────
+             │ Unused
+  0x20206000 ┴───────────────────────────────────────────
+             .....
+  0x60082800 ┬─────────────────────────────────────────── F
+             │ App Flash      1976                        L
+  0x60082048 ┼─────────────────────────────────────────── A
+             │ Protected        72                        S
+  0x60082000 ┴─────────────────────────────────────────── H
+
+  R0 : 0x00000001    R6 : 0x60082444
+  R1 : 0x00000000    R7 : 0x20206000
+  R2 : 0x00000000    R8 : 0x00000000
+  R3 : 0x00000000    R10: 0x00000000
+  R4 : 0x60082048    R11: 0x00000000
+  R5 : 0x20206000    R12: 0x202067F0
+  R9 : 0x20206800 (Static Base Register)
+  SP : 0x202067D0 (Process Stack Pointer)
+  LR : 0x60082293
+  PC : 0x6008229A
+ YPC : 0x6008229A
+
+ APSR: N 0 Z 0 C 1 V 0 Q 0
+       GE 0 0 0 0
+ EPSR: ICI.IT 0x00
+       ThumbBit true 
+
+ Total number of grant regions defined: 3
+  Grant  0 : --          Grant  1 : --          Grant  2 0x10000: 0x20207a84
+
+ Cortex-M MPU
+  Region 0: [0x20206000:0x20208000], length: 8192 bytes; ReadWrite (0x3)
+    Sub-region 0: [0x20206000:0x20206400], Enabled
+    Sub-region 1: [0x20206400:0x20206800], Enabled
+    Sub-region 2: [0x20206800:0x20206C00], Enabled
+    Sub-region 3: [0x20206C00:0x20207000], Disabled
+    Sub-region 4: [0x20207000:0x20207400], Disabled
+    Sub-region 5: [0x20207400:0x20207800], Disabled
+    Sub-region 6: [0x20207800:0x20207C00], Disabled
+    Sub-region 7: [0x20207C00:0x20208000], Disabled
+  Region 1: [0x60082000:0x60082800], length: 2048 bytes; UnprivilegedReadOnly (0x2)
+    Sub-region 0: [0x60082000:0x60082100], Enabled
+    Sub-region 1: [0x60082100:0x60082200], Enabled
+    Sub-region 2: [0x60082200:0x60082300], Enabled
+    Sub-region 3: [0x60082300:0x60082400], Enabled
+    Sub-region 4: [0x60082400:0x60082500], Enabled
+    Sub-region 5: [0x60082500:0x60082600], Enabled
+    Sub-region 6: [0x60082600:0x60082700], Enabled
+    Sub-region 7: [0x60082700:0x60082800], Enabled
+  Region 2: [0x20204940:0x20204980], length: 64 bytes; ReadWrite (0x3)
+    Sub-region 0: [0x20204940:0x20204948], Enabled
+    Sub-region 1: [0x20204948:0x20204950], Enabled
+    Sub-region 2: [0x20204950:0x20204958], Enabled
+    Sub-region 3: [0x20204958:0x20204960], Enabled
+    Sub-region 4: [0x20204960:0x20204968], Enabled
+    Sub-region 5: [0x20204968:0x20204970], Enabled
+    Sub-region 6: [0x20204970:0x20204978], Enabled
+    Sub-region 7: [0x20204978:0x20204980], Enabled
+  Region 3: Unused
+  Region 4: Unused
+  Region 5: Unused
+  Region 6: Unused
+  Region 7: Unused
+  Region 8: Unused
+  Region 9: Unused
+  Region 10: Unused
+  Region 11: Unused
+  Region 12: Unused
+  Region 13: Unused
+  Region 14: Unused
+  Region 15: Unused
+
+To debug, run `make debug RAM_START=0x20206000 FLASH_INIT=0x60082071`
+in the app's folder and open the .lst file.
+
