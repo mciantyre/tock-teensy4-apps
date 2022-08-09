@@ -51,7 +51,7 @@ all: kernel blink-app console-app build
 	$(LOADER) build/apps.hex
 
 ##################
-# TOCK 2.0 TESTING
+# TOCK 2.1 TESTING
 ##################
 
 c_hello_printf_long: build kernel
