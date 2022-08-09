@@ -84,7 +84,7 @@ static void callback( __attribute__ ((unused)) int unused0,
   }
 }
 
-void alarm_at(uint32_t reference, uint32_t dt, subscribe_upcall cb, void* ud, alarm_t* alarm) {
+int alarm_at(uint32_t reference, uint32_t dt, subscribe_upcall cb, void* ud, alarm_t* alarm) {
   alarm->reference = reference;
   alarm->dt        = dt;
   alarm->callback  = cb;
@@ -100,8 +100,10 @@ void alarm_at(uint32_t reference, uint32_t dt, subscribe_upcall cb, void* ud, al
 
   if (root_peek() == alarm) {
     alarm_internal_subscribe((subscribe_upcall*)callback, NULL);
-    alarm_internal_set(alarm->reference, alarm->dt);
+
+    return alarm_internal_set(alarm->reference, alarm->dt);
   }
+  return RETURNCODE_SUCCESS;
 }
 
 void alarm_cancel(alarm_t* alarm) {
@@ -126,13 +128,13 @@ void alarm_cancel(alarm_t* alarm) {
 
 // Timer implementation
 
-void timer_in(uint32_t ms, subscribe_upcall cb, void* ud, tock_timer_t *timer) {
+int timer_in(uint32_t ms, subscribe_upcall cb, void* ud, tock_timer_t *timer) {
   uint32_t frequency;
   alarm_internal_frequency(&frequency);
   uint32_t interval = (ms / 1000) * frequency + (ms % 1000) * (frequency / 1000);
   uint32_t now;
   alarm_internal_read(&now);
-  alarm_at(now, interval, cb, ud, &timer->alarm);
+  return alarm_at(now, interval, cb, ud, &timer->alarm);
 }
 
 static void repeating_upcall( uint32_t now,
@@ -166,28 +168,34 @@ void timer_cancel(tock_timer_t* timer) {
   alarm_cancel(&timer->alarm);
 }
 
-void delay_ms(uint32_t ms) {
-  void delay_upcall(__attribute__ ((unused)) int unused0,
-                    __attribute__ ((unused)) int unused1,
-                    __attribute__ ((unused)) int unused2,
-                    void* ud) {
-    *((bool*)ud) = true;
-  }
+static void delay_upcall(__attribute__ ((unused)) int unused0,
+                         __attribute__ ((unused)) int unused1,
+                         __attribute__ ((unused)) int unused2,
+                         void* ud) {
+  *((bool*)ud) = true;
+}
 
+int delay_ms(uint32_t ms) {
   bool cond = false;
   tock_timer_t timer;
-  timer_in(ms, delay_upcall, &cond, &timer);
+  int rc;
+
+  if ((rc = timer_in(ms, delay_upcall, &cond, &timer)) != RETURNCODE_SUCCESS) {
+    return rc;
+  }
+
   yield_for(&cond);
+  return rc;
+}
+
+static void yield_for_timeout_upcall(__attribute__ ((unused)) int unused0,
+                                     __attribute__ ((unused)) int unused1,
+                                     __attribute__ ((unused)) int unused2,
+                                     void* ud) {
+  *((bool*)ud) = true;
 }
 
 int yield_for_with_timeout(bool* cond, uint32_t ms) {
-  void yield_for_timeout_upcall(__attribute__ ((unused)) int unused0,
-                                __attribute__ ((unused)) int unused1,
-                                __attribute__ ((unused)) int unused2,
-                                void* ud) {
-    *((bool*)ud) = true;
-  }
-
   bool timeout = false;
   tock_timer_t timer;
   timer_in(ms, yield_for_timeout_upcall, &timeout, &timer);
