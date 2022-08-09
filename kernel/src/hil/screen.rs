@@ -1,7 +1,35 @@
-//! Interface for screens and displays.
+/*! Interface for screens and displays.
+
+The interfaces exposed here cover both configurable (`ScreenSetup`),
+and less configurable hardware (only `Screen`).
+
+It's composed of 4 main kinds of requests:
+- set power,
+- read configuration (e.g. `get_resolution`),
+- configure (e.g. `set_invert`),
+- write buffer.
+
+All requests, except for `Screen::set_power`, can return `OFF`
+under some circumstances.
+
+For buffer writes, it's when the display is powered off.
+
+While the display is not powered on, the user could try to configure it.
+In that case, the driver MUST either cache the value, or return `OFF`.
+This is to let the user power the display in the desired configuration.
+
+Configuration reads shall return the actual state of the display.
+In situations where a parameter cannot be configured
+(e.g. fixed resolution), they return value may be hardcoded.
+Otherwise, the driver should query the hardware directly,
+and return OFF if it's not powered.
+*/
+
 use crate::ErrorCode;
 use core::ops::Add;
 use core::ops::Sub;
+
+pub const MAX_BRIGHTNESS: usize = 65536;
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum ScreenRotation {
@@ -149,12 +177,13 @@ pub trait ScreenSetup {
     fn get_supported_pixel_format(&self, index: usize) -> Option<ScreenPixelFormat>;
 }
 
+/// The basic trait for screens
 pub trait Screen {
     /// Returns a tuple (width, height) with the current resolution (in pixels)
     /// This function is synchronous as the driver should know this value without
     /// requesting it from the screen.
     ///
-    /// note that width and height may change due to rotation
+    /// Note that width and height may change due to rotation.
     fn get_resolution(&self) -> (usize, usize);
 
     /// Returns the current pixel format
@@ -207,17 +236,51 @@ pub trait Screen {
     /// Set the object to receive the asynchronous command callbacks.
     fn set_client(&self, client: Option<&'static dyn ScreenClient>);
 
-    /// Sets the display brightness and/or powers it off
-    /// Screens must implement this function for at least two brightness values (in percent)
-    ///     0 - power off,
-    ///     otherwise - on, set brightness (if available)
+    /// Sets the display brightness value
+    ///
+    /// Depending on the display, this may not cause any actual changes
+    /// until and unless power is enabled (see `set_power`).
+    ///
+    /// The following values must be supported:
+    /// - 0 - completely no light emitted
+    /// - 1..MAX_BRIGHTNESS - on, set brightness to the given level
+    ///
+    /// The display should interpret the brightness value as *lightness*
+    /// (each increment should change preceived brightness the same).
+    /// 1 shall be the minimum supported brightness,
+    /// `MAX_BRIGHTNESS` and greater represent the maximum.
+    /// Values in between should approximate the intermediate values;
+    /// minimum and maximum included (e.g. when there is only 1 level).
     fn set_brightness(&self, brightness: usize) -> Result<(), ErrorCode>;
 
-    /// Inverts the colors.
-    fn invert_on(&self) -> Result<(), ErrorCode>;
+    /// Controls the screen power supply.
+    ///
+    /// Use it to initialize the display device.
+    ///
+    /// For screens where display needs nonzero brightness (e.g. LED),
+    /// this shall set brightness to a default value
+    /// if `set_brightness` was not called first.
+    ///
+    /// The device may implement power independently from brightness,
+    /// so call `set_brightness` to turn on/off the module completely.
+    ///
+    /// To allow starting in the correct configuration,
+    /// the driver is allowed to cache values like brightness or invert mode
+    /// and apply them together when power is enabled.
+    /// If the display cannot use selected configuration, this call returns `INVAL`.
+    ///
+    /// When finished, calls `ScreenClient::screen_is_ready`,
+    /// both when power was enabled and disabled.
+    fn set_power(&self, enabled: bool) -> Result<(), ErrorCode>;
 
-    /// Reverts the colors to normal.
-    fn invert_off(&self) -> Result<(), ErrorCode>;
+    /// Controls the color inversion mode.
+    ///
+    /// Pixels already in the frame buffer, as well as newly submited,
+    /// will be inverted. What that means depends on the current pixel format.
+    /// May get disabled when switching to another pixel format.
+    /// Returns ENOSUPPORT if the device does not accelerate color inversion.
+    /// Returns EINVAL if the current pixel format does not support color inversion.
+    fn set_invert(&self, enabled: bool) -> Result<(), ErrorCode>;
 }
 
 pub trait ScreenAdvanced: Screen + ScreenSetup {}
@@ -237,6 +300,6 @@ pub trait ScreenClient {
     /// This is different from `command_complete` as it has to pass back the write buffer
     fn write_complete(&self, buffer: &'static mut [u8], r: Result<(), ErrorCode>);
 
-    /// Some screens need some time to start, this function is called when the screen is ready
+    /// Some screens need some time to start, this function is called when the screen is ready.
     fn screen_is_ready(&self);
 }

@@ -25,7 +25,6 @@ pub mod io;
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
-const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 // Actual memory for holding the active process structures.
 static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
@@ -33,6 +32,7 @@ static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS]
 
 static mut CHIP: Option<&'static stm32f401cc::chip::Stm32f4xx<Stm32f401ccDefaultPeripherals>> =
     None;
+static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 
 // How should the kernel respond when a process faults.
 const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
@@ -46,10 +46,11 @@ pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 /// capsules for this platform.
 struct WeactF401CC {
     console: &'static capsules::console::Console<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
+    ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
     led: &'static capsules::led::LedDriver<
         'static,
         LedLow<'static, stm32f401cc::gpio::Pin<'static>>,
+        1,
     >,
     button: &'static capsules::button::Button<'static, stm32f401cc::gpio::Pin<'static>>,
     adc: &'static capsules::adc::AdcVirtualized<'static>,
@@ -90,6 +91,7 @@ impl KernelResources<stm32f401cc::chip::Stm32f4xx<'static, Stm32f401ccDefaultPer
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm4::systick::SysTick;
     type WatchDog = ();
+    type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         &self
@@ -109,15 +111,18 @@ impl KernelResources<stm32f401cc::chip::Stm32f4xx<'static, Stm32f401ccDefaultPer
     fn watchdog(&self) -> &Self::WatchDog {
         &()
     }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
+        &()
+    }
 }
 
 /// Helper function called during bring-up that configures DMA.
 unsafe fn setup_dma(
-    dma: &stm32f401cc::dma1::Dma1,
-    dma_streams: &'static [stm32f401cc::dma1::Stream; 8],
-    usart2: &'static stm32f401cc::usart::Usart,
+    dma: &stm32f401cc::dma::Dma1,
+    dma_streams: &'static [stm32f401cc::dma::Stream<stm32f401cc::dma::Dma1>; 8],
+    usart2: &'static stm32f401cc::usart::Usart<stm32f401cc::dma::Dma1>,
 ) {
-    use stm32f401cc::dma1::Dma1Peripheral;
+    use stm32f401cc::dma::Dma1Peripheral;
     use stm32f401cc::usart;
 
     dma.enable_clock();
@@ -143,11 +148,9 @@ unsafe fn setup_dma(
 /// Helper function called during bring-up that configures multiplexed I/O.
 unsafe fn set_pin_primary_functions(
     syscfg: &stm32f401cc::syscfg::Syscfg,
-    exti: &stm32f401cc::exti::Exti,
     gpio_ports: &'static stm32f401cc::gpio::GpioPorts<'static>,
 ) {
     use kernel::hil::gpio::Configure;
-    use stm32f401cc::exti::LineId;
     use stm32f401cc::gpio::{AlternateFunction, Mode, PinId, PortId};
 
     syscfg.enable_clock();
@@ -156,15 +159,13 @@ unsafe fn set_pin_primary_functions(
 
     // On-board KEY button is connected on PA0
     gpio_ports.get_pin(PinId::PA00).map(|pin| {
-        // By default, upon reset, the pin is in input mode, with no internal
-        // pull-up, no internal pull-down (i.e., floating).
-        //
-        // Only set the mapping between EXTI line and the Pin and let capsule do
-        // the rest.
-        exti.associate_line_gpiopin(LineId::Exti0, &pin);
+        pin.enable_interrupt();
     });
-    // EXTI0 interrupts is delivered at IRQn 6 (EXTI0)
-    cortexm4::nvic::Nvic::new(stm32f401cc::nvic::EXTI0).enable();
+
+    // enable interrupt for D3
+    gpio_ports.get_pin(PinId::PC14).map(|pin| {
+        pin.enable_interrupt();
+    });
 
     // PA2 (tx) and PA3 (rx) (USART2)
     gpio_ports.get_pin(PinId::PA02).map(|pin| {
@@ -212,7 +213,7 @@ unsafe fn setup_peripherals(tim2: &stm32f401cc::tim2::Tim2) {
 unsafe fn get_peripherals() -> (
     &'static mut Stm32f401ccDefaultPeripherals<'static>,
     &'static stm32f401cc::syscfg::Syscfg<'static>,
-    &'static stm32f401cc::dma1::Dma1<'static>,
+    &'static stm32f401cc::dma::Dma1<'static>,
 ) {
     // We use the default HSI 16Mhz clock
     let rcc = static_init!(stm32f401cc::rcc::Rcc, stm32f401cc::rcc::Rcc::new());
@@ -224,10 +225,12 @@ unsafe fn get_peripherals() -> (
         stm32f401cc::exti::Exti,
         stm32f401cc::exti::Exti::new(syscfg)
     );
-    let dma1 = static_init!(stm32f401cc::dma1::Dma1, stm32f401cc::dma1::Dma1::new(rcc));
+    let dma1 = static_init!(stm32f401cc::dma::Dma1, stm32f401cc::dma::Dma1::new(rcc));
+    let dma2 = static_init!(stm32f401cc::dma::Dma2, stm32f401cc::dma::Dma2::new(rcc));
+
     let peripherals = static_init!(
         Stm32f401ccDefaultPeripherals,
-        Stm32f401ccDefaultPeripherals::new(rcc, exti, dma1)
+        Stm32f401ccDefaultPeripherals::new(rcc, exti, dma1, dma2)
     );
     (peripherals, syscfg, dma1)
 }
@@ -245,11 +248,11 @@ pub unsafe fn main() {
 
     setup_peripherals(&base_peripherals.tim2);
 
-    set_pin_primary_functions(syscfg, &base_peripherals.exti, &base_peripherals.gpio_ports);
+    set_pin_primary_functions(syscfg, &base_peripherals.gpio_ports);
 
     setup_dma(
         dma1,
-        &base_peripherals.dma_streams,
+        &base_peripherals.dma1_streams,
         &base_peripherals.usart2,
     );
 
@@ -295,7 +298,7 @@ pub unsafe fn main() {
         capsules::console::DRIVER_NUM,
         uart_mux,
     )
-    .finalize(());
+    .finalize(components::console_component_helper!());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -303,12 +306,9 @@ pub unsafe fn main() {
     // Clock to Port A, B, C are enabled in `set_pin_primary_functions()`
     let gpio_ports = &base_peripherals.gpio_ports;
 
-    let led = components::led::LedsComponent::new(components::led_component_helper!(
+    let led = components::led::LedsComponent::new().finalize(components::led_component_helper!(
         LedLow<'static, stm32f401cc::gpio::Pin>,
         LedLow::new(gpio_ports.get_pin(stm32f401cc::gpio::PinId::PC13).unwrap()),
-    ))
-    .finalize(components::led_component_buf!(
-        LedLow<'static, stm32f401cc::gpio::Pin>
     ));
 
     // BUTTONs
@@ -423,6 +423,22 @@ pub unsafe fn main() {
                 adc_channel_5
             ));
 
+    let process_printer =
+        components::process_printer::ProcessPrinterTextComponent::new().finalize(());
+    PROCESS_PRINTER = Some(process_printer);
+
+    // PROCESS CONSOLE
+    let process_console = components::process_console::ProcessConsoleComponent::new(
+        board_kernel,
+        uart_mux,
+        mux_alarm,
+        process_printer,
+    )
+    .finalize(components::process_console_component_helper!(
+        stm32f401cc::tim2::Tim2
+    ));
+    let _ = process_console.start();
+
     let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
         .finalize(components::rr_component_helper!(NUM_PROCS));
 
@@ -444,7 +460,7 @@ pub unsafe fn main() {
 
     debug!("Initialization complete. Entering main loop");
 
-    /// These symbols are defined in the linker script.
+    // These symbols are defined in the linker script.
     extern "C" {
         /// Beginning of the ROM region containing app images.
         static _sapps: u8;

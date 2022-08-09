@@ -110,7 +110,7 @@ register_bitfields![u32,
         /// WO.
         PENDSTCLR       OFFSET(25)  NUMBITS(1),
 
-        /// Whether an excpetion will be serviced when existing debug state.
+        /// Whether an exception will be serviced when existing debug state.
         /// RO.
         ISRPREEMPT      OFFSET(23)  NUMBITS(1),
 
@@ -298,6 +298,7 @@ pub unsafe fn set_vector_table_offset(offset: *const ()) {
 /// Disable the FPU
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 pub unsafe fn disable_fpca() {
+    use core::arch::asm;
     SCB.cpacr
         .modify(CoprocessorAccessControl::CP10::CLEAR + CoprocessorAccessControl::CP11::CLEAR);
 

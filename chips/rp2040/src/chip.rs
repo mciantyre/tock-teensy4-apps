@@ -8,6 +8,7 @@ use kernel::platform::chip::InterruptService;
 use crate::adc;
 use crate::clocks::Clocks;
 use crate::gpio::{RPPins, SIO};
+use crate::i2c;
 use crate::interrupts;
 use crate::resets::Resets;
 use crate::spi;
@@ -16,7 +17,7 @@ use crate::timer::RPTimer;
 use crate::uart::Uart;
 use crate::watchdog::Watchdog;
 use crate::xosc::Xosc;
-use cortexm0p::interrupt_mask;
+use cortexm0p::{interrupt_mask, CortexM0P, CortexMVariant};
 
 #[repr(u8)]
 pub enum Processor {
@@ -107,7 +108,7 @@ impl<'a, I: InterruptService<()>> Chip for Rp2040<'a, I> {
     }
 
     unsafe fn print_state(&self, writer: &mut dyn Write) {
-        cortexm0p::print_cortexm0_state(writer);
+        CortexM0P::print_cortexm_state(writer);
     }
 }
 
@@ -123,10 +124,11 @@ pub struct Rp2040DefaultPeripherals<'a> {
     pub adc: adc::Adc,
     pub spi0: spi::Spi<'a>,
     pub sysinfo: sysinfo::SysInfo,
+    pub i2c0: i2c::I2c<'a>,
 }
 
 impl<'a> Rp2040DefaultPeripherals<'a> {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             resets: Resets::new(),
             sio: SIO::new(),
@@ -139,12 +141,14 @@ impl<'a> Rp2040DefaultPeripherals<'a> {
             adc: adc::Adc::new(),
             spi0: spi::Spi::new_spi0(),
             sysinfo: sysinfo::SysInfo::new(),
+            i2c0: i2c::I2c::new_i2c0(),
         }
     }
 
-    pub fn set_clocks(&'a self) {
+    pub fn resolve_dependencies(&'a self) {
         self.spi0.set_clocks(&self.clocks);
         self.uart0.set_clocks(&self.clocks);
+        self.i2c0.resolve_dependencies(&self.clocks, &self.resets);
     }
 }
 
@@ -177,6 +181,10 @@ impl InterruptService<()> for Rp2040DefaultPeripherals<'_> {
             }
             interrupts::IO_IRQ_BANK0 => {
                 self.pins.handle_interrupt();
+                true
+            }
+            interrupts::I2C0_IRQ => {
+                self.i2c0.handle_interrupt();
                 true
             }
             _ => false,

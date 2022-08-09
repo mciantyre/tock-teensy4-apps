@@ -101,8 +101,44 @@ impl<T: UIntLike, R: RegisterLongName> Field<T, R> {
 
     #[inline]
     /// Read value of the field as an enum member
+    ///
+    /// This method expects to be passed the unasked and unshifted register
+    /// value, extracts the field value by calling [`Field::read`] and
+    /// subsequently passes that value to the [`TryFromValue`] implementation on
+    /// the passed enum type.
+    ///
+    /// The [`register_bitfields!`](crate::register_bitfields) macro will
+    /// generate an enum containing the various named field variants and
+    /// implementing the required [`TryFromValue`] trait. It is accessible as
+    /// `$REGISTER_NAME::$FIELD_NAME::Value`.
+    ///
+    /// This method can be useful to symbolically represent read register field
+    /// states throughout the codebase and to enforce exhaustive matches over
+    /// all defined valid register field values.
+    ///
+    /// ## Usage Example
+    ///
+    /// ```rust
+    /// # use tock_registers::interfaces::Readable;
+    /// # use tock_registers::registers::InMemoryRegister;
+    /// # use tock_registers::register_bitfields;
+    /// register_bitfields![u8,
+    ///     EXAMPLEREG [
+    ///         TESTFIELD OFFSET(3) NUMBITS(3) [
+    ///             Foo = 2,
+    ///             Bar = 3,
+    ///             Baz = 6,
+    ///         ],
+    ///     ],
+    /// ];
+    ///
+    /// match EXAMPLEREG::TESTFIELD.read_as_enum(0x9C) {
+    ///     Some(EXAMPLEREG::TESTFIELD::Value::Bar) => "The value is 3!",
+    ///     _ => panic!("boo!"),
+    /// };
+    /// ```
     pub fn read_as_enum<E: TryFromValue<T, EnumType = E>>(self, val: T) -> Option<E> {
-        E::try_from(self.read(val))
+        E::try_from_value(self.read(val))
     }
 }
 
@@ -136,7 +172,7 @@ impl<T: UIntLike, R: RegisterLongName> Copy for Field<T, R> {}
 macro_rules! Field_impl_for {
     ($type:ty) => {
         impl<R: RegisterLongName> Field<$type, R> {
-            pub fn val(&self, value: $type) -> FieldValue<$type, R> {
+            pub const fn val(&self, value: $type) -> FieldValue<$type, R> {
                 FieldValue::<$type, R>::new(self.mask, self.shift, value)
             }
         }
@@ -194,9 +230,18 @@ FieldValue_impl_for!(u128);
 FieldValue_impl_for!(usize);
 
 impl<T: UIntLike, R: RegisterLongName> FieldValue<T, R> {
+    #[inline]
+    pub fn none() -> Self {
+        Self {
+            mask: T::zero(),
+            value: T::zero(),
+            associated_register: PhantomData,
+        }
+    }
+
     /// Get the raw bitmask represented by this FieldValue.
     #[inline]
-    pub fn mask(&self) -> T {
+    pub const fn mask(&self) -> T {
         self.mask as T
     }
 
@@ -252,7 +297,7 @@ impl<T: UIntLike, R: RegisterLongName> AddAssign for FieldValue<T, R> {
 pub trait TryFromValue<V> {
     type EnumType;
 
-    fn try_from(v: V) -> Option<Self::EnumType>;
+    fn try_from_value(v: V) -> Option<Self::EnumType>;
 }
 
 /// Helper macro for computing bitmask of variable number of bits
@@ -354,6 +399,7 @@ macro_rules! register_bitmasks {
 
             #[allow(dead_code)]
             #[allow(non_camel_case_types)]
+            #[derive(Copy, Clone, Eq, PartialEq)]
             #[repr($valtype)] // so that values larger than isize::MAX can be stored
             $(#[$outer])*
             pub enum Value {
@@ -366,7 +412,7 @@ macro_rules! register_bitmasks {
             impl TryFromValue<$valtype> for Value {
                 type EnumType = Value;
 
-                fn try_from(v: $valtype) -> Option<Self::EnumType> {
+                fn try_from_value(v: $valtype) -> Option<Self::EnumType> {
                     match v {
                         $(
                             $(#[$inner])*
@@ -375,6 +421,12 @@ macro_rules! register_bitmasks {
 
                         _ => Option::None
                     }
+                }
+            }
+
+            impl From<Value> for FieldValue<$valtype, $reg_desc> {
+                fn from(v: Value) -> Self {
+                    Self::new($crate::bitmask!($numbits), $offset, v as $valtype)
                 }
             }
         }
@@ -417,7 +469,7 @@ macro_rules! register_bitmasks {
             impl TryFromValue<$valtype> for Value {
                 type EnumType = Value;
 
-                fn try_from(_v: $valtype) -> Option<Self::EnumType> {
+                fn try_from_value(_v: $valtype) -> Option<Self::EnumType> {
                     Option::None
                 }
             }
@@ -470,14 +522,14 @@ mod tests {
     impl crate::fields::TryFromValue<u16> for Foo {
         type EnumType = Foo;
 
-        fn try_from(v: u16) -> Option<Self::EnumType> {
-            Self::try_from(v as u32)
+        fn try_from_value(v: u16) -> Option<Self::EnumType> {
+            Self::try_from_value(v as u32)
         }
     }
     impl crate::fields::TryFromValue<u32> for Foo {
         type EnumType = Foo;
 
-        fn try_from(v: u32) -> Option<Self::EnumType> {
+        fn try_from_value(v: u32) -> Option<Self::EnumType> {
             match v {
                 0 => Some(Foo::Foo0),
                 1 => Some(Foo::Foo1),
@@ -556,7 +608,7 @@ mod tests {
             for shift in 0..29 {
                 let field = Field::<u32, ()>::new(0x7, shift);
                 for x in 0..8 {
-                    assert_eq!(field.read_as_enum(x << shift), Foo::try_from(x));
+                    assert_eq!(field.read_as_enum(x << shift), Foo::try_from_value(x));
                 }
             }
         }

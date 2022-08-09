@@ -2,15 +2,16 @@
 
 #![crate_name = "cortexm0"]
 #![crate_type = "rlib"]
-#![feature(asm, naked_functions)]
+#![feature(asm_sym, naked_functions)]
 #![no_std]
+
+use core::fmt::Write;
 
 // Re-export the base generic cortex-m functions here as they are
 // valid on cortex-m0.
 pub use cortexm::support;
 
 pub use cortexm::nvic;
-pub use cortexm::print_cortexm_state as print_cortexm0_state;
 pub use cortexm::syscall;
 
 extern "C" {
@@ -25,22 +26,138 @@ extern "C" {
     static mut _erelocate: u32;
 }
 
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+struct HardFaultStackedRegisters {
+    r0: u32,
+    r1: u32,
+    r2: u32,
+    r3: u32,
+    r12: u32,
+    lr: u32,
+    pc: u32,
+    xpsr: u32,
+}
+
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+#[inline(never)]
+unsafe fn kernel_hardfault(faulting_stack: *mut u32) {
+    let hardfault_stacked_registers = HardFaultStackedRegisters {
+        r0: *faulting_stack.offset(0),
+        r1: *faulting_stack.offset(1),
+        r2: *faulting_stack.offset(2),
+        r3: *faulting_stack.offset(3),
+        r12: *faulting_stack.offset(4),
+        lr: *faulting_stack.offset(5),
+        pc: *faulting_stack.offset(6),
+        xpsr: *faulting_stack.offset(7),
+    };
+
+    panic!(
+        "Kernel HardFault.\r\n\
+         \tKernel version {}\r\n\
+         \tr0  0x{:x}\r\n\
+         \tr1  0x{:x}\r\n\
+         \tr2  0x{:x}\r\n\
+         \tr3  0x{:x}\r\n\
+         \tr12  0x{:x}\r\n\
+         \tlr  0x{:x}\r\n\
+         \tpc  0x{:x}\r\n\
+         \txpsr  0x{:x}\r\n\
+         ",
+        option_env!("TOCK_KERNEL_VERSION").unwrap_or("unknown"),
+        hardfault_stacked_registers.r0,
+        hardfault_stacked_registers.r1,
+        hardfault_stacked_registers.r2,
+        hardfault_stacked_registers.r3,
+        hardfault_stacked_registers.r12,
+        hardfault_stacked_registers.lr,
+        hardfault_stacked_registers.pc,
+        hardfault_stacked_registers.xpsr
+    );
+}
+
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+/// Continue the hardfault handler. This function is not `#[naked]`, meaning we
+/// can mix `asm!()` and Rust. We separate this logic to not have to write the
+/// entire fault handler entirely in assembly.
+unsafe extern "C" fn hard_fault_handler_continued(faulting_stack: *mut u32, kernel_stack: u32) {
+    use core::arch::asm;
+    if kernel_stack != 0 {
+        kernel_hardfault(faulting_stack);
+    } else {
+        // hard fault occurred in an app, not the kernel. The app should be
+        // marked as in an error state and handled by the kernel
+        asm!(
+            "
+            ldr r0, =APP_HARD_FAULT
+            movs r1, #1 /* Fault */
+            str r1, [r0, #0]
+
+            /*
+            * NOTE:
+            * -----
+            *
+            * Even though ARMv6-M SCB and Control registers
+            * are different from ARMv7-M, they are still compatible
+            * with each other. So, we can keep the same code as
+            * ARMv7-M.
+            *
+            * ARMv6-M however has no _privileged_ mode.
+            */
+
+            /* Read the SCB registers. */
+            ldr r0, =SCB_REGISTERS
+            ldr r1, =0xE000ED14
+            ldr r2, [r1, #0] /* CCR */
+            str r2, [r0, #0]
+            ldr r2, [r1, #20] /* CFSR */
+            str r2, [r0, #4]
+            ldr r2, [r1, #24] /* HFSR */
+            str r2, [r0, #8]
+            ldr r2, [r1, #32] /* MMFAR */
+            str r2, [r0, #12]
+            ldr r2, [r1, #36] /* BFAR */
+            str r2, [r0, #16]
+
+            /* Set thread mode to privileged */
+            movs r0, #0
+            msr CONTROL, r0
+            /* No ISB required on M0 */
+            /* http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dai0321a/BIHFJCAC.html */
+
+            ldr r0, 100f
+            mov lr, r0
+            b 200f // freturn
+    .align 4
+    100: // FEXC_RETURN_MSP
+      .word 0xFFFFFFF9
+    200: // freturn
+        ",
+            out("r1") _,
+            out("r0") _,
+            out("r2") _,
+            options(nostack),
+        );
+    }
+}
+
 // Mock implementation for tests on Travis-CI.
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn generic_isr() {
+unsafe extern "C" fn generic_isr() {
     unimplemented!()
 }
 
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 #[naked]
 /// All ISRs are caught by this handler which disables the NVIC and switches to the kernel.
-pub unsafe extern "C" fn generic_isr() {
+unsafe extern "C" fn generic_isr() {
+    use core::arch::asm;
     asm!(
         "
     /* Skip saving process state if not coming from user-space */
-    ldr r0, MEXC_RETURN_PSP
+    ldr r0, 300f // MEXC_RETURN_PSP
     cmp lr, r0
-    bne _ggeneric_isr_no_stacking
+    bne 100f
 
     /* We need the most recent kernel's version of r1, which points */
     /* to the Process struct's stored registers field. The kernel's r1 */
@@ -63,13 +180,13 @@ pub unsafe extern "C" fn generic_isr() {
     str r7, [r1, #12]
     pop {{r4-r7}}
 
-    ldr r0, MEXC_RETURN_MSP
-_ggeneric_isr_no_stacking:
+    ldr r0, 200f // MEXC_RETURN_MSP
+100: // _ggeneric_isr_no_stacking
     /* Find the ISR number by looking at the low byte of the IPSR registers */
     mrs r0, IPSR
     movs r1, #0xff
     ands r0, r1
-    /* ISRs start at 16, so substract 16 to get zero-indexed */
+    /* ISRs start at 16, so subtract 16 to get zero-indexed */
     subs r0, r0, #16
 
     /*
@@ -77,7 +194,7 @@ _ggeneric_isr_no_stacking:
      *    NVIC.ICER[r0 / 32] = 1 << (r0 & 31)
      * */
     /* r3 = &NVIC.ICER[r0 / 32] */
-    ldr r2, NVICICER     /* r2 = &NVIC.ICER */
+    ldr r2, 101f      /* r2 = &NVIC.ICER */
     lsrs r3, r0, #5   /* r3 = r0 / 32 */
     lsls r3, r3, #2   /* ICER is word-sized, so multiply offset by 4 */
     adds r3, r3, r2   /* r3 = r2 + r3 */
@@ -105,11 +222,11 @@ _ggeneric_isr_no_stacking:
     bx lr /* return here since we have extra words in the assembly */
 
 .align 4
-NVICICER:
+101: // NVICICER
   .word 0xE000E180
-MEXC_RETURN_MSP:
+200: // MEXC_RETURN_MSP
   .word 0xFFFFFFF9
-MEXC_RETURN_PSP:
+300: // MEXC_RETURN_PSP
   .word 0xFFFFFFFD",
         options(noreturn)
     );
@@ -117,7 +234,7 @@ MEXC_RETURN_PSP:
 
 // Mock implementation for tests on Travis-CI.
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn systick_handler() {
+unsafe extern "C" fn systick_handler() {
     unimplemented!()
 }
 
@@ -129,7 +246,8 @@ pub unsafe extern "C" fn systick_handler() {
 /// pending.
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 #[naked]
-pub unsafe extern "C" fn systick_handler() {
+unsafe extern "C" fn systick_handler() {
+    use core::arch::asm;
     asm!(
         "
     // Set thread mode to privileged to switch back to kernel mode.
@@ -139,13 +257,13 @@ pub unsafe extern "C" fn systick_handler() {
     /* http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dai0321a/BIHFJCAC.html */
     isb
 
-    ldr r0, ST_EXC_RETURN_MSP
+    ldr r0, 100f // ST_EXC_RETURN_MSP
 
     // This will resume in the switch to user function where application state
     // is saved and the scheduler can choose what to do next.
     bx   r0
 .align 4
-ST_EXC_RETURN_MSP:
+100: // ST_EXC_RETURN_MSP
   .word 0xFFFFFFF9
     ",
         options(noreturn)
@@ -154,32 +272,33 @@ ST_EXC_RETURN_MSP:
 
 // Mock implementation for tests on Travis-CI.
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn svc_handler() {
+unsafe extern "C" fn svc_handler() {
     unimplemented!()
 }
 
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 #[naked]
-pub unsafe extern "C" fn svc_handler() {
+unsafe extern "C" fn svc_handler() {
+    use core::arch::asm;
     asm!(
         "
-  ldr r0, EXC_RETURN_MSP
+  ldr r0, 200f // EXC_RETURN_MSP
   cmp lr, r0
-  bne to_kernel
-  ldr r1, EXC_RETURN_PSP
+  bne 100f
+  ldr r1, 300f // EXC_RETURN_PSP
   bx r1
 
-to_kernel:
+100: // to_kernel
   ldr r0, =SYSCALL_FIRED
   movs r1, #1
   str r1, [r0, #0]
-  ldr r1, EXC_RETURN_MSP
+  ldr r1, 200f
   bx r1
 
 .align 4
-EXC_RETURN_MSP:
+200: // EXC_RETURN_MSP
   .word 0xFFFFFFF9
-EXC_RETURN_PSP:
+300: // EXC_RETURN_PSP
   .word 0xFFFFFFFD
   ",
         options(noreturn)
@@ -188,20 +307,75 @@ EXC_RETURN_PSP:
 
 // Mock implementation for tests on Travis-CI.
 #[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn switch_to_user(
-    _user_stack: *const u8,
-    _process_regs: &mut [usize; 8],
-) -> *mut u8 {
+unsafe extern "C" fn hard_fault_handler() {
     unimplemented!()
 }
-
 #[cfg(all(target_arch = "arm", target_os = "none"))]
-#[no_mangle]
-pub unsafe extern "C" fn switch_to_user(
-    mut user_stack: *const u8,
-    process_regs: &mut [usize; 8],
-) -> *mut u8 {
+#[naked]
+unsafe extern "C" fn hard_fault_handler() {
+    use core::arch::asm;
+    // If `kernel_stack` is non-zero, then hard-fault occurred in
+    // kernel, otherwise the hard-fault occurred in user.
     asm!("
+    /*
+     * Will be incremented to 1 when we determine that it was a fault
+     * in the kernel
+     */
+    movs r1, #0
+    /*
+     * r2 is used for testing and r3 is used to store lr
+     */
+    mov r3, lr
+
+    movs r2, #4
+    tst r3, r2
+    beq 100f
+
+// _hardfault_psp:
+    mrs r0, psp
+    b 200f
+
+100: // _hardfault_msp
+    mrs r0, msp
+    adds r1, #1
+
+200: // _hardfault_exit
+
+    b {}    // Branch to the non-naked fault handler.
+    bx lr   // If continued function returns, we need to manually branch to
+            // link register.
+    ",
+    sym hard_fault_handler_continued,
+    options(noreturn));
+}
+
+// Enum with no variants to ensure that this type is not instantiable. It is
+// only used to pass architecture-specific constants and functions via the
+// `CortexMVariant` trait.
+pub enum CortexM0 {}
+
+impl cortexm::CortexMVariant for CortexM0 {
+    const GENERIC_ISR: unsafe extern "C" fn() = generic_isr;
+    const SYSTICK_HANDLER: unsafe extern "C" fn() = systick_handler;
+    const SVC_HANDLER: unsafe extern "C" fn() = svc_handler;
+    const HARD_FAULT_HANDLER: unsafe extern "C" fn() = hard_fault_handler;
+
+    // Mock implementation for tests on Travis-CI.
+    #[cfg(not(any(target_arch = "arm", target_os = "none")))]
+    unsafe fn switch_to_user(
+        _user_stack: *const usize,
+        _process_regs: &mut [usize; 8],
+    ) -> *const usize {
+        unimplemented!()
+    }
+
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    unsafe fn switch_to_user(
+        mut user_stack: *const usize,
+        process_regs: &mut [usize; 8],
+    ) -> *const usize {
+        use core::arch::asm;
+        asm!("
     // Rust `asm!()` macro (as of May 2021) will not let us mark r6, r7 and r9
     // as clobbers. r6 and r9 is used internally by LLVM, and r7 is used for
     // the frame pointer. However, in the process of restoring and saving the
@@ -256,160 +430,14 @@ pub unsafe extern "C" fn switch_to_user(
     ",
     inout("r0") user_stack,
     in("r1") process_regs,
-    out("r2") _, out("r3") _, out("r4") _, out("r5") _, out("r8") _, 
+    out("r2") _, out("r3") _, out("r4") _, out("r5") _, out("r8") _,
     out("r10") _, out("r11") _, out("r12") _);
 
-    user_stack as *mut u8
-}
-
-#[cfg(all(target_arch = "arm", target_os = "none"))]
-struct HardFaultStackedRegisters {
-    r0: u32,
-    r1: u32,
-    r2: u32,
-    r3: u32,
-    r12: u32,
-    lr: u32,
-    pc: u32,
-    xpsr: u32,
-}
-
-#[cfg(all(target_arch = "arm", target_os = "none"))]
-#[inline(never)]
-unsafe fn kernel_hardfault(faulting_stack: *mut u32) {
-    let hardfault_stacked_registers = HardFaultStackedRegisters {
-        r0: *faulting_stack.offset(0),
-        r1: *faulting_stack.offset(1),
-        r2: *faulting_stack.offset(2),
-        r3: *faulting_stack.offset(3),
-        r12: *faulting_stack.offset(4),
-        lr: *faulting_stack.offset(5),
-        pc: *faulting_stack.offset(6),
-        xpsr: *faulting_stack.offset(7),
-    };
-
-    panic!(
-        "Kernel HardFault.\r\n\
-         \tKernel version {}\r\n\
-         \tr0  0x{:x}\r\n\
-         \tr1  0x{:x}\r\n\
-         \tr2  0x{:x}\r\n\
-         \tr3  0x{:x}\r\n\
-         \tr12  0x{:x}\r\n\
-         \tlr  0x{:x}\r\n\
-         \tpc  0x{:x}\r\n\
-         \txpsr  0x{:x}\r\n\
-         ",
-        option_env!("TOCK_KERNEL_VERSION").unwrap_or("unknown"),
-        hardfault_stacked_registers.r0,
-        hardfault_stacked_registers.r1,
-        hardfault_stacked_registers.r2,
-        hardfault_stacked_registers.r3,
-        hardfault_stacked_registers.r12,
-        hardfault_stacked_registers.lr,
-        hardfault_stacked_registers.pc,
-        hardfault_stacked_registers.xpsr
-    );
-}
-
-// Mock implementation for tests on Travis-CI.
-#[cfg(not(any(target_arch = "arm", target_os = "none")))]
-pub unsafe extern "C" fn hard_fault_handler() {
-    unimplemented!()
-}
-
-#[cfg(all(target_arch = "arm", target_os = "none"))]
-/// Continue the hardfault handler. This function is not `#[naked]`, meaning we
-/// can mix `asm!()` and Rust. We separate this logic to not have to write the
-/// entire fault handler entirely in assembly.
-unsafe extern "C" fn hard_fault_handler_continued(faulting_stack: *mut u32, kernel_stack: u32) {
-    if kernel_stack != 0 {
-        kernel_hardfault(faulting_stack);
-    } else {
-        // hard fault occurred in an app, not the kernel. The app should be
-        // marked as in an error state and handled by the kernel
-        asm!(
-            "
-            ldr r0, =APP_HARD_FAULT
-            movs r1, #1 /* Fault */
-            str r1, [r0, #0]
-
-            /*
-            * NOTE:
-            * -----
-            *
-            * Even though ARMv6-M SCB and Control registers
-            * are different from ARMv7-M, they are still compatible
-            * with each other. So, we can keep the same code as
-            * ARMv7-M.
-            *
-            * ARMv6-M however has no _privileged_ mode.
-            */
-
-            /* Read the SCB registers. */
-            ldr r0, =SCB_REGISTERS
-            ldr r1, =0xE000ED14
-            ldr r2, [r1, #0] /* CCR */
-            str r2, [r0, #0]
-            ldr r2, [r1, #20] /* CFSR */
-            str r2, [r0, #4]
-            ldr r2, [r1, #24] /* HFSR */
-            str r2, [r0, #8]
-            ldr r2, [r1, #32] /* MMFAR */
-            str r2, [r0, #12]
-            ldr r2, [r1, #36] /* BFAR */
-            str r2, [r0, #16]
-
-            /* Set thread mode to privileged */
-            movs r0, #0
-            msr CONTROL, r0
-            /* No ISB required on M0 */
-            /* http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dai0321a/BIHFJCAC.html */
-
-            ldr r0, FEXC_RETURN_MSP
-            bx r0
-    .align 4
-    FEXC_RETURN_MSP:
-      .word 0xFFFFFFF9
-        "
-        );
+        user_stack
     }
-}
 
-#[cfg(all(target_arch = "arm", target_os = "none"))]
-#[naked]
-pub unsafe extern "C" fn hard_fault_handler() {
-    // If `kernel_stack` is non-zero, then hard-fault occurred in
-    // kernel, otherwise the hard-fault occurred in user.
-    asm!("
-    /*
-     * Will be incremented to 1 when we determine that it was a fault
-     * in the kernel
-     */
-    movs r1, #0
-    /*
-     * r2 is used for testing and r3 is used to store lr
-     */
-    mov r3, lr
-
-    movs r2, #4
-    tst r3, r2
-    beq _hardfault_msp
-
-_hardfault_psp:
-    mrs r0, psp
-    b _hardfault_exit
-
-_hardfault_msp:
-    mrs r0, msp
-    adds r1, #1
-
-_hardfault_exit:
-
-    b {}    // Branch to the non-naked fault handler.
-    bx lr   // If continued function returns, we need to manually branch to
-            // link register.
-    ",
-    sym hard_fault_handler_continued,
-    options(noreturn));
+    #[inline]
+    unsafe fn print_cortexm_state(writer: &mut dyn Write) {
+        cortexm::print_cortexm_state(writer)
+    }
 }

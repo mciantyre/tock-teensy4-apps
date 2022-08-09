@@ -3,7 +3,7 @@
 
 use core::cell::Cell;
 
-use kernel::grant::Grant;
+use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil::time::{self, Alarm, Frequency, Ticks, Ticks32};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::{ErrorCode, ProcessId};
@@ -24,7 +24,7 @@ pub struct AlarmData {
 }
 
 const ALARM_CALLBACK_NUM: usize = 0;
-const NUM_UPCALLS: usize = 1;
+const NUM_UPCALLS: u8 = 1;
 
 impl Default for AlarmData {
     fn default() -> AlarmData {
@@ -37,12 +37,15 @@ impl Default for AlarmData {
 pub struct AlarmDriver<'a, A: Alarm<'a>> {
     alarm: &'a A,
     num_armed: Cell<usize>,
-    app_alarms: Grant<AlarmData, NUM_UPCALLS>,
+    app_alarms: Grant<AlarmData, UpcallCount<NUM_UPCALLS>, AllowRoCount<0>, AllowRwCount<0>>,
     next_alarm: Cell<Expiration>,
 }
 
 impl<'a, A: Alarm<'a>> AlarmDriver<'a, A> {
-    pub const fn new(alarm: &'a A, grant: Grant<AlarmData, NUM_UPCALLS>) -> AlarmDriver<'a, A> {
+    pub const fn new(
+        alarm: &'a A,
+        grant: Grant<AlarmData, UpcallCount<NUM_UPCALLS>, AllowRoCount<0>, AllowRwCount<0>>,
+    ) -> AlarmDriver<'a, A> {
         AlarmDriver {
             alarm: alarm,
             num_armed: Cell::new(0),
@@ -210,12 +213,8 @@ impl<'a, A: Alarm<'a>> SyscallDriver for AlarmDriver<'a, A> {
                             }
                         }
                     },
-                    4 /* Set absolute expiration */ => {
-                        let reference = now.into_u32() as usize;
-                        let future_time = data;
-                        let dt = future_time.wrapping_sub(reference);
-                        // if previously unarmed, but now will become armed
-                        rearm(reference, dt)
+                    4 /* Deprecated in 2.0, used to be: set absolute expiration */ => {
+                        (CommandReturn::failure(ErrorCode::NOSUPPORT), false)
                     },
                     5 /* Set relative expiration */ => {
                         let reference = now.into_u32() as usize;
@@ -224,11 +223,6 @@ impl<'a, A: Alarm<'a>> SyscallDriver for AlarmDriver<'a, A> {
                         rearm(reference, dt)
                     },
                     6 /* Set absolute expiration with reference point */ => {
-                        // Taking a reference timestamp from userspace
-                        // prevents wraparound bugs; future versions of
-                        // libtock will use only this call and deprecate
-                        // command #4; for now it is added as an additional
-                        // comamnd for backwards compatibility. -pal
                         let reference = data;
                         let dt = data2;
                         rearm(reference, dt)

@@ -15,9 +15,9 @@ Running
 -------
 
 FuseSoC can be used to run SweRVolf on either an FPGA board or in a simulation
-enviroment.
+environment.
 
-Tock has been tested on the simulation enviroment.
+Tock has been tested on the simulation environment.
 
 Running in simulation with EH1 core
 -----------------------------------
@@ -54,8 +54,8 @@ make sim
 NOTE: The Verilator simulation can be slow. Below are some rough estimates
 of time when running on a standard x64 laptop.
 
-Boot, hardware initalise, first print: 20 seconds
-Boot, hardware initalise, panic: 30 seconds
+Boot, hardware initialise, first print: 20 seconds
+Boot, hardware initialise, panic: 30 seconds
 
 The below diff below can be used to increase the simulation speed, with no
 functionality impact.

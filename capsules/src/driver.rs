@@ -16,6 +16,8 @@ pub enum NUM {
     Adc                   = 0x00005,
     Dac                   = 0x00006,
     AnalogComparator      = 0x00007,
+    LowLevelDebug         = 0x00008,
+    ReadOnlyState         = 0x00009,
 
     // Kernel
     Ipc                   = 0x10000,
@@ -38,11 +40,13 @@ pub enum NUM {
     Hmac                  = 0x40003,
     CtapHid               = 0x40004,
     Sha                   = 0x40005,
+    Aes                   = 0x40006,
 
     // Storage
     AppFlash              = 0x50000,
     NvmStorage            = 0x50001,
     SdCard                = 0x50002,
+    KVSystem              = 0x50003,
 
     // Sensors
     Temperature           = 0x60000,
@@ -51,6 +55,7 @@ pub enum NUM {
     NINEDOF               = 0x60004,
     Proximity             = 0x60005,
     SoundPressure         = 0x60006,
+    AirQuality            = 0x60007,
 
     // Sensor ICs
     Tsl2561               = 0x70000,
@@ -59,6 +64,7 @@ pub enum NUM {
     L3gd20                = 0x70005,
     Lsm303dlch            = 0x70006,
     Mlx90614              = 0x70007,
+    Lsm6dsoxtr            = 0x70008,
 
     // Other ICs
     Ltc294x               = 0x80000,
@@ -72,5 +78,6 @@ pub enum NUM {
     Screen                = 0x90001,
     Touch                 = 0x90002,
     TextScreen            = 0x90003,
+    SevenSegment          = 0x90004,
 }
 }

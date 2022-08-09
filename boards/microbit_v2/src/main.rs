@@ -64,12 +64,12 @@ const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::Panic
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
-const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
     [None; NUM_PROCS];
 
 static mut CHIP: Option<&'static nrf52833::chip::NRF52<Nrf52833DefaultPeripherals>> = None;
+static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
@@ -87,17 +87,21 @@ pub struct MicroBit {
     >,
     console: &'static capsules::console::Console<'static>,
     gpio: &'static capsules::gpio::GPIO<'static, nrf52::gpio::GPIOPin<'static>>,
-    led: &'static capsules::led_matrix::LedMatrixDriver<
+    led: &'static capsules::led::LedDriver<
         'static,
-        nrf52::gpio::GPIOPin<'static>,
-        capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
+        capsules::led_matrix::LedMatrixLed<
+            'static,
+            nrf52::gpio::GPIOPin<'static>,
+            capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
+        >,
+        25,
     >,
     button: &'static capsules::button::Button<'static, nrf52::gpio::GPIOPin<'static>>,
     rng: &'static capsules::rng::RngDriver<'static>,
     ninedof: &'static capsules::ninedof::NineDof<'static>,
     lsm303agr: &'static capsules::lsm303agr::Lsm303agrI2C<'static>,
     temperature: &'static capsules::temperature::TemperatureSensor<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
+    ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
     adc: &'static capsules::adc::AdcVirtualized<'static>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
@@ -124,7 +128,7 @@ impl SyscallDriverLookup for MicroBit {
             capsules::gpio::DRIVER_NUM => f(Some(self.gpio)),
             capsules::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules::button::DRIVER_NUM => f(Some(self.button)),
-            capsules::led_matrix::DRIVER_NUM => f(Some(self.led)),
+            capsules::led::DRIVER_NUM => f(Some(self.led)),
             capsules::ninedof::DRIVER_NUM => f(Some(self.ninedof)),
             capsules::adc::DRIVER_NUM => f(Some(self.adc)),
             capsules::temperature::DRIVER_NUM => f(Some(self.temperature)),
@@ -149,6 +153,7 @@ impl KernelResources<nrf52833::chip::NRF52<'static, Nrf52833DefaultPeripherals<'
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm4::systick::SysTick;
     type WatchDog = ();
+    type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         &self
@@ -166,6 +171,9 @@ impl KernelResources<nrf52833::chip::NRF52<'static, Nrf52833DefaultPeripherals<'
         &self.systick
     }
     fn watchdog(&self) -> &Self::WatchDog {
+        &()
+    }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
         &()
     }
 }
@@ -320,6 +328,8 @@ pub unsafe fn main() {
         capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52833::rtc::Rtc>,
         capsules::virtual_alarm::VirtualMuxAlarm::new(mux_alarm)
     );
+    virtual_alarm_buzzer.setup();
+
     let buzzer = static_init!(
         capsules::buzzer_driver::Buzzer<
             'static,
@@ -362,7 +372,7 @@ pub unsafe fn main() {
         capsules::console::DRIVER_NUM,
         uart_mux,
     )
-    .finalize(());
+    .finalize(components::console_component_helper!());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -483,7 +493,7 @@ pub unsafe fn main() {
         ),
     );
 
-    &nrf52833_peripherals.gpio_port[LED_MICROPHONE_PIN].set_high_drive(true);
+    let _ = &nrf52833_peripherals.gpio_port[LED_MICROPHONE_PIN].set_high_drive(true);
 
     let sound_pressure = components::sound_pressure::SoundPressureComponent::new(
         board_kernel,
@@ -532,7 +542,7 @@ pub unsafe fn main() {
     // LED Matrix
     //--------------------------------------------------------------------------
 
-    let led = components::led_matrix_component_helper!(
+    let led_matrix = components::led_matrix_component_helper!(
         nrf52833::gpio::GPIOPin,
         nrf52::rtc::Rtc<'static>,
         mux_alarm,
@@ -556,13 +566,65 @@ pub unsafe fn main() {
         nrf52::rtc::Rtc<'static>
     ));
 
+    let led = static_init!(
+        capsules::led::LedDriver<
+            'static,
+            capsules::led_matrix::LedMatrixLed<
+                'static,
+                nrf52::gpio::GPIOPin<'static>,
+                capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
+            >,
+            25,
+        >,
+        capsules::led::LedDriver::new(components::led_matrix_leds!(
+            nrf52::gpio::GPIOPin<'static>,
+            capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
+            led_matrix,
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (0, 2),
+            (1, 2),
+            (2, 2),
+            (3, 2),
+            (4, 2),
+            (0, 3),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+            (4, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+            (4, 4)
+        )),
+    );
+
     //--------------------------------------------------------------------------
     // Process Console
     //--------------------------------------------------------------------------
-    let process_console =
-        components::process_console::ProcessConsoleComponent::new(board_kernel, uart_mux)
-            .finalize(());
-    let _ = process_console.start();
+    let process_printer =
+        components::process_printer::ProcessPrinterTextComponent::new().finalize(());
+    PROCESS_PRINTER = Some(process_printer);
+
+    let _process_console = components::process_console::ProcessConsoleComponent::new(
+        board_kernel,
+        uart_mux,
+        mux_alarm,
+        process_printer,
+    )
+    .finalize(components::process_console_component_helper!(
+        nrf52833::rtc::Rtc
+    ));
+    let _ = _process_console.start();
 
     //--------------------------------------------------------------------------
     // FINAL SETUP AND BOARD BOOT
@@ -616,7 +678,7 @@ pub unsafe fn main() {
     // PROCESSES AND MAIN LOOP
     //--------------------------------------------------------------------------
 
-    /// These symbols are defined in the linker script.
+    // These symbols are defined in the linker script.
     extern "C" {
         /// Beginning of the ROM region containing app images.
         static _sapps: u8;

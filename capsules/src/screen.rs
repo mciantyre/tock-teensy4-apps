@@ -12,12 +12,11 @@
 
 use core::cell::Cell;
 use core::convert::From;
-use core::mem;
 
-use kernel::grant::Grant;
+use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil;
 use kernel::hil::screen::{ScreenPixelFormat, ScreenRotation};
-use kernel::processbuffer::{ReadOnlyProcessBuffer, ReadableProcessBuffer};
+use kernel::processbuffer::ReadableProcessBuffer;
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::{ErrorCode, ProcessId};
@@ -25,6 +24,13 @@ use kernel::{ErrorCode, ProcessId};
 /// Syscall driver number.
 use crate::driver;
 pub const DRIVER_NUM: usize = driver::NUM::Screen as usize;
+
+/// Ids for read-only allow buffers
+mod ro_allow {
+    pub const SHARED: usize = 0;
+    /// The number of allow buffers the kernel stores for this grant
+    pub const COUNT: u8 = 1;
+}
 
 fn screen_rotation_from(screen_rotation: usize) -> Option<ScreenRotation> {
     match screen_rotation {
@@ -51,20 +57,13 @@ fn screen_pixel_format_from(screen_pixel_format: usize) -> Option<ScreenPixelFor
 enum ScreenCommand {
     Nop,
     SetBrightness(usize),
-    InvertOn,
-    InvertOff,
-    GetSupportedResolutionModes,
-    GetSupportedResolution(usize),
-    GetSupportedPixelFormats,
-    GetSupportedPixelFormat(usize),
-    GetRotation,
+    SetPower(bool),
+    SetInvert(bool),
     SetRotation(ScreenRotation),
-    GetResolution,
     SetResolution {
         width: usize,
         height: usize,
     },
-    GetPixelFormat,
     SetPixelFormat(ScreenPixelFormat),
     SetWriteFrame {
         x: usize,
@@ -87,7 +86,6 @@ fn pixels_in_bytes(pixels: usize, bits_per_pixel: usize) -> usize {
 
 pub struct App {
     pending_command: bool,
-    shared: ReadOnlyProcessBuffer,
     write_position: usize,
     write_len: usize,
     command: ScreenCommand,
@@ -99,7 +97,6 @@ impl Default for App {
     fn default() -> App {
         App {
             pending_command: false,
-            shared: ReadOnlyProcessBuffer::default(),
             command: ScreenCommand::Nop,
             width: 0,
             height: 0,
@@ -112,8 +109,7 @@ impl Default for App {
 pub struct Screen<'a> {
     screen: &'a dyn hil::screen::Screen,
     screen_setup: Option<&'a dyn hil::screen::ScreenSetup>,
-    apps: Grant<App, 1>,
-    screen_ready: Cell<bool>,
+    apps: Grant<App, UpcallCount<1>, AllowRoCount<{ ro_allow::COUNT }>, AllowRwCount<0>>,
     current_process: OptionalCell<ProcessId>,
     pixel_format: Cell<ScreenPixelFormat>,
     buffer: TakeCell<'static, [u8]>,
@@ -124,14 +120,13 @@ impl<'a> Screen<'a> {
         screen: &'a dyn hil::screen::Screen,
         screen_setup: Option<&'a dyn hil::screen::ScreenSetup>,
         buffer: &'static mut [u8],
-        grant: Grant<App, 1>,
+        grant: Grant<App, UpcallCount<1>, AllowRoCount<{ ro_allow::COUNT }>, AllowRwCount<0>>,
     ) -> Screen<'a> {
         Screen {
             screen: screen,
             screen_setup: screen_setup,
             apps: grant,
             current_process: OptionalCell::empty(),
-            screen_ready: Cell::new(false),
             pixel_format: Cell::new(screen.get_pixel_format()),
             buffer: TakeCell::new(buffer),
         }
@@ -157,7 +152,7 @@ impl<'a> Screen<'a> {
         {
             Err(e) => CommandReturn::failure(e),
             Ok(r) => {
-                if self.screen_ready.get() && self.current_process.is_none() {
+                if self.current_process.is_none() {
                     self.current_process.set(process_id);
                     let r = self.call_screen(command, process_id);
                     if r != Ok(()) {
@@ -171,26 +166,22 @@ impl<'a> Screen<'a> {
         }
     }
 
+    fn is_len_multiple_color_depth(&self, len: usize) -> bool {
+        let depth = pixels_in_bytes(1, self.screen.get_pixel_format().get_bits_per_pixel());
+        (len % depth) == 0
+    }
+
     fn call_screen(&self, command: ScreenCommand, process_id: ProcessId) -> Result<(), ErrorCode> {
         match command {
             ScreenCommand::SetBrightness(brighness) => self.screen.set_brightness(brighness),
-            ScreenCommand::InvertOn => self.screen.invert_on(),
-            ScreenCommand::InvertOff => self.screen.invert_off(),
+            ScreenCommand::SetPower(enabled) => self.screen.set_power(enabled),
+            ScreenCommand::SetInvert(enabled) => self.screen.set_invert(enabled),
             ScreenCommand::SetRotation(rotation) => {
                 if let Some(screen) = self.screen_setup {
                     screen.set_rotation(rotation)
                 } else {
                     Err(ErrorCode::NOSUPPORT)
                 }
-            }
-            ScreenCommand::GetRotation => {
-                let rotation = self.screen.get_rotation();
-                self.run_next_command(
-                    kernel::errorcode::into_statuscode(Ok(())),
-                    rotation as usize,
-                    0,
-                );
-                Ok(())
             }
             ScreenCommand::SetResolution { width, height } => {
                 if let Some(screen) = self.screen_setup {
@@ -199,11 +190,6 @@ impl<'a> Screen<'a> {
                     Err(ErrorCode::NOSUPPORT)
                 }
             }
-            ScreenCommand::GetResolution => {
-                let (width, height) = self.screen.get_resolution();
-                self.run_next_command(kernel::errorcode::into_statuscode(Ok(())), width, height);
-                Ok(())
-            }
             ScreenCommand::SetPixelFormat(pixel_format) => {
                 if let Some(screen) = self.screen_setup {
                     screen.set_pixel_format(pixel_format)
@@ -211,94 +197,24 @@ impl<'a> Screen<'a> {
                     Err(ErrorCode::NOSUPPORT)
                 }
             }
-            ScreenCommand::GetPixelFormat => {
-                let pixel_format = self.screen.get_pixel_format();
-                self.run_next_command(
-                    kernel::errorcode::into_statuscode(Ok(())),
-                    pixel_format as usize,
-                    0,
-                );
-                Ok(())
-            }
-            ScreenCommand::GetSupportedResolutionModes => {
-                if let Some(screen) = self.screen_setup {
-                    let resolution_modes = screen.get_num_supported_resolutions();
-                    self.run_next_command(
-                        kernel::errorcode::into_statuscode(Ok(())),
-                        resolution_modes,
-                        0,
-                    );
-                    Ok(())
-                } else {
-                    Err(ErrorCode::NOSUPPORT)
-                }
-            }
-            ScreenCommand::GetSupportedResolution(resolution_index) => {
-                if let Some(screen) = self.screen_setup {
-                    if let Some((width, height)) = screen.get_supported_resolution(resolution_index)
-                    {
-                        self.run_next_command(
-                            kernel::errorcode::into_statuscode(if width > 0 && height > 0 {
-                                Ok(())
-                            } else {
-                                Err(ErrorCode::INVAL)
-                            }),
-                            width,
-                            height,
-                        );
-                        Ok(())
-                    } else {
-                        Err(ErrorCode::INVAL)
-                    }
-                } else {
-                    Err(ErrorCode::NOSUPPORT)
-                }
-            }
-            ScreenCommand::GetSupportedPixelFormats => {
-                if let Some(screen) = self.screen_setup {
-                    let color_modes = screen.get_num_supported_pixel_formats();
-                    self.run_next_command(
-                        kernel::errorcode::into_statuscode(Ok(())),
-                        color_modes,
-                        0,
-                    );
-                    Ok(())
-                } else {
-                    Err(ErrorCode::NOSUPPORT)
-                }
-            }
-            ScreenCommand::GetSupportedPixelFormat(pixel_format_index) => {
-                if let Some(screen) = self.screen_setup {
-                    if let Some(pixel_format) =
-                        screen.get_supported_pixel_format(pixel_format_index)
-                    {
-                        self.run_next_command(
-                            kernel::errorcode::into_statuscode(Ok(())),
-                            pixel_format as usize,
-                            0,
-                        );
-                        Ok(())
-                    } else {
-                        Err(ErrorCode::INVAL)
-                    }
-                } else {
-                    Err(ErrorCode::NOSUPPORT)
-                }
-            }
             ScreenCommand::Fill => match self
                 .apps
-                .enter(process_id, |app, _| {
-                    // if it is larger than 0, we know it fits
-                    // the size has been verified by subscribe
-                    if app.shared.len() > 0 {
+                .enter(process_id, |app, kernel_data| {
+                    let len = kernel_data
+                        .get_readonly_processbuffer(ro_allow::SHARED)
+                        .map_or(0, |shared| shared.len());
+                    // Ensure we have a buffer that is the correct size
+                    if len == 0 {
+                        Err(ErrorCode::NOMEM)
+                    } else if !self.is_len_multiple_color_depth(len) {
+                        Err(ErrorCode::INVAL)
+                    } else {
                         app.write_position = 0;
                         app.write_len = pixels_in_bytes(
                             app.width * app.height,
                             self.pixel_format.get().get_bits_per_pixel(),
                         );
                         Ok(())
-                    } else {
-                        Err(ErrorCode::NOMEM)
                     }
                 })
                 .unwrap_or_else(|err| err.into())
@@ -318,18 +234,20 @@ impl<'a> Screen<'a> {
 
             ScreenCommand::Write(data_len) => match self
                 .apps
-                .enter(process_id, |app, _| {
-                    let len = if app.shared.len() < data_len {
-                        app.shared.len()
+                .enter(process_id, |app, kernel_data| {
+                    let len = kernel_data
+                        .get_readonly_processbuffer(ro_allow::SHARED)
+                        .map_or(0, |shared| shared.len())
+                        .min(data_len);
+                    // Ensure we have a buffer that is the correct size
+                    if len == 0 {
+                        Err(ErrorCode::NOMEM)
+                    } else if !self.is_len_multiple_color_depth(len) {
+                        Err(ErrorCode::INVAL)
                     } else {
-                        data_len
-                    };
-                    if len > 0 {
                         app.write_position = 0;
                         app.write_len = len;
                         Ok(())
-                    } else {
-                        Err(ErrorCode::NOMEM)
                     }
                 })
                 .unwrap_or_else(|err| err.into())
@@ -366,16 +284,12 @@ impl<'a> Screen<'a> {
     }
 
     fn schedule_callback(&self, data1: usize, data2: usize, data3: usize) {
-        if !self.screen_ready.get() {
-            self.screen_ready.set(true);
-        } else {
-            self.current_process.take().map(|process_id| {
-                let _ = self.apps.enter(process_id, |app, upcalls| {
-                    app.pending_command = false;
-                    upcalls.schedule_upcall(0, (data1, data2, data3)).ok();
-                });
+        self.current_process.take().map(|process_id| {
+            let _ = self.apps.enter(process_id, |app, upcalls| {
+                app.pending_command = false;
+                upcalls.schedule_upcall(0, (data1, data2, data3)).ok();
             });
-        }
+        });
     }
 
     fn run_next_command(&self, data1: usize, data2: usize, data3: usize) {
@@ -415,7 +329,7 @@ impl<'a> Screen<'a> {
             || 0,
             |process_id| {
                 self.apps
-                    .enter(*process_id, |app, _| {
+                    .enter(*process_id, |app, kernel_data| {
                         let position = app.write_position;
                         let mut len = app.write_len;
                         if position < len {
@@ -425,24 +339,26 @@ impl<'a> Screen<'a> {
                             let mut pos = initial_pos;
                             match app.command {
                                 ScreenCommand::Write(_) => {
-                                    let res = app
-                                        .shared
-                                        .enter(|s| {
-                                            let mut chunks = s.chunks(buffer_size);
-                                            if let Some(chunk) = chunks.nth(chunk_number) {
-                                                for (i, byte) in chunk.iter().enumerate() {
-                                                    if pos < len {
-                                                        buffer[i] = byte.get();
-                                                        pos = pos + 1
-                                                    } else {
-                                                        break;
+                                    let res = kernel_data
+                                        .get_readonly_processbuffer(ro_allow::SHARED)
+                                        .and_then(|shared| {
+                                            shared.enter(|s| {
+                                                let mut chunks = s.chunks(buffer_size);
+                                                if let Some(chunk) = chunks.nth(chunk_number) {
+                                                    for (i, byte) in chunk.iter().enumerate() {
+                                                        if pos < len {
+                                                            buffer[i] = byte.get();
+                                                            pos = pos + 1
+                                                        } else {
+                                                            break;
+                                                        }
                                                     }
+                                                    app.write_len - initial_pos
+                                                } else {
+                                                    // stop writing
+                                                    0
                                                 }
-                                                app.write_len - initial_pos
-                                            } else {
-                                                // stop writing
-                                                0
-                                            }
+                                            })
                                         })
                                         .unwrap_or(0);
                                     if res > 0 {
@@ -463,22 +379,25 @@ impl<'a> Screen<'a> {
                                     };
                                     app.write_position =
                                         app.write_position + write_len * bytes_per_pixel;
-                                    app.shared
-                                        .enter(|data| {
-                                            let mut bytes = data.iter();
-                                            // bytes per pixel
-                                            for i in 0..bytes_per_pixel {
-                                                if let Some(byte) = bytes.next() {
-                                                    buffer[i] = byte.get();
-                                                }
-                                            }
-                                            for i in 1..write_len {
+                                    kernel_data
+                                        .get_readonly_processbuffer(ro_allow::SHARED)
+                                        .and_then(|shared| {
+                                            shared.enter(|data| {
+                                                let mut bytes = data.iter();
                                                 // bytes per pixel
-                                                for j in 0..bytes_per_pixel {
-                                                    buffer[bytes_per_pixel * i + j] = buffer[j]
+                                                for i in 0..bytes_per_pixel {
+                                                    if let Some(byte) = bytes.next() {
+                                                        buffer[i] = byte.get();
+                                                    }
                                                 }
-                                            }
-                                            write_len * bytes_per_pixel
+                                                for i in 1..write_len {
+                                                    // bytes per pixel
+                                                    for j in 0..bytes_per_pixel {
+                                                        buffer[bytes_per_pixel * i + j] = buffer[j]
+                                                    }
+                                                }
+                                                write_len * bytes_per_pixel
+                                            })
                                         })
                                         .unwrap_or(0)
                                 }
@@ -537,25 +456,61 @@ impl<'a> SyscallDriver for Screen<'a> {
             }
             // Does it have the screen setup
             1 => CommandReturn::success_u32(self.screen_setup.is_some() as u32),
+            // Set power
+            2 => self.enqueue_command(ScreenCommand::SetPower(data1 != 0), process_id),
             // Set Brightness
             3 => self.enqueue_command(ScreenCommand::SetBrightness(data1), process_id),
-            // Invert On
-            4 => self.enqueue_command(ScreenCommand::InvertOn, process_id),
-            // Invert Off
-            5 => self.enqueue_command(ScreenCommand::InvertOff, process_id),
+            // Invert on (deprecated)
+            4 => self.enqueue_command(ScreenCommand::SetInvert(true), process_id),
+            // Invert off (deprecated)
+            5 => self.enqueue_command(ScreenCommand::SetInvert(false), process_id),
+            // Set Invert
+            6 => self.enqueue_command(ScreenCommand::SetInvert(data1 != 0), process_id),
 
-            // Get Resolution Modes Number
-            11 => self.enqueue_command(ScreenCommand::GetSupportedResolutionModes, process_id),
+            // Get Resolution Modes count
+            11 => {
+                if let Some(screen) = self.screen_setup {
+                    CommandReturn::success_u32(screen.get_num_supported_resolutions() as u32)
+                } else {
+                    CommandReturn::failure(ErrorCode::NOSUPPORT)
+                }
+            }
             // Get Resolution Mode Width and Height
-            12 => self.enqueue_command(ScreenCommand::GetSupportedResolution(data1), process_id),
+            12 => {
+                if let Some(screen) = self.screen_setup {
+                    match screen.get_supported_resolution(data1) {
+                        Some((width, height)) if width > 0 && height > 0 => {
+                            CommandReturn::success_u32_u32(width as u32, height as u32)
+                        }
+                        _ => CommandReturn::failure(ErrorCode::INVAL),
+                    }
+                } else {
+                    CommandReturn::failure(ErrorCode::NOSUPPORT)
+                }
+            }
 
-            // Get Color Depth Modes Number
-            13 => self.enqueue_command(ScreenCommand::GetSupportedPixelFormats, process_id),
-            // Get Color Depth Mode Bits per Pixel
-            14 => self.enqueue_command(ScreenCommand::GetSupportedPixelFormat(data1), process_id),
+            // Get pixel format Modes count
+            13 => {
+                if let Some(screen) = self.screen_setup {
+                    CommandReturn::success_u32(screen.get_num_supported_pixel_formats() as u32)
+                } else {
+                    CommandReturn::failure(ErrorCode::NOSUPPORT)
+                }
+            }
+            // Get supported pixel format
+            14 => {
+                if let Some(screen) = self.screen_setup {
+                    match screen.get_supported_pixel_format(data1) {
+                        Some(pixel_format) => CommandReturn::success_u32(pixel_format as u32),
+                        _ => CommandReturn::failure(ErrorCode::INVAL),
+                    }
+                } else {
+                    CommandReturn::failure(ErrorCode::NOSUPPORT)
+                }
+            }
 
             // Get Rotation
-            21 => self.enqueue_command(ScreenCommand::GetRotation, process_id),
+            21 => CommandReturn::success_u32(self.screen.get_rotation() as u32),
             // Set Rotation
             22 => self.enqueue_command(
                 ScreenCommand::SetRotation(
@@ -565,7 +520,10 @@ impl<'a> SyscallDriver for Screen<'a> {
             ),
 
             // Get Resolution
-            23 => self.enqueue_command(ScreenCommand::GetResolution, process_id),
+            23 => {
+                let (width, height) = self.screen.get_resolution();
+                CommandReturn::success_u32_u32(width as u32, height as u32)
+            }
             // Set Resolution
             24 => self.enqueue_command(
                 ScreenCommand::SetResolution {
@@ -575,9 +533,9 @@ impl<'a> SyscallDriver for Screen<'a> {
                 process_id,
             ),
 
-            // Get Color Depth
-            25 => self.enqueue_command(ScreenCommand::GetPixelFormat, process_id),
-            // Set Color Depth
+            // Get pixel format
+            25 => CommandReturn::success_u32(self.screen.get_pixel_format() as u32),
+            // Set pixel format
             26 => {
                 if let Some(pixel_format) = screen_pixel_format_from(data1) {
                     self.enqueue_command(ScreenCommand::SetPixelFormat(pixel_format), process_id)
@@ -602,40 +560,6 @@ impl<'a> SyscallDriver for Screen<'a> {
             300 => self.enqueue_command(ScreenCommand::Fill, process_id),
 
             _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
-        }
-    }
-
-    fn allow_readonly(
-        &self,
-        process_id: ProcessId,
-        allow_num: usize,
-        mut slice: ReadOnlyProcessBuffer,
-    ) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
-        match allow_num {
-            // TODO should refuse allow while writing
-            0 => {
-                let res = self
-                    .apps
-                    .enter(process_id, |app, _| {
-                        let depth =
-                            pixels_in_bytes(1, self.screen.get_pixel_format().get_bits_per_pixel());
-                        let len = slice.len();
-                        // allow only if the slice length is a a multiple of color depth
-                        if len == 0 || (len > 0 && (len % depth == 0)) {
-                            app.write_position = 0;
-                            mem::swap(&mut app.shared, &mut slice);
-                            Ok(())
-                        } else {
-                            Err(ErrorCode::INVAL)
-                        }
-                    })
-                    .map_err(ErrorCode::from);
-                match res {
-                    Err(e) => Err((slice, e)),
-                    Ok(_) => Ok(slice),
-                }
-            }
-            _ => Err((slice, ErrorCode::NOSUPPORT)),
         }
     }
 

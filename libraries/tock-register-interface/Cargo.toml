@@ -9,20 +9,15 @@ readme = "README.md"
 keywords = ["tock", "embedded", "registers", "mmio", "bare-metal"]
 categories = ["data-structures", "embedded", "no-std"]
 license = "MIT/Apache-2.0"
-edition = "2018"
+edition = "2021"
 
 [badges]
 travis-ci = { repository = "tock/tock", branch = "master" }
 
 [features]
-default = [ "register_types", "std_unit_tests" ]
+default = [ "register_types" ]
 
 # Include actual register types (except LocalRegisterCopy). Disabling
 # the feature makes this an interface-only library and removes all
 # usage of unsafe code
 register_types = []
-
-# Feature flag to enable generation of unit tests for the
-# registers. Enabling this may break compilation in
-# `custom-test-frameworks` environments.
-std_unit_tests = []

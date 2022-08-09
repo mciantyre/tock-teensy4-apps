@@ -13,6 +13,9 @@ on:
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 # If you add additional jobs, remember to add them to bors.toml
+permissions:
+  contents: read
+
 jobs:
   ci-format:
     strategy:
@@ -85,10 +88,14 @@ jobs:
         run: |
           sudo apt update
         if: matrix.os == 'ubuntu-latest'
-      - name: Install dependencies
+      - name: Install dependencies for ubuntu-latest
         run: |
-          sudo apt install libudev-dev
+          sudo apt install libudev-dev libzmq3-dev
         if: matrix.os == 'ubuntu-latest'
+      - name: Install dependencies for macos-latest
+        run: |
+          brew install zeromq
+        if: matrix.os == 'macos-latest'
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
       - name: ci-job-libraries

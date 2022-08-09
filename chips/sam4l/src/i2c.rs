@@ -525,12 +525,12 @@ struct TWISClock {
 }
 impl ClockInterface for TWISClock {
     fn is_enabled(&self) -> bool {
-        let slave_clock = self.slave.expect("I2C: Use of slave with no clock");
+        let slave_clock = self.slave.unwrap(); // Unwrap fail = I2C: Use of slave with no clock
         slave_clock.is_enabled()
     }
 
     fn enable(&self) {
-        let slave_clock = self.slave.expect("I2C: Use of slave with no clock");
+        let slave_clock = self.slave.unwrap(); // Unwrap fail = I2C: Use of slave with no clock
         if self.master.is_enabled() {
             panic!("I2C: Request for slave clock, but master active");
         }
@@ -538,7 +538,7 @@ impl ClockInterface for TWISClock {
     }
 
     fn disable(&self) {
-        let slave_clock = self.slave.expect("I2C: Use of slave with no clock");
+        let slave_clock = self.slave.unwrap(); // Unwrap fail = I2C: Use of slave with no clock
         slave_clock.disable();
     }
 }
@@ -597,10 +597,7 @@ impl PeripheralManagement<TWISClock> for I2CHw {
     type RegisterType = TWISRegisters;
 
     fn get_registers<'a>(&'a self) -> &'a TWISRegisters {
-        &*self
-            .slave_mmio_address
-            .as_ref()
-            .expect("Access of non-existent slave")
+        &*self.slave_mmio_address.as_ref().unwrap() // Unwrap fail = Access of non-existent slave
     }
 
     fn get_clock(&self) -> &TWISClock {
@@ -633,7 +630,7 @@ const fn create_twims_clocks(
 // Need to implement the `new` function on the I2C device as a constructor.
 // This gets called from the device tree.
 impl I2CHw {
-    const fn new(
+    fn new(
         base_addr: StaticRef<TWIMRegisters>,
         slave_base_addr: Option<StaticRef<TWISRegisters>>,
         clocks: (TWIMClock, TWISClock),
@@ -664,7 +661,7 @@ impl I2CHw {
         }
     }
 
-    pub const fn new_i2c0(pm: &'static pm::PowerManager) -> Self {
+    pub fn new_i2c0(pm: &'static pm::PowerManager) -> Self {
         I2CHw::new(
             I2C_BASE_ADDRS[0],
             Some(I2C_SLAVE_BASE_ADDRS[0]),
@@ -678,7 +675,7 @@ impl I2CHw {
         )
     }
 
-    pub const fn new_i2c1(pm: &'static pm::PowerManager) -> Self {
+    pub fn new_i2c1(pm: &'static pm::PowerManager) -> Self {
         I2CHw::new(
             I2C_BASE_ADDRS[1],
             Some(I2C_SLAVE_BASE_ADDRS[1]),
@@ -692,7 +689,7 @@ impl I2CHw {
         )
     }
 
-    pub const fn new_i2c2(pm: &'static pm::PowerManager) -> Self {
+    pub fn new_i2c2(pm: &'static pm::PowerManager) -> Self {
         I2CHw::new(
             I2C_BASE_ADDRS[2],
             None,
@@ -703,7 +700,7 @@ impl I2CHw {
         )
     }
 
-    pub const fn new_i2c3(pm: &'static pm::PowerManager) -> Self {
+    pub fn new_i2c3(pm: &'static pm::PowerManager) -> Self {
         I2CHw::new(
             I2C_BASE_ADDRS[3],
             None,
