@@ -41,10 +41,7 @@ impl<Spi: hil::spi::SpiMaster> hil::spi::SpiMasterClient for MuxSpiMaster<'_, Sp
 }
 
 impl<'a, Spi: hil::spi::SpiMaster> MuxSpiMaster<'a, Spi> {
-    pub const fn new(
-        spi: &'a Spi,
-        deferred_caller: &'a DynamicDeferredCall,
-    ) -> MuxSpiMaster<'a, Spi> {
+    pub fn new(spi: &'a Spi, deferred_caller: &'a DynamicDeferredCall) -> MuxSpiMaster<'a, Spi> {
         MuxSpiMaster {
             spi: spi,
             devices: List::new(),
@@ -104,6 +101,19 @@ impl<'a, Spi: hil::spi::SpiMaster> MuxSpiMaster<'a, Spi> {
                         });
                     }
                     Op::Idle => {} // Can't get here...
+                }
+            });
+        } else {
+            self.inflight.map(|node| {
+                match node.operation.get() {
+                    // we have to report an error
+                    Op::ReadWriteDone(status, len) => {
+                        node.txbuffer.take().map(|write_buffer| {
+                            let read_buffer = node.rxbuffer.take();
+                            self.read_write_done(write_buffer, read_buffer, len, status);
+                        });
+                    }
+                    _ => {} // Something is really in flight
                 }
             });
         }
@@ -169,7 +179,7 @@ pub struct VirtualSpiMasterDevice<'a, Spi: hil::spi::SpiMaster> {
 }
 
 impl<'a, Spi: hil::spi::SpiMaster> VirtualSpiMasterDevice<'a, Spi> {
-    pub const fn new(
+    pub fn new(
         mux: &'a MuxSpiMaster<'a, Spi>,
         chip_select: Spi::ChipSelect,
     ) -> VirtualSpiMasterDevice<'a, Spi> {

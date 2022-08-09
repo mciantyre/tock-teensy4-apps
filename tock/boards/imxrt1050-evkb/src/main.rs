@@ -41,14 +41,15 @@ pub mod io;
 pub mod boot_header;
 
 // Number of concurrent processes this platform supports.
-const NUM_PROCS: usize = 1;
-const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
+const NUM_PROCS: usize = 4;
 
 // Actual memory for holding the active process structures.
-static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] = [None];
+static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
+    [None; NUM_PROCS];
 
 type Chip = imxrt1050::chip::Imxrt10xx<imxrt1050::chip::Imxrt10xxDefaultPeripherals>;
 static mut CHIP: Option<&'static Chip> = None;
+static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 
 // How should the kernel respond when a process faults.
 const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
@@ -75,8 +76,12 @@ struct Imxrt1050EVKB {
     button: &'static capsules::button::Button<'static, imxrt1050::gpio::Pin<'static>>,
     console: &'static capsules::console::Console<'static>,
     gpio: &'static capsules::gpio::GPIO<'static, imxrt1050::gpio::Pin<'static>>,
-    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
-    led: &'static capsules::led::LedDriver<'static, LedLow<'static, imxrt1050::gpio::Pin<'static>>>,
+    ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
+    led: &'static capsules::led::LedDriver<
+        'static,
+        LedLow<'static, imxrt1050::gpio::Pin<'static>>,
+        1,
+    >,
     ninedof: &'static capsules::ninedof::NineDof<'static>,
 
     scheduler: &'static RoundRobinSched<'static>,
@@ -111,6 +116,7 @@ impl KernelResources<imxrt1050::chip::Imxrt10xx<imxrt1050::chip::Imxrt10xxDefaul
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm7::systick::SysTick;
     type WatchDog = ();
+    type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         &self
@@ -128,6 +134,9 @@ impl KernelResources<imxrt1050::chip::Imxrt10xx<imxrt1050::chip::Imxrt10xxDefaul
         &self.systick
     }
     fn watchdog(&self) -> &Self::WatchDog {
+        &()
+    }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
         &()
     }
 }
@@ -321,19 +330,16 @@ pub unsafe fn main() {
         capsules::console::DRIVER_NUM,
         lpuart_mux,
     )
-    .finalize(());
+    .finalize(components::console_component_helper!());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(lpuart_mux).finalize(());
 
     // LEDs
 
     // Clock to Port A is enabled in `set_pin_primary_functions()
-    let led = components::led::LedsComponent::new(components::led_component_helper!(
+    let led = components::led::LedsComponent::new().finalize(components::led_component_helper!(
         LedLow<'static, imxrt1050::gpio::Pin<'static>>,
         LedLow::new(peripherals.ports.pin(imxrt1050::gpio::PinId::AdB0_09)),
-    ))
-    .finalize(components::led_component_buf!(
-        LedLow<'static, imxrt1050::gpio::Pin<'static>>
     ));
 
     // BUTTONs
@@ -473,6 +479,24 @@ pub unsafe fn main() {
     //
     // See comment in `boards/imix/src/main.rs`
     // virtual_uart_rx_test::run_virtual_uart_receive(mux_uart);
+
+    //--------------------------------------------------------------------------
+    // Process Console
+    //---------------------------------------------------------------------------
+    let process_printer =
+        components::process_printer::ProcessPrinterTextComponent::new().finalize(());
+    PROCESS_PRINTER = Some(process_printer);
+
+    let process_console = components::process_console::ProcessConsoleComponent::new(
+        board_kernel,
+        lpuart_mux,
+        mux_alarm,
+        process_printer,
+    )
+    .finalize(components::process_console_component_helper!(
+        imxrt1050::gpt::Gpt1
+    ));
+    let _ = process_console.start();
 
     debug!("Tock OS initialization complete. Entering main loop");
 

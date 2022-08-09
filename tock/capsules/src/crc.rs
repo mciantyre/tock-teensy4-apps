@@ -63,7 +63,7 @@
 //! __Polynomial__: `0x04C11DB7`
 //!
 //! This algorithm uses the same polynomial as `Crc-32`, but does no post-
-//! processing on the output value.  It can be perfomed purely in hardware on
+//! processing on the output value.  It can be performed purely in hardware on
 //! the SAM4L.
 //!
 //! ### SAM4L-32C
@@ -75,15 +75,15 @@
 //! the SAM4L.
 
 use core::cell::Cell;
-use core::{cmp, mem};
+use core::cmp;
 
-use kernel::grant::Grant;
+use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil::crc::{Client, Crc, CrcAlgorithm, CrcOutput};
-use kernel::processbuffer::{ReadOnlyProcessBuffer, ReadableProcessBuffer, ReadableProcessSlice};
+use kernel::processbuffer::{ReadableProcessBuffer, ReadableProcessSlice};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::NumericCellExt;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
-use kernel::utilities::leasable_buffer::LeasableBuffer;
+use kernel::utilities::leasable_buffer::LeasableMutableBuffer;
 use kernel::{ErrorCode, ProcessId};
 
 /// Syscall driver number.
@@ -91,10 +91,16 @@ use crate::driver;
 pub const DRIVER_NUM: usize = driver::NUM::Crc as usize;
 pub const DEFAULT_CRC_BUF_LENGTH: usize = 256;
 
+/// Ids for read-only allow buffers
+mod ro_allow {
+    pub const BUFFER: usize = 0;
+    /// The number of allow buffers the kernel stores for this grant
+    pub const COUNT: u8 = 1;
+}
+
 /// An opaque value maintaining state for one application's request
 #[derive(Default)]
 pub struct App {
-    buffer: ReadOnlyProcessBuffer,
     // if Some, the process is waiting for the result of CRC
     // of len bytes using the given algorithm
     request: Option<(CrcAlgorithm, usize)>,
@@ -105,7 +111,7 @@ pub struct App {
 pub struct CrcDriver<'a, C: Crc<'a>> {
     crc: &'a C,
     crc_buffer: TakeCell<'static, [u8]>,
-    grant: Grant<App, 1>,
+    grant: Grant<App, UpcallCount<1>, AllowRoCount<{ ro_allow::COUNT }>, AllowRwCount<0>>,
     current_process: OptionalCell<ProcessId>,
     // We need to save our current
     app_buffer_written: Cell<usize>,
@@ -128,7 +134,7 @@ impl<'a, C: Crc<'a>> CrcDriver<'a, C> {
     pub fn new(
         crc: &'a C,
         crc_buffer: &'static mut [u8],
-        grant: Grant<App, 1>,
+        grant: Grant<App, UpcallCount<1>, AllowRoCount<{ ro_allow::COUNT }>, AllowRwCount<0>>,
     ) -> CrcDriver<'a, C> {
         CrcDriver {
             crc,
@@ -146,7 +152,7 @@ impl<'a, C: Crc<'a>> CrcDriver<'a, C> {
                 kbuffer[i] = data[i].get();
             }
             if copy_len > 0 {
-                let mut leasable = LeasableBuffer::new(kbuffer);
+                let mut leasable = LeasableMutableBuffer::new(kbuffer);
                 leasable.slice(0..copy_len);
                 let res = self.crc.input(leasable);
                 match res {
@@ -165,53 +171,55 @@ impl<'a, C: Crc<'a>> CrcDriver<'a, C> {
 
     // Start a new request. Return Ok(()) if one started, Err(FAIL) if not.
     // Issue callbacks for any requests that are invalid, either because
-    // they are zero-length or requested an invalid algoritm.
+    // they are zero-length or requested an invalid algorithm.
     fn next_request(&self) -> Result<(), ErrorCode> {
         self.app_buffer_written.set(0);
         for process in self.grant.iter() {
             let process_id = process.processid();
-            let started = process.enter(|grant, upcalls| {
+            let started = process.enter(|grant, kernel_data| {
                 // If there's no buffer this means the process is dead, so
                 // no need to issue a callback on this error case.
-                let res: Result<(), ErrorCode> = grant
-                    .buffer
-                    .enter(|buffer| {
-                        if let Some((algorithm, len)) = grant.request {
-                            let copy_len = cmp::min(len, buffer.len());
-                            if copy_len == 0 {
-                                // 0-length or 0-size buffer
-                                Err(ErrorCode::SIZE)
-                            } else {
-                                let res = self.crc.set_algorithm(algorithm);
-                                match res {
-                                    Ok(()) => {
-                                        let copy_len = self.do_next_input(buffer, copy_len);
-                                        if copy_len > 0 {
-                                            self.app_buffer_written.set(copy_len);
-                                            self.current_process.set(process_id);
-                                            Ok(())
-                                        } else {
-                                            // Next input failed
-                                            Err(ErrorCode::FAIL)
+                let res: Result<(), ErrorCode> = kernel_data
+                    .get_readonly_processbuffer(ro_allow::BUFFER)
+                    .and_then(|buffer| {
+                        buffer.enter(|buffer| {
+                            if let Some((algorithm, len)) = grant.request {
+                                let copy_len = cmp::min(len, buffer.len());
+                                if copy_len == 0 {
+                                    // 0-length or 0-size buffer
+                                    Err(ErrorCode::SIZE)
+                                } else {
+                                    let res = self.crc.set_algorithm(algorithm);
+                                    match res {
+                                        Ok(()) => {
+                                            let copy_len = self.do_next_input(buffer, copy_len);
+                                            if copy_len > 0 {
+                                                self.app_buffer_written.set(copy_len);
+                                                self.current_process.set(process_id);
+                                                Ok(())
+                                            } else {
+                                                // Next input failed
+                                                Err(ErrorCode::FAIL)
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // Setting the algorithm failed
+                                            Err(ErrorCode::INVAL)
                                         }
                                     }
-                                    Err(_) => {
-                                        // Setting the algorithm failed
-                                        Err(ErrorCode::INVAL)
-                                    }
                                 }
+                            } else {
+                                // no request
+                                Err(ErrorCode::FAIL)
                             }
-                        } else {
-                            // no request
-                            Err(ErrorCode::FAIL)
-                        }
+                        })
                     })
                     .unwrap_or(Err(ErrorCode::NOMEM));
                 match res {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         if grant.request.is_some() {
-                            upcalls
+                            kernel_data
                                 .schedule_upcall(
                                     0,
                                     (kernel::errorcode::into_statuscode(Err(e)), 0, 0),
@@ -242,29 +250,6 @@ impl<'a, C: Crc<'a>> SyscallDriver for CrcDriver<'a, C> {
     /// The `allow` syscall for this driver supports the single
     /// `allow_num` zero, which is used to provide a buffer over which
     /// to compute a Crc computation.
-    ///
-    fn allow_readonly(
-        &self,
-        process_id: ProcessId,
-        allow_num: usize,
-        mut slice: ReadOnlyProcessBuffer,
-    ) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
-        let res = match allow_num {
-            // Provide user buffer to compute Crc over
-            0 => self
-                .grant
-                .enter(process_id, |grant, _| {
-                    mem::swap(&mut grant.buffer, &mut slice);
-                })
-                .map_err(ErrorCode::from),
-            _ => Err(ErrorCode::NOSUPPORT),
-        };
-        if let Err(e) = res {
-            Err((slice, e))
-        } else {
-            Ok(slice)
-        }
-    }
 
     // The `subscribe` syscall supports the single `subscribe_number`
     // zero, which is used to provide a callback that will receive the
@@ -356,10 +341,14 @@ impl<'a, C: Crc<'a>> SyscallDriver for CrcDriver<'a, C> {
                 };
                 let res = self
                     .grant
-                    .enter(process_id, |grant, _| {
+                    .enter(process_id, |grant, kernel_data| {
                         if grant.request.is_some() {
                             Err(ErrorCode::BUSY)
-                        } else if length > grant.buffer.len() {
+                        } else if length
+                            > kernel_data
+                                .get_readonly_processbuffer(ro_allow::BUFFER)
+                                .map_or(0, |buffer| buffer.len())
+                        {
                             Err(ErrorCode::SIZE)
                         } else {
                             grant.request = Some((algorithm, length));
@@ -394,13 +383,17 @@ impl<'a, C: Crc<'a>> SyscallDriver for CrcDriver<'a, C> {
 }
 
 impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
-    fn input_done(&self, result: Result<(), ErrorCode>, buffer: LeasableBuffer<'static, u8>) {
+    fn input_done(
+        &self,
+        result: Result<(), ErrorCode>,
+        buffer: LeasableMutableBuffer<'static, u8>,
+    ) {
         // A call to `input` has finished. This can mean that either
         // we have processed the entire buffer passed in, or it was
         // truncated by the CRC unit as it was too large. In the first
         // case, we can see whether there is more outstanding data
         // from the app, whereas in the latter we need to advance the
-        // LeasableBuffer window and pass it in again.
+        // LeasableMutableBuffer window and pass it in again.
         let mut computing = false;
         // There are three outcomes to this match:
         //   - crc_buffer is not put back: input is ongoing
@@ -413,12 +406,12 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                     // Put the kernel buffer back
                     self.crc_buffer.replace(buffer.take());
                     self.current_process.map(|pid| {
-                        let _res = self.grant.enter(*pid, |grant, upcalls| {
+                        let _res = self.grant.enter(*pid, |grant, kernel_data| {
                             // This shouldn't happen unless there's a way to clear out a request
                             // through a system call: regardless, the request is gone, so cancel
                             // the CRC.
                             if grant.request.is_none() {
-                                upcalls
+                                kernel_data
                                     .schedule_upcall(
                                         0,
                                         (
@@ -436,7 +429,10 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                             // Compute how many remaining bytes to compute over
                             let (alg, size) = grant.request.unwrap();
                             grant.request = Some((alg, size));
-                            let size = cmp::min(size, grant.buffer.len());
+                            let size = kernel_data
+                                .get_readonly_processbuffer(ro_allow::BUFFER)
+                                .map_or(0, |buffer| buffer.len())
+                                .min(size);
                             // If the buffer has shrunk, size might be less than
                             // app_buffer_written: don't allow wraparound
                             let remaining = size - cmp::min(self.app_buffer_written.get(), size);
@@ -450,7 +446,7 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                                     }
                                     Err(_) => {
                                         grant.request = None;
-                                        upcalls
+                                        kernel_data
                                             .schedule_upcall(
                                                 0,
                                                 (
@@ -466,18 +462,20 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                                 }
                             } else {
                                 // More bytes: do the next input
-                                let amount = grant
-                                    .buffer
-                                    .enter(|app_slice| {
-                                        self.do_next_input(
-                                            &app_slice[self.app_buffer_written.get()..],
-                                            remaining,
-                                        )
+                                let amount = kernel_data
+                                    .get_readonly_processbuffer(ro_allow::BUFFER)
+                                    .and_then(|buffer| {
+                                        buffer.enter(|app_slice| {
+                                            self.do_next_input(
+                                                &app_slice[self.app_buffer_written.get()..],
+                                                remaining,
+                                            )
+                                        })
                                     })
                                     .unwrap_or(0);
                                 if amount == 0 {
                                     grant.request = None;
-                                    upcalls
+                                    kernel_data
                                         .schedule_upcall(
                                             0,
                                             (
@@ -503,9 +501,9 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                         Err((e, returned_buffer)) => {
                             self.crc_buffer.replace(returned_buffer.take());
                             self.current_process.map(|pid| {
-                                let _res = self.grant.enter(*pid, |grant, upcalls| {
+                                let _res = self.grant.enter(*pid, |grant, kernel_data| {
                                     grant.request = None;
-                                    upcalls
+                                    kernel_data
                                         .schedule_upcall(
                                             0,
                                             (kernel::errorcode::into_statuscode(Err(e)), 0, 0),
@@ -521,9 +519,9 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                 // The callback returned an error, pass it back to userspace
                 self.crc_buffer.replace(buffer.take());
                 self.current_process.map(|pid| {
-                    let _res = self.grant.enter(*pid, |grant, upcalls| {
+                    let _res = self.grant.enter(*pid, |grant, kernel_data| {
                         grant.request = None;
-                        upcalls
+                        kernel_data
                             .schedule_upcall(0, (kernel::errorcode::into_statuscode(Err(e)), 0, 0))
                             .ok();
                     });
@@ -541,12 +539,12 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
         // First of all, inform the app about the finished operation /
         // the result
         self.current_process.take().map(|process_id| {
-            let _ = self.grant.enter(process_id, |grant, upcalls| {
+            let _ = self.grant.enter(process_id, |grant, kernel_data| {
                 grant.request = None;
                 match result {
                     Ok(output) => {
                         let (val, user_int) = encode_upcall_crc_output(output);
-                        upcalls
+                        kernel_data
                             .schedule_upcall(
                                 0,
                                 (
@@ -558,7 +556,7 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                             .ok();
                     }
                     Err(e) => {
-                        upcalls
+                        kernel_data
                             .schedule_upcall(0, (kernel::errorcode::into_statuscode(Err(e)), 0, 0))
                             .ok();
                     }

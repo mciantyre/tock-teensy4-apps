@@ -8,7 +8,7 @@
 //! Receiving RTT Messages
 //! ----------------------
 //!
-//! With the jlink tools, reciving RTT messages is a two step process. First,
+//! With the jlink tools, receiving RTT messages is a two step process. First,
 //! open a JTAG connection with a command like:
 //!
 //! ```shell
@@ -55,6 +55,7 @@
 //!     VirtualMuxAlarm<'static, nrf5x::rtc::Rtc>,
 //!     VirtualMuxAlarm::new(mux_alarm)
 //! );
+//! virtual_alarm_rtt.setup();
 //!
 //! let rtt_memory = static_init!(
 //!     capsules::segger_rtt::SeggerRttMemory,

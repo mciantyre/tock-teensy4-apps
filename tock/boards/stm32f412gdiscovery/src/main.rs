@@ -26,13 +26,13 @@ pub mod io;
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
-const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 // Actual memory for holding the active process structures.
 static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
     [None, None, None, None];
 
 static mut CHIP: Option<&'static stm32f412g::chip::Stm32f4xx<Stm32f412gDefaultPeripherals>> = None;
+static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 
 // How should the kernel respond when a process faults.
 const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
@@ -46,9 +46,12 @@ pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 /// capsules for this platform.
 struct STM32F412GDiscovery {
     console: &'static capsules::console::Console<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
-    led:
-        &'static capsules::led::LedDriver<'static, LedLow<'static, stm32f412g::gpio::Pin<'static>>>,
+    ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
+    led: &'static capsules::led::LedDriver<
+        'static,
+        LedLow<'static, stm32f412g::gpio::Pin<'static>>,
+        4,
+    >,
     button: &'static capsules::button::Button<'static, stm32f412g::gpio::Pin<'static>>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
@@ -102,6 +105,7 @@ impl
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm4::systick::SysTick;
     type WatchDog = ();
+    type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         &self
@@ -121,15 +125,18 @@ impl
     fn watchdog(&self) -> &Self::WatchDog {
         &()
     }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
+        &()
+    }
 }
 
 /// Helper function called during bring-up that configures DMA.
 unsafe fn setup_dma(
-    dma: &stm32f412g::dma1::Dma1,
-    dma_streams: &'static [stm32f412g::dma1::Stream; 8],
-    usart2: &'static stm32f412g::usart::Usart,
+    dma: &stm32f412g::dma::Dma1,
+    dma_streams: &'static [stm32f412g::dma::Stream<stm32f412g::dma::Dma1>; 8],
+    usart2: &'static stm32f412g::usart::Usart<stm32f412g::dma::Dma1>,
 ) {
-    use stm32f412g::dma1::Dma1Peripheral;
+    use stm32f412g::dma::Dma1Peripheral;
     use stm32f412g::usart;
 
     dma.enable_clock();
@@ -155,12 +162,10 @@ unsafe fn setup_dma(
 /// Helper function called during bring-up that configures multiplexed I/O.
 unsafe fn set_pin_primary_functions(
     syscfg: &stm32f412g::syscfg::Syscfg,
-    exti: &stm32f412g::exti::Exti,
     i2c1: &stm32f412g::i2c::I2C,
     gpio_ports: &'static stm32f412g::gpio::GpioPorts<'static>,
 ) {
     use kernel::hil::gpio::Configure;
-    use stm32f412g::exti::LineId;
     use stm32f412g::gpio::{AlternateFunction, Mode, PinId, PortId};
 
     syscfg.enable_clock();
@@ -192,63 +197,33 @@ unsafe fn set_pin_primary_functions(
     // uncomment this if you do not plan to use the joystick up, as they both use Exti0
     // joystick selection is connected on pa00
     // gpio_ports.get_pin(PinId::PA00).map(|pin| {
-    //     // By default, upon reset, the pin is in input mode, with no internal
-    //     // pull-up, no internal pull-down (i.e., floating).
-    //     //
-    //     // Only set the mapping between EXTI line and the Pin and let capsule do
-    //     // the rest.
-    //     exti.associate_line_gpiopin(LineId::Exti0, pin);
+    //     pin.enable_interrupt();
     // });
-    // // EXTI0 interrupts is delivered at IRQn 6 (EXTI0)
-    // cortexm4::nvic::Nvic::new(stm32f412g::nvic::EXTI0).enable();
 
     // joystick down is connected on pg01
     gpio_ports.get_pin(PinId::PG01).map(|pin| {
-        // By default, upon reset, the pin is in input mode, with no internal
-        // pull-up, no internal pull-down (i.e., floating).
-        //
-        // Only set the mapping between EXTI line and the Pin and let capsule do
-        // the rest.
-        exti.associate_line_gpiopin(LineId::Exti1, pin);
+        pin.enable_interrupt();
     });
-    // EXTI1 interrupts is delivered at IRQn 7 (EXTI1)
-    cortexm4::nvic::Nvic::new(stm32f412g::nvic::EXTI1).enable();
 
     // joystick left is connected on pf15
     gpio_ports.get_pin(PinId::PF15).map(|pin| {
-        // By default, upon reset, the pin is in input mode, with no internal
-        // pull-up, no internal pull-down (i.e., floating).
-        //
-        // Only set the mapping between EXTI line and the Pin and let capsule do
-        // the rest.
-        exti.associate_line_gpiopin(LineId::Exti15, pin);
+        pin.enable_interrupt();
     });
-    // EXTI15_10 interrupts is delivered at IRQn 40 (EXTI15_10)
-    cortexm4::nvic::Nvic::new(stm32f412g::nvic::EXTI15_10).enable();
 
     // joystick right is connected on pf14
     gpio_ports.get_pin(PinId::PF14).map(|pin| {
-        // By default, upon reset, the pin is in input mode, with no internal
-        // pull-up, no internal pull-down (i.e., floating).
-        //
-        // Only set the mapping between EXTI line and the Pin and let capsule do
-        // the rest.
-        exti.associate_line_gpiopin(LineId::Exti14, pin);
+        pin.enable_interrupt();
     });
-    // EXTI15_10 interrupts is delivered at IRQn 40 (EXTI15_10)
-    cortexm4::nvic::Nvic::new(stm32f412g::nvic::EXTI15_10).enable();
 
     // joystick up is connected on pg00
     gpio_ports.get_pin(PinId::PG00).map(|pin| {
-        // By default, upon reset, the pin is in input mode, with no internal
-        // pull-up, no internal pull-down (i.e., floating).
-        //
-        // Only set the mapping between EXTI line and the Pin and let capsule do
-        // the rest.
-        exti.associate_line_gpiopin(LineId::Exti0, pin);
+        pin.enable_interrupt();
     });
-    // EXTI0 interrupts is delivered at IRQn 6 (EXTI0)
-    cortexm4::nvic::Nvic::new(stm32f412g::nvic::EXTI0).enable();
+
+    // enable interrupt for D0
+    gpio_ports.get_pin(PinId::PG09).map(|pin| {
+        pin.enable_interrupt();
+    });
 
     // Enable clocks for GPIO Ports
     // Disable some of them if you don't need some of the GPIOs
@@ -283,12 +258,7 @@ unsafe fn set_pin_primary_functions(
 
     // FT6206 interrupt
     gpio_ports.get_pin(PinId::PG05).map(|pin| {
-        // By default, upon reset, the pin is in input mode, with no internal
-        // pull-up, no internal pull-down (i.e., floating).
-        //
-        // Only set the mapping between EXTI line and the Pin and let capsule do
-        // the rest.
-        exti.associate_line_gpiopin(LineId::Exti5, pin);
+        pin.enable_interrupt();
     });
 
     // ADC
@@ -402,7 +372,7 @@ unsafe fn setup_peripherals(
 unsafe fn get_peripherals() -> (
     &'static mut Stm32f412gDefaultPeripherals<'static>,
     &'static stm32f412g::syscfg::Syscfg<'static>,
-    &'static stm32f412g::dma1::Dma1<'static>,
+    &'static stm32f412g::dma::Dma1<'static>,
 ) {
     let rcc = static_init!(stm32f412g::rcc::Rcc, stm32f412g::rcc::Rcc::new());
     let syscfg = static_init!(
@@ -411,11 +381,13 @@ unsafe fn get_peripherals() -> (
     );
 
     let exti = static_init!(stm32f412g::exti::Exti, stm32f412g::exti::Exti::new(syscfg));
-    let dma1 = static_init!(stm32f412g::dma1::Dma1, stm32f412g::dma1::Dma1::new(rcc));
+
+    let dma1 = static_init!(stm32f412g::dma::Dma1, stm32f412g::dma::Dma1::new(rcc));
+    let dma2 = static_init!(stm32f412g::dma::Dma2, stm32f412g::dma::Dma2::new(rcc));
 
     let peripherals = static_init!(
         Stm32f412gDefaultPeripherals,
-        Stm32f412gDefaultPeripherals::new(rcc, exti, dma1)
+        Stm32f412gDefaultPeripherals::new(rcc, exti, dma1, dma2)
     );
     (peripherals, syscfg, dma1)
 }
@@ -437,16 +409,11 @@ pub unsafe fn main() {
     );
 
     // We use the default HSI 16Mhz clock
-    set_pin_primary_functions(
-        syscfg,
-        &base_peripherals.exti,
-        &base_peripherals.i2c1,
-        &base_peripherals.gpio_ports,
-    );
+    set_pin_primary_functions(syscfg, &base_peripherals.i2c1, &base_peripherals.gpio_ports);
 
     setup_dma(
         dma1,
-        &base_peripherals.dma_streams,
+        &base_peripherals.dma1_streams,
         &base_peripherals.usart2,
     );
 
@@ -492,35 +459,15 @@ pub unsafe fn main() {
         capsules::console::DRIVER_NUM,
         uart_mux,
     )
-    .finalize(());
+    .finalize(components::console_component_helper!());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
-
-    // // Setup the process inspection console
-    // let process_console_uart = static_init!(UartDevice, UartDevice::new(mux_uart, true));
-    // process_console_uart.setup();
-    // pub struct ProcessConsoleCapability;
-    // unsafe impl capabilities::ProcessManagementCapability for ProcessConsoleCapability {}
-    // let process_console = static_init!(
-    //     capsules::process_console::ProcessConsole<'static, ProcessConsoleCapability>,
-    //     capsules::process_console::ProcessConsole::new(
-    //         process_console_uart,
-    //         &mut capsules::process_console::WRITE_BUF,
-    //         &mut capsules::process_console::READ_BUF,
-    //         &mut capsules::process_console::COMMAND_BUF,
-    //         board_kernel,
-    //         ProcessConsoleCapability,
-    //     )
-    // );
-    // hil::uart::Transmit::set_transmit_client(process_console_uart, process_console);
-    // hil::uart::Receive::set_receive_client(process_console_uart, process_console);
-    // process_console.start();
 
     // LEDs
 
     // Clock to Port A is enabled in `set_pin_primary_functions()`
 
-    let led = components::led::LedsComponent::new(components::led_component_helper!(
+    let led = components::led::LedsComponent::new().finalize(components::led_component_helper!(
         LedLow<'static, stm32f412g::gpio::Pin>,
         LedLow::new(
             base_peripherals
@@ -546,9 +493,6 @@ pub unsafe fn main() {
                 .get_pin(stm32f412g::gpio::PinId::PE03)
                 .unwrap()
         ),
-    ))
-    .finalize(components::led_component_buf!(
-        LedLow<'static, stm32f412g::gpio::Pin>
     ));
 
     // BUTTONs
@@ -716,7 +660,7 @@ pub unsafe fn main() {
     )
     .finalize(components::screen_buffer_size!(57600));
 
-    let touch = components::touch::TouchComponent::new(
+    let touch = components::touch::MultiTouchComponent::new(
         board_kernel,
         capsules::touch::DRIVER_NUM,
         ft6x06,
@@ -789,6 +733,22 @@ pub unsafe fn main() {
                 adc_channel_4,
                 adc_channel_5
             ));
+
+    let process_printer =
+        components::process_printer::ProcessPrinterTextComponent::new().finalize(());
+    PROCESS_PRINTER = Some(process_printer);
+
+    // PROCESS CONSOLE
+    let process_console = components::process_console::ProcessConsoleComponent::new(
+        board_kernel,
+        uart_mux,
+        mux_alarm,
+        process_printer,
+    )
+    .finalize(components::process_console_component_helper!(
+        stm32f412g::tim2::Tim2
+    ));
+    let _ = process_console.start();
 
     let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
         .finalize(components::rr_component_helper!(NUM_PROCS));

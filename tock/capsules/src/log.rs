@@ -7,7 +7,7 @@
 //!
 //! Entries can be identified and seeked-to with their unique Entry IDs. Entry IDs maintain the
 //! ordering of the underlying entries, and an entry with a larger entry ID is newer and comes
-//! after an entry with a smaller ID. IDs can also be used to determing the physical position of
+//! after an entry with a smaller ID. IDs can also be used to determine the physical position of
 //! entries within the log's underlying storage volume - taking the ID modulo the size of the
 //! underlying storage volume yields the position of the entry's header relative to the start of
 //! the volume. Entries should not be created manually by clients, only retrieved through the
@@ -60,7 +60,7 @@
 //!         )
 //!     );
 //!     kernel::hil::flash::HasClient::set_client(&sam4l::flashcalw::FLASH_CONTROLLER, log);
-//!     log.initialize_callback_handle(dynamic_deferred_caller.register(log).expect("no deferred call slot available for log storage"));
+//!     log.initialize_callback_handle(dynamic_deferred_caller.register(log).unwrap()); // Unwrap fail = no deferred call slot available for log storage
 //!
 //!     log.set_read_client(log_storage_read_client);
 //!     log.set_append_client(log_storage_append_client);

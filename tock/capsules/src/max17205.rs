@@ -39,7 +39,7 @@
 
 use core::cell::Cell;
 
-use kernel::grant::Grant;
+use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil::i2c;
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
@@ -199,8 +199,10 @@ impl<'a> MAX17205<'a> {
     fn setup_read_romid(&self) -> Result<(), ErrorCode> {
         self.buffer.take().map_or(Err(ErrorCode::NOMEM), |buffer| {
             self.i2c_upper.enable();
+            let nrom_id = Registers::NRomID as u16;
 
-            buffer[0] = Registers::NRomID as u8;
+            buffer[0] = (nrom_id & 0xFF) as u8;
+            buffer[1] = (nrom_id >> 8) as u8;
             // TODO verify errors
             let _ = self.i2c_upper.write(buffer, 1);
             self.state.set(State::SetupReadRomID);
@@ -396,11 +398,14 @@ pub struct App {}
 pub struct MAX17205Driver<'a> {
     max17205: &'a MAX17205<'a>,
     owning_process: OptionalCell<ProcessId>,
-    apps: Grant<App, 1>,
+    apps: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
 }
 
 impl<'a> MAX17205Driver<'a> {
-    pub fn new(max: &'a MAX17205, grant: Grant<App, 1>) -> Self {
+    pub fn new(
+        max: &'a MAX17205,
+        grant: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
+    ) -> Self {
         Self {
             max17205: max,
             owning_process: OptionalCell::empty(),

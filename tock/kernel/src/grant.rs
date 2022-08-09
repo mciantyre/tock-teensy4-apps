@@ -24,16 +24,18 @@
 //! be allocated in that process's grant region, even if the `Grant` has been
 //! entered for other processes.
 //!
-//! Upcalls are stored in the dynamically allocated grant for a particular
-//! Driver as well. Upcalls are stored outside of the `T` object to enable the
-//! kernel to manage them and ensure the upcall swapping guarantees are met.
+//! Upcalls and allowed buffer references are stored in the dynamically
+//! allocated grant for a particular Driver as well. Upcalls and allowed buffer
+//! references are stored outside of the `T` object to enable the kernel to
+//! manage them and ensure swapping guarantees are met.
 //!
-//! The type `T` of a `Grant` is fixed in size and the number of upcalls
-//! associated with a grant is fixed. That is, when a `Grant` is entered for a
-//! process the resulting allocated object will be the size of `SizeOf<T>` plus
-//! the size for the upcalls. If capsules need additional process-specific
-//! memory for their operation, they can use an `Allocator` to request
-//! additional memory from the process's grant region.
+//! The type `T` of a `Grant` is fixed in size and the number of upcalls and
+//! allowed buffers associated with a grant is fixed. That is, when a `Grant` is
+//! entered for a process the resulting allocated object will be the size of
+//! `SizeOf<T>` plus the size for the structure to hold upcalls and allowed
+//! buffer references. If capsules need additional process-specific memory for
+//! their operation, they can use an `Allocator` to request additional memory
+//! from the process's grant region.
 //!
 //! ```text,ignore
 //!                            ┌──────────────────┐
@@ -69,7 +71,7 @@
 //! │ │─────────────────│  │ │     region.
 //! │ │ Padding         │  │ │
 //! │ │─────────────────│  │ │
-//! │ │ Upcall Table    │  │ │
+//! │ │ GrantKernelData │  │ │
 //! │ └─────────────────┘◄─┘ │
 //! │                        │
 //! │ ┌─────────────────┐    │
@@ -90,33 +92,35 @@
 //!
 //! ```text,ignore
 //!                         ┌──────────────────────────┐
-//!                         │ struct Grant<T, NUM_UP> {│
+//!                         │ struct Grant<T, ...> {   │
 //!                         │   driver_num: usize      │
 //!                         │   grant_num: usize       │
-//!                         │ }                        ├─┐
-//! Entering a Grant for a  └──┬───────────────────────┘ │
-//! process causes the         │                         │
-//! memory for T to be         │ .enter(ProcessId)       │ .enter(ProcessId, fn)
-//! allocated.                 ▼                         │
-//!                         ┌──────────────────────────┐ │ For convenience,
-//! ProcessGrant represents │ struct ProcessGrant<T> { │ │ allocating and getting
-//! a Grant allocated for a │   number: usize          │ │ access to the T object
-//! specific process.       │   process: &Process      │ │ is combined in one
-//!                         │ }                        │ │ .enter() call.
-//! A provided closure      └──┬───────────────────────┘ │
-//! is given access to         │                         │
-//! the underlying memory      │ .enter(fn)              │
-//! where the T is stored.     ▼                         │
-//!                         ┌──────────────────────────┐ │
-//! GrantData wraps the     │ struct GrantData<T>   {  │◄┘
-//! type and provides       │   data: &mut T           │
-//! mutable access.         │ }                        │
-//! GrantUpcallTable        │ struct GrantUpcallTable {│
-//! provides access to      │   upcalls: [SavedUpcall] │
-//! scheduling upcalls      │ }                        │
-//!                         └──┬───────────────────────┘
+//!                         │ }                        ├───┐
+//! Entering a Grant for a  └──┬───────────────────────┘   │
+//! process causes the         │                           │
+//! memory for T to be         │ .enter(ProcessId)         │ .enter(ProcessId, fn)
+//! allocated.                 ▼                           │
+//!                         ┌──────────────────────────┐   │ For convenience,
+//! ProcessGrant represents │ struct ProcessGrant<T> { │   │ allocating and getting
+//! a Grant allocated for a │   number: usize          │   │ access to the T object
+//! specific process.       │   process: &Process      │   │ is combined in one
+//!                         │ }                        │   │ .enter() call.
+//! A provided closure      └──┬───────────────────────┘   │
+//! is given access to         │                           │
+//! the underlying memory      │ .enter(fn)                │
+//! where the T is stored.     ▼                           │
+//!                         ┌────────────────────────────┐ │
+//! GrantData wraps the     │ struct GrantData<T>   {    │◄┘
+//! type and provides       │   data: &mut T             │
+//! mutable access.         │ }                          │
+//! GrantKernelData         │ struct GrantKernelData {   │
+//! provides access to      │   upcalls: [SavedUpcall]   │
+//! scheduling upcalls      │   allow_ro: [SavedAllowRo] │
+//! and process buffers.    │   allow_rw: [SavedAllowRW] │
+//!                         │ }                          │
+//!                         └──┬─────────────────────────┘
 //! The actual object T can    │
-//! only be accessed inside    │ fn(mem: &GrantData, upcalls: &GrantUpcallTable)
+//! only be accessed inside    │ fn(mem: &GrantData, kernel_data: &GrantKernelData)
 //! the closure.               ▼
 //! ```
 
@@ -129,8 +133,368 @@ use core::slice;
 
 use crate::kernel::Kernel;
 use crate::process::{Error, Process, ProcessCustomGrantIdentifer, ProcessId};
+use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
+use crate::processbuffer::{ReadOnlyProcessBufferRef, ReadWriteProcessBufferRef};
 use crate::upcall::{Upcall, UpcallError, UpcallId};
 use crate::ErrorCode;
+
+/// Tracks how many upcalls a grant instance supports automatically.
+pub trait UpcallSize {
+    /// The number of upcalls the grant supports.
+    const COUNT: u8;
+}
+
+/// Specifies how many upcalls a grant instance supports automatically.
+pub struct UpcallCount<const NUM: u8>;
+impl<const NUM: u8> UpcallSize for UpcallCount<NUM> {
+    const COUNT: u8 = NUM;
+}
+
+/// Tracks how many read-only allows a grant instance supports automatically.
+pub trait AllowRoSize {
+    /// The number of read-only allows the grant supports.
+    const COUNT: u8;
+}
+
+/// Specifies how many read-only allows a grant instance supports automatically.
+pub struct AllowRoCount<const NUM: u8>;
+impl<const NUM: u8> AllowRoSize for AllowRoCount<NUM> {
+    const COUNT: u8 = NUM;
+}
+
+/// Tracks how many read-write allows a grant instance supports automatically.
+pub trait AllowRwSize {
+    /// The number of read-write allows the grant supports.
+    const COUNT: u8;
+}
+
+/// Specifies how many read-write allows a grant instance supports
+/// automatically.
+pub struct AllowRwCount<const NUM: u8>;
+impl<const NUM: u8> AllowRwSize for AllowRwCount<NUM> {
+    const COUNT: u8 = NUM;
+}
+
+/// Helper that calculated offsets within the kernel owned memory (i.e. the
+/// non-T part of grant).
+///
+/// Example layout of full grant belonging to a single app and driver:
+///
+/// ```text,ignore
+/// 0x003FFC8  ┌────────────────────────────────────┐
+///            │   T                                |
+/// 0x003FFxx  ├  ───────────────────────── ┐ K     |
+///            │   Padding (ensure T aligns)| e     |
+/// 0x003FF44  ├  ───────────────────────── | r     |
+///            │   SavedAllowRwN            | n     |
+///            │   ...                      | e     | G
+///            │   SavedAllowRw1            | l     | r
+///            │   SavedAllowRw0            |       | a
+/// 0x003FF44  ├  ───────────────────────── | O     | n
+///            │   SavedAllowRoN            | w     | t
+///            │   ...                      | n     |
+///            │   SavedAllowRo1            | e     | M
+///            │   SavedAllowRo0            | d     | e
+/// 0x003FF30  ├  ───────────────────────── |       | m
+///            │   SavedUpcallN             | D     | o
+///            │   ...                      | a     | r
+///            │   SavedUpcall1             | t     | y
+///            │   SavedUpcall0             | a     |
+/// 0x003FF24  ├  ───────────────────────── |       |
+///            │   Counters (usize)         |       |
+/// 0x003FF20  └────────────────────────────────────┘
+/// ```
+///
+/// The counters structure is composed as:
+///
+/// ```text,ignore
+/// 0             1             2             3         bytes
+/// |-------------|-------------|-------------|-------------|
+/// | # Upcalls   | # RO Allows | # RW Allows | [unused]    |
+/// |-------------|-------------|-------------|-------------|
+/// ```
+///
+/// This type is created whenever a grant is entered, and is responsible for
+/// ensuring that the grant is closed when it is no longer used. On `Drop`, we
+/// leave the grant. This protects against calling `grant.enter()` without
+/// calling the corresponding `grant.leave()`, perhaps due to accidentally using
+/// the `?` operator.
+struct EnteredGrantKernelManagedLayout<'a> {
+    /// Leaving a grant is handled through the process implementation, so must
+    /// keep a reference to the relevant process.
+    process: &'a dyn Process,
+    /// The grant number of the entered grant that we want to ensure we leave
+    /// properly.
+    grant_num: usize,
+
+    /// The location of the counters structure for the grant.
+    counters_ptr: *mut usize,
+    /// Pointer to the array of saved upcalls.
+    upcalls_array: *mut SavedUpcall,
+    /// Pointer to the array of saved read-only allows.
+    allow_ro_array: *mut SavedAllowRo,
+    /// Pointer to the array of saved read-write allows.
+    allow_rw_array: *mut SavedAllowRw,
+}
+
+/// Represents the number of the upcall elements in the kernel owned section of
+/// the grant.
+#[derive(Copy, Clone)]
+struct UpcallItems(u8);
+/// Represents the number of the read-only allow elements in the kernel owned
+/// section of the grant.
+#[derive(Copy, Clone)]
+struct AllowRoItems(u8);
+/// Represents the number of the read-write allow elements in the kernel owned
+/// section of the grant.
+#[derive(Copy, Clone)]
+struct AllowRwItems(u8);
+/// Represents the size data (in bytes) T within the grant.
+#[derive(Copy, Clone)]
+struct GrantDataSize(usize);
+/// Represents the alignment of data T within the grant.
+#[derive(Copy, Clone)]
+struct GrantDataAlign(usize);
+
+impl<'a> EnteredGrantKernelManagedLayout<'a> {
+    /// Reads the specified pointer as the base of the kernel owned grant region
+    /// that has previously been initialized.
+    ///
+    /// # Safety
+    ///
+    /// The incoming base pointer must be well aligned and already contain
+    /// initialized data in the expected form. There must not be any other
+    /// `EnteredGrantKernelManagedLayout` for the given `base_ptr` at the same
+    /// time, otherwise multiple mutable references to the same upcall/allow
+    /// slices could be created.
+    unsafe fn read_from_base(
+        base_ptr: NonNull<u8>,
+        process: &'a dyn Process,
+        grant_num: usize,
+    ) -> Self {
+        let counters_ptr = base_ptr.as_ptr() as *mut usize;
+        let counters_val = counters_ptr.read();
+
+        // Parse the counters field for each of the fields
+        let [_, _, allow_ro_num, upcalls_num] = u32::to_be_bytes(counters_val as u32);
+
+        // Skip over the counter usize, then the stored array of `SavedAllowRo`
+        // items and `SavedAllowRw` items.
+        let upcalls_array = counters_ptr.add(1) as *mut SavedUpcall;
+        let allow_ro_array = upcalls_array.add(upcalls_num as usize) as *mut SavedAllowRo;
+        let allow_rw_array = allow_ro_array.add(allow_ro_num as usize) as *mut SavedAllowRw;
+
+        Self {
+            process,
+            grant_num,
+            counters_ptr,
+            upcalls_array,
+            allow_ro_array,
+            allow_rw_array,
+        }
+    }
+
+    /// Creates a layout from the specified pointer and lengths of arrays and
+    /// initializes the kernel owned portion of the layout.
+    ///
+    /// # Safety
+    ///
+    /// The incoming base pointer must be well aligned and reference enough
+    /// memory to hold the entire kernel managed grant structure. There must
+    /// not be any other `EnteredGrantKernelManagedLayout` for
+    /// the given `base_ptr` at the same time, otherwise multiple mutable
+    /// references to the same upcall/allow slices could be created.
+    unsafe fn initialize_from_counts(
+        base_ptr: NonNull<u8>,
+        upcalls_num_val: UpcallItems,
+        allow_ro_num_val: AllowRoItems,
+        allow_rw_num_val: AllowRwItems,
+        process: &'a dyn Process,
+        grant_num: usize,
+    ) -> Self {
+        let counters_ptr = base_ptr.as_ptr() as *mut usize;
+
+        // Create the counters usize value by correctly packing the various
+        // counts into 8 bit fields.
+        let counter: usize =
+            u32::from_be_bytes([0, allow_rw_num_val.0, allow_ro_num_val.0, upcalls_num_val.0])
+                as usize;
+
+        let upcalls_array = counters_ptr.add(1) as *mut SavedUpcall;
+        let allow_ro_array = upcalls_array.add(upcalls_num_val.0.into()) as *mut SavedAllowRo;
+        let allow_rw_array = allow_ro_array.add(allow_ro_num_val.0.into()) as *mut SavedAllowRw;
+
+        counters_ptr.write(counter.into());
+        write_default_array(upcalls_array, upcalls_num_val.0.into());
+        write_default_array(allow_ro_array, allow_ro_num_val.0.into());
+        write_default_array(allow_rw_array, allow_rw_num_val.0.into());
+
+        Self {
+            process,
+            grant_num,
+            counters_ptr,
+            upcalls_array,
+            allow_ro_array,
+            allow_rw_array,
+        }
+    }
+
+    /// Returns the entire grant size including the kernel owned memory,
+    /// padding, and data for T. Requires that grant_t_align be a power of 2,
+    /// which is guaranteed from align_of rust calls.
+    fn grant_size(
+        upcalls_num: UpcallItems,
+        allow_ro_num: AllowRoItems,
+        allow_rw_num: AllowRwItems,
+        grant_t_size: GrantDataSize,
+        grant_t_align: GrantDataAlign,
+    ) -> usize {
+        let kernel_managed_size = size_of::<usize>()
+            + upcalls_num.0 as usize * size_of::<SavedUpcall>()
+            + allow_ro_num.0 as usize * size_of::<SavedAllowRo>()
+            + allow_rw_num.0 as usize * size_of::<SavedAllowRw>();
+        // We know that grant_t_align is a power of 2, so we can make a mask
+        // that will save only the remainder bits.
+        let grant_t_align_mask = grant_t_align.0 - 1;
+        // Determine padding to get to the next multiple of grant_t_align by
+        // taking the remainder and subtracting that from the alignment, then
+        // ensuring a full alignment value maps to 0.
+        let padding =
+            (grant_t_align.0 - (kernel_managed_size & grant_t_align_mask)) & grant_t_align_mask;
+        kernel_managed_size + padding + grant_t_size.0
+    }
+
+    /// Returns the alignment of the entire grant region based on the alignment
+    /// of data T.
+    fn grant_align(grant_t_align: GrantDataAlign) -> usize {
+        // The kernel owned memory all aligned to usize. We need to use the
+        // higher of the two alignment to ensure our padding calculations work
+        // for any alignment of T.
+        cmp::max(align_of::<usize>(), grant_t_align.0)
+    }
+
+    /// Returns the offset for the grant data t within the entire grant region.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the specified base pointer is aligned to at
+    /// least the alignment of T and points to a grant that is of size
+    /// grant_size bytes.
+    unsafe fn offset_of_grant_data_t(
+        base_ptr: NonNull<u8>,
+        grant_size: usize,
+        grant_t_size: GrantDataSize,
+    ) -> NonNull<u8> {
+        // The location of the grant data T is the last element in the entire
+        // grant region. Caller must verify that memory is accessible and well
+        // aligned to T.
+        let grant_t_size_usize: usize = grant_t_size.0;
+        NonNull::new_unchecked(base_ptr.as_ptr().add(grant_size - grant_t_size_usize))
+    }
+
+    /// Read an 8 bit value from the counter field offset by the specified
+    /// number of bits. This is a helper function for reading the counter field.
+    fn get_counter_offset(&self, offset_bits: usize) -> usize {
+        // # Safety
+        //
+        // Creating a `EnteredGrantKernelManagedLayout` object requires that the
+        // pointers are well aligned and point to valid memory.
+        let counters_val = unsafe { self.counters_ptr.read() };
+        (counters_val >> offset_bits) & 0xFF
+    }
+
+    /// Return the number of upcalls stored by the core kernel for this grant.
+    fn get_upcalls_number(&self) -> usize {
+        self.get_counter_offset(0)
+    }
+
+    /// Return the number of read-only allow buffers stored by the core kernel
+    /// for this grant.
+    fn get_allow_ro_number(&self) -> usize {
+        self.get_counter_offset(8)
+    }
+
+    /// Return the number of read-write allow buffers stored by the core kernel
+    /// for this grant.
+    fn get_allow_rw_number(&self) -> usize {
+        self.get_counter_offset(16)
+    }
+
+    /// Return mutable access to the slice of stored upcalls for this grant.
+    /// This is necessary for storing a new upcall.
+    fn get_upcalls_slice(&mut self) -> &mut [SavedUpcall] {
+        // # Safety
+        //
+        // Creating a `EnteredGrantKernelManagedLayout` object ensures that the
+        // pointer to the upcall array is valid.
+        unsafe { slice::from_raw_parts_mut(self.upcalls_array, self.get_upcalls_number()) }
+    }
+
+    /// Return mutable access to the slice of stored read-only allow buffers for
+    /// this grant. This is necessary for storing a new read-only allow.
+    fn get_allow_ro_slice(&mut self) -> &mut [SavedAllowRo] {
+        // # Safety
+        //
+        // Creating a `EnteredGrantKernelManagedLayout` object ensures that the
+        // pointer to the RO allow array is valid.
+        unsafe { slice::from_raw_parts_mut(self.allow_ro_array, self.get_allow_ro_number()) }
+    }
+
+    /// Return mutable access to the slice of stored read-write allow buffers
+    /// for this grant. This is necessary for storing a new read-write allow.
+    fn get_allow_rw_slice(&mut self) -> &mut [SavedAllowRw] {
+        // # Safety
+        //
+        // Creating a `EnteredGrantKernelManagedLayout` object ensures that the
+        // pointer to the RW allow array is valid.
+        unsafe { slice::from_raw_parts_mut(self.allow_rw_array, self.get_allow_rw_number()) }
+    }
+
+    /// Return slices to the kernel managed upcalls and allow buffers. This
+    /// permits using upcalls and allow buffers when a capsule is accessing a
+    /// grant.
+    fn get_resource_slices(&self) -> (&[SavedUpcall], &[SavedAllowRo], &[SavedAllowRw]) {
+        // # Safety
+        //
+        // Creating a `EnteredGrantKernelManagedLayout` object ensures that the
+        // pointer to the upcall array is valid.
+        let upcall_slice =
+            unsafe { slice::from_raw_parts(self.upcalls_array, self.get_upcalls_number()) };
+
+        // # Safety
+        //
+        // Creating a `EnteredGrantKernelManagedLayout` object ensures that the
+        // pointer to the RO allow array is valid.
+        let allow_ro_slice =
+            unsafe { slice::from_raw_parts(self.allow_ro_array, self.get_allow_ro_number()) };
+
+        // # Safety
+        //
+        // Creating a `KernelManagedLayout` object ensures that the pointer to
+        // the RW allow array is valid.
+        let allow_rw_slice =
+            unsafe { slice::from_raw_parts(self.allow_rw_array, self.get_allow_rw_number()) };
+
+        (upcall_slice, allow_ro_slice, allow_rw_slice)
+    }
+}
+
+// Ensure that we leave the grant once this goes out of scope.
+impl Drop for EnteredGrantKernelManagedLayout<'_> {
+    fn drop(&mut self) {
+        // ### Safety
+        //
+        // To safely call this function we must ensure that no references will
+        // exist to the grant once `leave_grant()` returns. Because using a
+        // `EnteredGrantKernelManagedLayout` object is the only only way we
+        // access the actual memory of a grant, and we are calling
+        // `leave_grant()` from its `drop()` method, we are sure there will be
+        // no remaining references to the grant.
+        unsafe {
+            self.process.leave_grant(self.grant_num);
+        }
+    }
+}
 
 /// This GrantData object provides access to the memory allocated for a grant
 /// for a specific process.
@@ -170,18 +534,24 @@ impl<'a, T: 'a + ?Sized> DerefMut for GrantData<'a, T> {
     }
 }
 
-/// This GrantUpcallTable object provides a handle to access Upcalls stored on
-/// behalf of a particular grant/driver.
+/// This GrantKernelData object provides a handle to access upcalls and process
+/// buffers stored on behalf of a particular grant/driver.
 ///
-/// Capsules gain access to a GrantUpcallTable object by calling
-/// `Grant::enter()`. From there, they can schedule upcalls. No other access to
-/// upcalls is provided.
+/// Capsules gain access to a GrantKernelData object by calling
+/// `Grant::enter()`. From there, they can schedule upcalls or access process
+/// buffers.
 ///
 /// It is expected that this type will only exist as a short-lived stack
 /// allocation, so its size is not a significant concern.
-pub struct GrantUpcallTable<'a> {
-    /// The mutable reference to the actual object type stored in the grant.
+pub struct GrantKernelData<'a> {
+    /// A reference to the actual upcall slice stored in the grant.
     upcalls: &'a [SavedUpcall],
+
+    /// A reference to the actual read only allow slice stored in the grant.
+    allow_ro: &'a [SavedAllowRo],
+
+    /// A reference to the actual read write allow slice stored in the grant.
+    allow_rw: &'a [SavedAllowRw],
 
     /// We need to keep track of the driver number so we can properly identify
     /// the Upcall that is called. We need to keep track of its source so we can
@@ -193,16 +563,20 @@ pub struct GrantUpcallTable<'a> {
     process: &'a dyn Process,
 }
 
-impl<'a> GrantUpcallTable<'a> {
-    /// Create a `GrantUpcallTable` object to provide a handle for capsules to
+impl<'a> GrantKernelData<'a> {
+    /// Create a `GrantKernelData` object to provide a handle for capsules to
     /// call Upcalls.
     fn new(
         upcalls: &'a [SavedUpcall],
+        allow_ro: &'a [SavedAllowRo],
+        allow_rw: &'a [SavedAllowRw],
         driver_num: usize,
         process: &'a dyn Process,
-    ) -> GrantUpcallTable<'a> {
+    ) -> GrantKernelData<'a> {
         Self {
             upcalls,
+            allow_ro,
+            allow_rw,
             driver_num,
             process,
         }
@@ -240,15 +614,167 @@ impl<'a> GrantUpcallTable<'a> {
             },
         )
     }
+
+    /// Returns a lifetime limited reference to the requested
+    /// `ReadOnlyProcessBuffer`.
+    ///
+    /// The `ReadOnlyProcessBuffer` is only valid for as long as this object is
+    /// valid, i.e. the lifetime of the app enter closure.
+    ///
+    /// If the specified allow number is invalid, then a AddressOutOfBounds will
+    /// be returned. This returns a process::Error to allow for easy chaining of
+    /// this function with the ReadOnlyProcessBuffer::enter function with
+    /// `and_then`.
+    pub fn get_readonly_processbuffer(
+        &self,
+        allow_ro_num: usize,
+    ) -> Result<ReadOnlyProcessBufferRef, crate::process::Error> {
+        self.allow_ro.get(allow_ro_num).map_or(
+            Err(crate::process::Error::AddressOutOfBounds),
+            |saved_ro| {
+                // # Safety
+                //
+                // This is the saved process buffer data has been validated to
+                // be wholly contained within this process before it was stored.
+                // The lifetime of the ReadOnlyProcessBuffer is bound to the
+                // lifetime of self, which correctly limits dereferencing this
+                // saved pointer to only when it is valid.
+                unsafe {
+                    Ok(ReadOnlyProcessBufferRef::new(
+                        saved_ro.ptr,
+                        saved_ro.len,
+                        self.process.processid(),
+                    ))
+                }
+            },
+        )
+    }
+
+    /// Returns a lifetime limited reference to the requested
+    /// `ReadWriteProcessBuffer`.
+    ///
+    /// The ReadWriteProcessBuffer is only value for as long as this object is
+    /// valid, i.e. the lifetime of the app enter closure.
+    ///
+    /// If the specified allow number is invalid, then a AddressOutOfBounds will
+    /// be return. This returns a process::Error to allow for easy chaining of
+    /// this function with the `ReadWriteProcessBuffer::enter()` function with
+    /// `and_then`.
+    pub fn get_readwrite_processbuffer(
+        &self,
+        allow_rw_num: usize,
+    ) -> Result<ReadWriteProcessBufferRef, crate::process::Error> {
+        self.allow_rw.get(allow_rw_num).map_or(
+            Err(crate::process::Error::AddressOutOfBounds),
+            |saved_rw| {
+                // # Safety
+                //
+                // This is the saved process buffer data has been validated to
+                // be wholly contained within this process before it was stored.
+                // The lifetime of the ReadWriteProcessBuffer is bound to the
+                // lifetime of self, which correctly limits dereferencing this
+                // saved pointer to only when it is valid.
+                unsafe {
+                    Ok(ReadWriteProcessBufferRef::new(
+                        saved_rw.ptr,
+                        saved_rw.len,
+                        self.process.processid(),
+                    ))
+                }
+            },
+        )
+    }
 }
 
-/// A minimal representation of an upcall, used for storing an upcall
-/// in a process' grant table without wasting memory duplicating information
-/// such as process ID.
+/// A minimal representation of an upcall, used for storing an upcall in a
+/// process' grant table without wasting memory duplicating information such as
+/// process ID.
 #[repr(C)]
-pub(crate) struct SavedUpcall {
-    pub(crate) appdata: usize,
-    pub(crate) fn_ptr: Option<NonNull<()>>,
+#[derive(Default)]
+struct SavedUpcall {
+    appdata: usize,
+    fn_ptr: Option<NonNull<()>>,
+}
+
+/// A minimal representation of a read-only allow from app, used for storing a
+/// read-only allow in a process' kernel managed grant space without wasting
+/// memory duplicating information such as process ID.
+#[repr(C)]
+struct SavedAllowRo {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl Default for SavedAllowRo {
+    fn default() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
+}
+
+/// A minimal representation of a read-write allow from app, used for storing a
+/// read-write allow in a process' kernel managed grant space without wasting
+/// memory duplicating information such as process ID.
+#[repr(C)]
+struct SavedAllowRw {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Default for SavedAllowRw {
+    fn default() -> Self {
+        Self {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+/// Write the default value of T to every element of the array.
+///
+/// # Safety
+///
+/// The pointer must be well aligned and point to allocated memory that is
+/// writable for `size_of::<T> * num` bytes. No Rust references may exist to
+/// memory in the address range spanned by `base..base+num` at the time this
+/// function is called. The memory does not need to be initialized yet. If it
+/// already does contain initialized memory, then those contents will be
+/// overwritten without being `Drop`ed first.
+unsafe fn write_default_array<T: Default>(base: *mut T, num: usize) {
+    for i in 0..num {
+        base.add(i).write(T::default());
+    }
+}
+
+/// Enters the grant for the specified process. Caller must hold on to the grant
+/// lifetime guard while they accessing the memory in the layout (second
+/// element).
+fn enter_grant_kernel_managed(
+    process: &dyn Process,
+    driver_num: usize,
+) -> Result<EnteredGrantKernelManagedLayout, ErrorCode> {
+    let grant_num = process.lookup_grant_from_driver_num(driver_num)?;
+
+    // Check if the grant has been allocated, and if not we cannot enter this
+    // grant.
+    match process.grant_is_allocated(grant_num) {
+        Some(true) => { /* Allocated, nothing to do */ }
+        Some(false) => return Err(ErrorCode::NOMEM),
+        None => return Err(ErrorCode::FAIL),
+    };
+
+    // Return early if no grant.
+    let grant_base_ptr = process.enter_grant(grant_num).or(Err(ErrorCode::NOMEM))?;
+    // # Safety
+    //
+    // We know that this pointer is well aligned and initialized with meaningful
+    // data when the grant region was allocated.
+    let layout = unsafe {
+        EnteredGrantKernelManagedLayout::read_from_base(grant_base_ptr, process, grant_num)
+    };
+    Ok(layout)
 }
 
 /// Subscribe to an upcall by saving the upcall in the grant region for the
@@ -257,38 +783,11 @@ pub(crate) fn subscribe(
     process: &dyn Process,
     upcall: Upcall,
 ) -> Result<Upcall, (Upcall, ErrorCode)> {
-    let grant_num = match process.lookup_grant_from_driver_num(upcall.upcall_id.driver_num) {
-        Ok(grant_num) => grant_num,
-        Err(e) => return Err((upcall, e.into())),
+    // Enter grant and keep it open until _grant_open goes out of scope.
+    let mut layout = match enter_grant_kernel_managed(process, upcall.upcall_id.driver_num) {
+        Ok(val) => val,
+        Err(e) => return Err((upcall, e)),
     };
-
-    // Check if the grant has been allocated, and if not we cannot handle the
-    // subscribe call.
-    if let Some(is_allocated) = process.grant_is_allocated(grant_num) {
-        if !is_allocated {
-            return Err((upcall, ErrorCode::NOMEM));
-        }
-    } else {
-        // Process is no longer active, this case will never happen.
-        return Err((upcall, ErrorCode::FAIL));
-    }
-
-    // Return early if no grant.
-    let grant_ptr = match process.enter_grant(grant_num) {
-        Ok(grant_ptr) => grant_ptr,
-        Err(_) => return Err((upcall, ErrorCode::NOMEM)),
-    };
-
-    // The number of upcalls is stored first.
-    //
-    // # Safety
-    //
-    // This is safe because of how we created the grant region that starts at
-    // this pointer. The grant structure does not change once it has been
-    // allocated, and if we can enter the grant we know it must be allocated. We
-    // verified the pointer is correctly aligned and that the first value in the
-    // grant is the `usize` sized number of upcalls.
-    let num_upcalls = unsafe { *(grant_ptr as *const usize) };
 
     // Create the saved upcalls slice from the grant memory.
     //
@@ -296,19 +795,13 @@ pub(crate) fn subscribe(
     //
     // This is safe because of how the grant was initially allocated and that
     // because we were able to enter the grant the grant region must be valid
-    // and initialized. We increment past the usize length and the next memory
-    // is a slice of `SavedUpcall`s. We verified pointer alignment at
-    // initialization.
-    let saved_upcalls_slice = unsafe {
-        slice::from_raw_parts_mut(
-            grant_ptr.add(size_of::<usize>()) as *mut SavedUpcall,
-            num_upcalls,
-        )
-    };
+    // and initialized. We are also holding the grant open until `_grant_open`
+    // goes out of scope.
+    let saved_upcalls_slice = layout.get_upcalls_slice();
 
     // Index into the saved upcall slice to get the old upcall. Use .get in case
     // userspace passed us a bad subscribe number.
-    let rval = match saved_upcalls_slice.get_mut(upcall.upcall_id.subscribe_num) {
+    match saved_upcalls_slice.get_mut(upcall.upcall_id.subscribe_num) {
         Some(saved_upcall) => {
             // Create an `Upcall` object with the old saved upcall.
             let old_upcall = Upcall::new(
@@ -326,13 +819,103 @@ pub(crate) fn subscribe(
             Ok(old_upcall)
         }
         None => Err((upcall, ErrorCode::INVAL)),
+    }
+}
+
+/// Stores the specified read-only process buffer in the kernel managed grant
+/// region for this process and driver. The previous read-only process buffer
+/// stored at the same allow_num id is returned.
+pub(crate) fn allow_ro(
+    process: &dyn Process,
+    driver_num: usize,
+    allow_num: usize,
+    buffer: ReadOnlyProcessBuffer,
+) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
+    // Enter grant and keep it open until `_grant_open` goes out of scope.
+    let mut layout = match enter_grant_kernel_managed(process, driver_num) {
+        Ok(val) => val,
+        Err(e) => return Err((buffer, e)),
     };
 
-    // Now that we have finished modifying the grant region we need to "release"
-    // the grant.
-    process.leave_grant(grant_num);
+    // Create the saved allow ro slice from the grant memory.
+    //
+    // # Safety
+    //
+    // This is safe because of how the grant was initially allocated and that
+    // because we were able to enter the grant the grant region must be valid
+    // and initialized. We are also holding the grant open until _grant_open
+    // goes out of scope.
+    let saved_allow_ro_slice = layout.get_allow_ro_slice();
 
-    rval
+    // Index into the saved slice to get the old value. Use .get in case
+    // userspace passed us a bad allow number.
+    match saved_allow_ro_slice.get_mut(allow_num) {
+        Some(saved) => {
+            // # Safety
+            //
+            // The pointer has already been validated to be within application
+            // memory before storing the values in the saved slice.
+            let old_allow =
+                unsafe { ReadOnlyProcessBuffer::new(saved.ptr, saved.len, process.processid()) };
+
+            // Replace old values with current buffer.
+            let (ptr, len) = buffer.consume();
+            saved.ptr = ptr;
+            saved.len = len;
+
+            // Success!
+            Ok(old_allow)
+        }
+        None => Err((buffer, ErrorCode::INVAL)),
+    }
+}
+
+/// Stores the specified read-write process buffer in the kernel managed grant
+/// region for this process and driver. The previous read-write process buffer
+/// stored at the same allow_num id is returned.
+pub(crate) fn allow_rw(
+    process: &dyn Process,
+    driver_num: usize,
+    allow_num: usize,
+    buffer: ReadWriteProcessBuffer,
+) -> Result<ReadWriteProcessBuffer, (ReadWriteProcessBuffer, ErrorCode)> {
+    // Enter grant and keep it open until `_grant_open` goes out of scope.
+    let mut layout = match enter_grant_kernel_managed(process, driver_num) {
+        Ok(val) => val,
+        Err(e) => return Err((buffer, e)),
+    };
+
+    // Create the saved allow rw slice from the grant memory.
+    //
+    // # Safety
+    //
+    // This is safe because of how the grant was initially allocated and that
+    // because we were able to enter the grant the grant region must be valid
+    // and initialized. We are also holding the grant open until `_grant_open`
+    // goes out of scope.
+    let saved_allow_rw_slice = layout.get_allow_rw_slice();
+
+    // Index into the saved slice to get the old value. Use .get in case
+    // userspace passed us a bad allow number.
+    match saved_allow_rw_slice.get_mut(allow_num) {
+        Some(saved) => {
+            // # Safety
+            //
+            // The pointer has already been validated to be within application
+            // memory before storing the values in the saved slice.
+            let old_allow =
+                unsafe { ReadWriteProcessBuffer::new(saved.ptr, saved.len, process.processid()) };
+
+            // Replace old values with current buffer.
+            let (ptr, len) = buffer.consume();
+            saved.ptr = ptr;
+            saved.len = len;
+
+            // Success!
+            Ok(old_allow)
+        }
+        None => Err((buffer, ErrorCode::INVAL)),
+    }
 }
 
 /// An instance of a grant allocated for a particular process.
@@ -343,7 +926,13 @@ pub(crate) fn subscribe(
 ///
 /// This is created from a `Grant` when that grant is entered for a specific
 /// process.
-pub struct ProcessGrant<'a, T: 'a, const NUM_UPCALLS: usize> {
+pub struct ProcessGrant<
+    'a,
+    T: 'a,
+    Upcalls: UpcallSize,
+    AllowROs: AllowRoSize,
+    AllowRWs: AllowRwSize,
+> {
     /// The process the grant is applied to.
     ///
     /// We use a reference here because instances of `ProcessGrant` are very
@@ -358,11 +947,13 @@ pub struct ProcessGrant<'a, T: 'a, const NUM_UPCALLS: usize> {
     /// The identifier of the Grant this is applied for.
     grant_num: usize,
 
-    /// Used to keep the Rust type of the grant.
-    _phantom: PhantomData<T>,
+    /// Used to store Rust types for grant.
+    _phantom: PhantomData<(T, Upcalls, AllowROs, AllowRWs)>,
 }
 
-impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> {
+impl<'a, T: Default, Upcalls: UpcallSize, AllowROs: AllowRoSize, AllowRWs: AllowRwSize>
+    ProcessGrant<'a, T, Upcalls, AllowROs, AllowRWs>
+{
     /// Create a `ProcessGrant` for the given Grant in the given Process's grant
     /// region.
     ///
@@ -374,7 +965,10 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
     /// If the grant is already allocated or could be allocated, and the process
     /// is valid, this returns `Ok(ProcessGrant)`. Otherwise it returns a
     /// relevant error.
-    fn new(grant: &Grant<T, NUM_UPCALLS>, processid: ProcessId) -> Result<Self, Error> {
+    fn new(
+        grant: &Grant<T, Upcalls, AllowROs, AllowRWs>,
+        processid: ProcessId,
+    ) -> Result<Self, Error> {
         // Moves non-generic code from new() into non-generic function to reduce
         // code bloat from the generic function being monomorphized, as it is
         // common to have over 50 copies of Grant::enter() in a Tock kernel (and
@@ -384,9 +978,11 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
         fn new_inner<'a>(
             grant_num: usize,
             driver_num: usize,
-            grant_t_size: usize,
-            grant_t_align: usize,
-            num_upcalls: usize,
+            grant_t_size: GrantDataSize,
+            grant_t_align: GrantDataAlign,
+            num_upcalls: UpcallItems,
+            num_allow_ros: AllowRoItems,
+            num_allow_rws: AllowRwItems,
             processid: ProcessId,
         ) -> Result<(Option<NonNull<u8>>, &'a dyn Process), Error> {
             // Here is an example of how the grants are laid out in the grant
@@ -428,185 +1024,61 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
             // grant.
             if let Some(is_allocated) = process.grant_is_allocated(grant_num) {
                 if !is_allocated {
-                    // Allocate space in the process's memory for enough space
-                    // for upcalls and something of type `T` for the grant.
-                    //
-                    // Here is an example layout of the grant allocation:
-                    //
-                    // Mem. Addr.
-                    // 0x003FFC8  ┌────────────────────────────────────  G
-                    //            │   T                                  r
-                    // 0x003FFxx  ├  ─────────────────────────           a
-                    //            │   Padding    (ensure T alignment)    n
-                    // 0x003FFxx  ├  ─────────────────────────           t
-                    //            │   SavedUpcallN                       M
-                    //            │   ...                                e
-                    //            │   SavedUpcall1                       m
-                    //            │   SavedUpcall0                       o
-                    // 0x003FF24  ├  ─────────────────────────           r
-                    //            │   NumUpcalls (usize)                 y
-                    // 0x003FF20  └────────────────────────────────────  1
-                    //
-                    // Note: This allocation is intentionally never freed. A
-                    // grant region is valid once allocated for the lifetime of
-                    // the process.
-                    //
-                    // If the grant could not be allocated this will cause the
-                    // `new()` function to return with an error.
+                    // Calculate the alignment and size for entire grant region.
+                    let alloc_align = EnteredGrantKernelManagedLayout::grant_align(grant_t_align);
+                    let alloc_size = EnteredGrantKernelManagedLayout::grant_size(
+                        num_upcalls,
+                        num_allow_ros,
+                        num_allow_rws,
+                        grant_t_size,
+                        grant_t_align,
+                    );
 
-                    // For the upcalls we need one word for the number of
-                    // upcalls, and then that many SavedUpcalls.
-                    let upcalls_size =
-                        size_of::<usize>() + (num_upcalls * size_of::<SavedUpcall>());
+                    // Allocate grant, the memory is still uninitialized though.
+                    if !process.allocate_grant(grant_num, driver_num, alloc_size, alloc_align) {
+                        return Err(Error::OutOfMemory);
+                    }
 
-                    // As the number of upcalls comes first we need to make sure
-                    // the num_upcalls usize is properly aligned. Then, we
-                    // assume SavedUpcall is also properly aligned to the same
-                    // alignment, and can go immediately after the num_upcalls
-                    // usize. If that were to ever not be true this alignment
-                    // and padding calculation would be wrong.
-                    let upcalls_align = align_of::<usize>();
+                    let grant_ptr = process.enter_grant(grant_num)?;
 
-                    // Calculate the padding needed between the upcalls data and
-                    // T such that T will be properly aligned assuming the grant
-                    // starts at the correct alignment for an object of type T.
-                    let upcalls_padding = grant_t_align - (upcalls_size % grant_t_align);
-
-                    // Calculate the alignment to use for both the upcalls and
-                    // T.
-                    let alloc_align = cmp::max(upcalls_align, grant_t_align);
-
-                    // Now we can calculate the entire size of the grant.
-                    let alloc_size = upcalls_size + upcalls_padding + grant_t_size;
-
-                    let (ptr_upcall_count, optional_ptr_first_upcall, raw_ptr_grant_nn) = process
-                        .allocate_grant(grant_num, driver_num, alloc_size, alloc_align)
-                        .map_or(Err(Error::OutOfMemory), |buf| {
-                            // Number of upcalls.
-                            let ptr_upcall_count = NonNull::cast::<usize>(buf);
-
-                            // Upcall array.
-
-                            // Only create the pointer to the first upcall if we
-                            // actually have memory for the SavedUpcall to
-                            // exist.
-                            let optional_ptr_first_upcall = if num_upcalls > 0 {
-                                // # Safety
-                                //
-                                // It is safe to construct a *u8 pointer to the
-                                // start of the upcalls array because we ensured
-                                // that the memory is both valid and aligned by
-                                // performing the allocation.
-                                let raw_ptr_upcalls =
-                                    unsafe { buf.as_ptr().add(size_of::<usize>()) };
-                                // # Safety
-                                //
-                                // We know that `raw_ptr_upcalls` is not null
-                                // because it exists within a successful grant
-                                // allocation.
-                                let raw_ptr_upcalls_nn =
-                                    unsafe { NonNull::new_unchecked(raw_ptr_upcalls) };
-                                // We only construct a pointer to the first
-                                // SavedUpcall in the array because the memory
-                                // is not initialized yet. Also we know that
-                                // there will be at least one SavedUpcall in the
-                                // array. We do not create a slice because the
-                                // memory is not initialized.
-                                let ptr_first_upcall =
-                                    NonNull::cast::<SavedUpcall>(raw_ptr_upcalls_nn);
-
-                                Some(ptr_first_upcall)
-                            } else {
-                                None
-                            };
-
-                            // Get raw pointer to grant type T so that only
-                            // remaining step in outer (generic) function it to
-                            // cast the pointer to a pointer to T and initialize
-                            // it if needed.
-
-                            // # Safety
-                            //
-                            // This is safe because we ensure that this pointer
-                            // remains in valid memory because of the allocation
-                            // we just completed.
-                            let raw_ptr_grant = unsafe {
-                                buf.as_ptr().add(
-                                    size_of::<usize>()
-                                        + upcalls_padding
-                                        + (num_upcalls * size_of::<SavedUpcall>()),
-                                )
-                            };
-                            // # Safety
-                            //
-                            // We know that `raw_ptr_grant` is not null because
-                            // it exists within a successful grant allocation.
-                            let raw_ptr_grant_nn = unsafe { NonNull::new_unchecked(raw_ptr_grant) };
-
-                            Ok((
-                                ptr_upcall_count,
-                                optional_ptr_first_upcall,
-                                raw_ptr_grant_nn,
-                            ))
-                        })?;
-
-                    // Initialize the grant allocation and its various fields.
-
-                    // Number of upcalls.
+                    // Create a layout from the counts we have and initialize
+                    // all memory so it is valid in the future to read as a
+                    // reference.
                     //
                     // # Safety
                     //
-                    // Writing memory at an arbitrary pointer is unsafe. We are
-                    // safe to do this here because the following conditions are
-                    // met:
-                    //
-                    // 1. The pointer address is valid. The pointer is allocated
-                    //    statically in process memory, and will exist for as
-                    //    long as the process does. The grant is only accessible
-                    //    while the process is still valid.
-                    //
-                    // 2. The pointer is correctly aligned because we calculated
-                    //    the alignment before calling `allocate_grant()` which
-                    //    ensures the pointer is correctly aligned.
+                    // - The grant base pointer is well aligned, yet does not
+                    //   have initialized data.
+                    // - The pointer points to a large enough space to correctly
+                    //   write to is guaranteed by alloc of size
+                    //   `EnteredGrantKernelManagedLayout::grant_size`.
+                    // - There are no proper rust references that map to these
+                    //   addresses.
                     unsafe {
-                        // Insert length of upcalls.
-                        write(ptr_upcall_count.as_ptr(), num_upcalls);
+                        let _layout = EnteredGrantKernelManagedLayout::initialize_from_counts(
+                            grant_ptr,
+                            num_upcalls,
+                            num_allow_ros,
+                            num_allow_rws,
+                            process,
+                            grant_num,
+                        );
                     }
 
-                    // SavedUpcalls
+                    // # Safety
                     //
-                    // Only try to initialize upcalls if this grant actually has
-                    // any.
-                    optional_ptr_first_upcall.map(|ptr_first_upcall| {
-                        // Initialize the SavedUpcalls in an explicit loop. We
-                        // do not use a slice because before this runs the
-                        // SavedUpcalls are not initialized and creating a slice
-                        // to uninitialized memory is not safe.
-                        for i in 0..num_upcalls {
-                            // # Safety
-                            //
-                            // This is safe because we have allocated enough
-                            // space for `num_upcalls` and that each SavedUpcall
-                            // is at least aligned to `usize` bytes.
-                            let ptr_upcall = unsafe { ptr_first_upcall.as_ptr().add(i) };
-                            // # Safety
-                            //
-                            // This is safe because the pointer is valid, aligned,
-                            // and will live as long as the process does.
-                            unsafe {
-                                write(
-                                    ptr_upcall,
-                                    SavedUpcall {
-                                        appdata: 0,
-                                        fn_ptr: None,
-                                    },
-                                );
-                            }
-                        }
-                    });
-                    // If we got here, we allocated space for a T, and outer
-                    // (generic) function must initialize it.
-                    Ok((Some(raw_ptr_grant_nn), process))
+                    // The grant pointer points to an alloc that is alloc_size
+                    // large and is at least as aligned as grant_t_align.
+                    unsafe {
+                        Ok((
+                            Some(EnteredGrantKernelManagedLayout::offset_of_grant_data_t(
+                                grant_ptr,
+                                alloc_size,
+                                grant_t_size,
+                            )),
+                            process,
+                        ))
+                    }
                 } else {
                     // T was already allocated, outer function should not
                     // initialize T.
@@ -623,9 +1095,11 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
         let (opt_raw_grant_ptr_nn, process) = new_inner(
             grant.grant_num,
             grant.driver_num,
-            size_of::<T>(),
-            align_of::<T>(),
-            NUM_UPCALLS,
+            GrantDataSize(size_of::<T>()),
+            GrantDataAlign(align_of::<T>()),
+            UpcallItems(Upcalls::COUNT),
+            AllowRoItems(AllowROs::COUNT),
+            AllowRwItems(AllowRWs::COUNT),
             processid,
         )?;
 
@@ -649,8 +1123,7 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
                 //    object starts a multiple of `align_of<T>` from the
                 //    beginning of the allocation.
                 unsafe {
-                    // Convert untyped `*mut u8` allocation to
-                    // allocated type
+                    // Convert untyped `*mut u8` allocation to allocated type.
                     let new_region = NonNull::cast::<T>(allocated_ptr);
                     // We use `ptr::write` to avoid `Drop`ping the uninitialized
                     // memory in case `T` implements the `Drop` trait.
@@ -660,8 +1133,8 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
             None => {} // Case if grant was already allocated.
         }
 
-        // We have ensured the grant is already allocated or was just
-        // allocated, so we can create and return the `ProcessGrant` type.
+        // We have ensured the grant is already allocated or was just allocated,
+        // so we can create and return the `ProcessGrant` type.
         Ok(ProcessGrant {
             process: process,
             driver_num: grant.driver_num,
@@ -673,7 +1146,10 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
     /// Return an `ProcessGrant` for a grant in a process if the process is
     /// valid and that process grant has already been allocated, or `None`
     /// otherwise.
-    fn new_if_allocated(grant: &Grant<T, NUM_UPCALLS>, process: &'a dyn Process) -> Option<Self> {
+    fn new_if_allocated(
+        grant: &Grant<T, Upcalls, AllowROs, AllowRWs>,
+        process: &'a dyn Process,
+    ) -> Option<Self> {
         if let Some(is_allocated) = process.grant_is_allocated(grant.grant_num) {
             if is_allocated {
                 Some(ProcessGrant {
@@ -698,8 +1174,8 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
     }
 
     /// Run a function with access to the memory in the related process for the
-    /// related Grant. This also provides access to any associated Upcalls
-    /// stored with the grant.
+    /// related Grant. This also provides access to any associated Upcalls and
+    /// allowed buffers stored with the grant.
     ///
     /// This is "entering" the grant region, and the _only_ time when the
     /// contents of a grant region can be accessed.
@@ -709,7 +1185,7 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
     /// panic!()`. See the comment in `access_grant()` for more information.
     pub fn enter<F, R>(self, fun: F) -> R
     where
-        F: FnOnce(&mut GrantData<T>, &GrantUpcallTable) -> R,
+        F: FnOnce(&mut GrantData<T>, &GrantKernelData) -> R,
     {
         // # `unwrap()` Safety
         //
@@ -774,7 +1250,7 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
     /// `Some(fun())`.
     pub fn try_enter<F, R>(self, fun: F) -> Option<R>
     where
-        F: FnOnce(&mut GrantData<T>, &GrantUpcallTable) -> R,
+        F: FnOnce(&mut GrantData<T>, &GrantKernelData) -> R,
     {
         self.access_grant(fun, false)
     }
@@ -792,7 +1268,7 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
     /// panic!()`. See the comment in `access_grant()` for more information.
     pub fn enter_with_allocator<F, R>(self, fun: F) -> R
     where
-        F: FnOnce(&mut GrantData<T>, &GrantUpcallTable, &mut GrantRegionAllocator) -> R,
+        F: FnOnce(&mut GrantData<T>, &GrantKernelData, &mut GrantRegionAllocator) -> R,
     {
         // # `unwrap()` Safety
         //
@@ -810,11 +1286,27 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
     /// return `None` if the grant region is entered and do nothing.
     fn access_grant<F, R>(self, fun: F, panic_on_reenter: bool) -> Option<R>
     where
-        F: FnOnce(&mut GrantData<T>, &GrantUpcallTable) -> R,
+        F: FnOnce(&mut GrantData<T>, &GrantKernelData) -> R,
+    {
+        self.access_grant_with_allocator(
+            |grant_data, kernel_data, _allocator| fun(grant_data, kernel_data),
+            panic_on_reenter,
+        )
+    }
+
+    /// Access the `ProcessGrant` memory and run a closure on the process's
+    /// grant memory.
+    ///
+    /// If `panic_on_reenter` is `true`, this will panic if the grant region is
+    /// already currently entered. If `panic_on_reenter` is `false`, this will
+    /// return `None` if the grant region is entered and do nothing.
+    fn access_grant_with_allocator<F, R>(self, fun: F, panic_on_reenter: bool) -> Option<R>
+    where
+        F: FnOnce(&mut GrantData<T>, &GrantKernelData, &mut GrantRegionAllocator) -> R,
     {
         // Access the grant that is in process memory. This can only fail if
         // the grant is already entered.
-        let optional_grant_ptr = self
+        let grant_ptr = self
             .process
             .enter_grant(self.grant_num)
             .map_err(|_err| {
@@ -879,189 +1371,70 @@ impl<'a, T: Default, const NUM_UPCALLS: usize> ProcessGrant<'a, T, NUM_UPCALLS> 
                 // grant regions.
                 panic!("Attempted to re-enter a grant region.");
             })
-            .ok();
+            .ok()?;
+        let grant_t_align = GrantDataAlign(align_of::<T>());
+        let grant_t_size = GrantDataSize(size_of::<T>());
 
-        // Return early if no grant. Type annotation for unsafe correctness.
-        let grant_ptr: *mut u8 = if let Some(ptr) = optional_grant_ptr {
-            ptr
-        } else {
-            return None;
+        let alloc_size = EnteredGrantKernelManagedLayout::grant_size(
+            UpcallItems(Upcalls::COUNT),
+            AllowRoItems(AllowROs::COUNT),
+            AllowRwItems(AllowRWs::COUNT),
+            grant_t_size,
+            grant_t_align,
+        );
+
+        // Parse layout of entire grant allocation using the known base pointer.
+        //
+        // # Safety
+        //
+        // Grant pointer is well aligned and points to initialized data.
+        let layout = unsafe {
+            EnteredGrantKernelManagedLayout::read_from_base(grant_ptr, self.process, self.grant_num)
         };
 
-        // See new() for more explanation on these calculations.
-        let upcalls_size = size_of::<usize>() + (NUM_UPCALLS * size_of::<SavedUpcall>());
-        let grant_t_align = align_of::<T>();
-        let upcalls_padding = grant_t_align - (upcalls_size % grant_t_align);
-
-        // `grant_ptr` now refers to the special memory we store for each
-        // `Grant` which contains the number of upcalls for this grant, an array
-        // of upcall data, some potential padding, and then the object of type
-        // T.
-        //
-        // To get to the correct pointer where object of type T is store, we
-        // have to increment the pointer past our saved upcall state and
-        // padding.
+        // Get references to all of the saved upcall data.
         //
         // # Safety
         //
-        // This pointer is safe because it is a *u8 and we offset it the same
-        // number of bytes as when the grant memory was originally allocated.
-        let grant_type_ptr = unsafe { grant_ptr.add(upcalls_size + upcalls_padding) };
-
-        // # Safety
-        //
-        // This pointer is safe because it is a *u8 and we offset it the correct
-        // number of bytes to the start of the `SavedUpcall` array.
-        let saved_upcalls_ptr = unsafe { grant_ptr.add(size_of::<usize>()) };
-        // # Safety
-        //
-        // Creating this slice is safe because the pointer is in the grant
-        // allocation that is guaranteed to still exist, a grant can only be
-        // entered once at a time so this is the only mutable reference to this
-        // slice, and the slice has valid SavedUpcalls which are guaranteed to
-        // be initialized.
-        let saved_upcalls_slice =
-            unsafe { slice::from_raw_parts(saved_upcalls_ptr as *mut SavedUpcall, NUM_UPCALLS) };
-
-        // Process only holds the grant's memory, but does not know the actual
-        // type of the grant. We case the type here so that the user of the
-        // grant is restricted by the type system to access this memory safely.
-        //
-        // # Safety
-        //
-        // This is safe as long as the memory at grant_ptr is correctly aligned,
-        // the correct size for type `T`, is only ever cast as a `T`, and only
-        // one reference to the object exists. We guarantee this because type
-        // `T` cannot change, and we ensure the size and alignment are correct
-        // when the grant is allocated. We ensure that only one reference can
-        // ever exist by marking the grant entered in `enter_grant()`, and
-        // subsequent calls to `enter_grant()` will fail.
-        let grant = unsafe { &mut *(grant_type_ptr as *mut T) };
-
-        // Create a wrapped object that is passed to the capsule.
-        let mut grant_data = GrantData::new(grant);
-        // Create a wrapped object that gives access to the upcalls for this
-        // driver.
-        let upcall_table =
-            GrantUpcallTable::new(saved_upcalls_slice, self.driver_num, self.process);
-
-        // Allow the capsule to access the grant.
-        let res = fun(&mut grant_data, &upcall_table);
-
-        // Now that the capsule has finished we need to "release" the grant.
-        // This will mark it as no longer entered and allow the grant to be used
-        // in the future.
-        self.process.leave_grant(self.grant_num);
-
-        Some(res)
-    }
-
-    /// Access the `ProcessGrant` memory and run a closure on the process's
-    /// grant memory.
-    ///
-    /// If `panic_on_reenter` is `true`, this will panic if the grant region is
-    /// already currently entered. If `panic_on_reenter` is `false`, this will
-    /// return `None` if the grant region is entered and do nothing.
-    fn access_grant_with_allocator<F, R>(self, fun: F, panic_on_reenter: bool) -> Option<R>
-    where
-        F: FnOnce(&mut GrantData<T>, &GrantUpcallTable, &mut GrantRegionAllocator) -> R,
-    {
-        // Access the grant that is in process memory. This can only fail if
-        // the grant is already entered.
-        let optional_grant_ptr = self
-            .process
-            .enter_grant(self.grant_num)
-            .map_err(|_err| {
-                // If we get an error it is because the grant is already
-                // entered. `process.enter_grant()` can fail for several
-                // reasons, but only the double enter case can happen once a
-                // grant has been applied. The other errors would be detected
-                // earlier (i.e. before the grant can be applied).
-
-                // If `panic_on_reenter` is false, we skip this error and do
-                // nothing with this grant.
-                if !panic_on_reenter {
-                    return;
-                }
-
-                // See `access_grant()` for an explanation of this panic.
-                panic!("Attempted to re-enter a grant region.");
-            })
-            .ok();
-
-        // # `unwrap()` Safety
-        //
-        // Only `unwrap()` if some, otherwise return early.
-        let grant_ptr: *mut u8 = if optional_grant_ptr.is_some() {
-            optional_grant_ptr.unwrap()
-        } else {
-            return None;
+        // - Pointer is well aligned and initialized with data from Self::new()
+        //   call.
+        // - Data will not be modified externally while this immutable reference
+        //   is alive.
+        // - Data is accessible for the entire duration of this immutable
+        //   reference.
+        // - No other mutable reference to this memory exists concurrently.
+        //   Mutable reference to this memory are only created through the
+        //   kernel in the syscall interface which is serialized in time with
+        //   this call.
+        let (saved_upcalls_slice, saved_allow_ro_slice, saved_allow_rw_slice) =
+            layout.get_resource_slices();
+        let grant_data = unsafe {
+            EnteredGrantKernelManagedLayout::offset_of_grant_data_t(
+                grant_ptr,
+                alloc_size,
+                grant_t_size,
+            )
+            .cast()
+            .as_mut()
         };
 
-        // See new() for more explanation on these calculations.
-        let upcalls_size = size_of::<usize>() + (NUM_UPCALLS * size_of::<SavedUpcall>());
-        let grant_t_align = align_of::<T>();
-        let upcalls_padding = grant_t_align - (upcalls_size % grant_t_align);
-
-        // # Safety
-        //
-        // This pointer is safe because it is a *u8 and we offset it the same
-        // number of bytes as when the grant memory was originally allocated.
-        let grant_type_ptr = unsafe { grant_ptr.add(upcalls_size + upcalls_padding) };
-
-        // # Safety
-        //
-        // This pointer is safe because it is a *u8 and we offset it the correct
-        // number of bytes to the start of the `SavedUpcall` array.
-        let saved_upcalls_ptr = unsafe { grant_ptr.add(size_of::<usize>()) };
-        // # Safety
-        //
-        // Creating this slice is safe because the pointer is in the grant
-        // allocation that is guaranteed to still exist, a grant can only be
-        // entered once at a time so this is the only mutable reference to this
-        // slice, and the slice has valid SavedUpcalls which are guaranteed to
-        // be initialized.
-        let saved_upcalls_slice =
-            unsafe { slice::from_raw_parts(saved_upcalls_ptr as *mut SavedUpcall, NUM_UPCALLS) };
-
-        // Process only holds the grant's memory, but does not know the actual
-        // type of the grant. We case the type here so that the user of the
-        // grant is restricted by the type system to access this memory safely.
-        //
-        // # Safety
-        //
-        // This is safe as long as the memory at grant_ptr is correctly aligned,
-        // the correct size for type `T`, is only every cast as a `T`, and only
-        // one reference to the object exists. We guarantee this because type
-        // `T` cannot change, and we ensure the size and alignment are correct
-        // when the grant is allocated. We ensure that only one reference can
-        // ever exist by marking the grant entered in `enter_grant()`, and
-        // subsequent calls to `enter_grant()` will fail.
-        let grant = unsafe { &mut *(grant_type_ptr as *mut T) };
-
-        // Create a wrapped object that is passed to the capsule.
-        let mut grant_data = GrantData::new(grant);
-
+        // Create a wrapped objects that are passed to functor.
+        let mut grant_data = GrantData::new(grant_data);
+        let kernel_data = GrantKernelData::new(
+            saved_upcalls_slice,
+            saved_allow_ro_slice,
+            saved_allow_rw_slice,
+            self.driver_num,
+            self.process,
+        );
         // Setup an allocator in case the capsule needs additional memory in the
         // grant space.
         let mut allocator = GrantRegionAllocator {
             processid: self.process.processid(),
         };
 
-        // Create a wrapped object that gives access to the upcalls for this
-        // driver.
-        let upcall_table =
-            GrantUpcallTable::new(saved_upcalls_slice, self.driver_num, self.process);
-
-        // Allow the capsule to access the grant.
-        let res = fun(&mut grant_data, &upcall_table, &mut allocator);
-
-        // Now that the capsule has finished we need to "release" the grant.
-        // This will mark it as no longer entered and allow the grant to be used
-        // in the future.
-        self.process.leave_grant(self.grant_num);
-
-        Some(res)
+        // Call functor and pass back value.
+        Some(fun(&mut grant_data, &kernel_data, &mut allocator))
     }
 }
 
@@ -1269,7 +1642,7 @@ impl GrantRegionAllocator {
 /// belonging to the process that the object is allocated for. The `Grant` type
 /// is used to get access to `ProcessGrant`s, which are tied to a specific
 /// process and provide access to the memory object allocated for that process.
-pub struct Grant<T: Default, const NUM_UPCALLS: usize> {
+pub struct Grant<T: Default, Upcalls: UpcallSize, AllowROs: AllowRoSize, AllowRWs: AllowRwSize> {
     /// Hold a reference to the core kernel so we can iterate processes.
     pub(crate) kernel: &'static Kernel,
 
@@ -1283,11 +1656,13 @@ pub struct Grant<T: Default, const NUM_UPCALLS: usize> {
     /// process.
     grant_num: usize,
 
-    /// Used to keep the Rust type of the grant.
-    ptr: PhantomData<T>,
+    /// Used to store the Rust types for grant.
+    ptr: PhantomData<(T, Upcalls, AllowROs, AllowRWs)>,
 }
 
-impl<T: Default, const NUM_UPCALLS: usize> Grant<T, NUM_UPCALLS> {
+impl<T: Default, Upcalls: UpcallSize, AllowROs: AllowRoSize, AllowRWs: AllowRwSize>
+    Grant<T, Upcalls, AllowROs, AllowRWs>
+{
     /// Create a new `Grant` type which allows a capsule to store
     /// process-specific data for each process in the process's memory region.
     ///
@@ -1309,7 +1684,7 @@ impl<T: Default, const NUM_UPCALLS: usize> Grant<T, NUM_UPCALLS> {
     /// provided closure is run with access to the memory in the grant region.
     pub fn enter<F, R>(&self, processid: ProcessId, fun: F) -> Result<R, Error>
     where
-        F: FnOnce(&mut GrantData<T>, &GrantUpcallTable) -> R,
+        F: FnOnce(&mut GrantData<T>, &GrantKernelData) -> R,
     {
         let pg = ProcessGrant::new(self, processid)?;
 
@@ -1330,7 +1705,7 @@ impl<T: Default, const NUM_UPCALLS: usize> Grant<T, NUM_UPCALLS> {
     /// memory in the process's grant region.
     pub fn enter_with_allocator<F, R>(&self, processid: ProcessId, fun: F) -> Result<R, Error>
     where
-        F: FnOnce(&mut GrantData<T>, &GrantUpcallTable, &mut GrantRegionAllocator) -> R,
+        F: FnOnce(&mut GrantData<T>, &GrantKernelData, &mut GrantRegionAllocator) -> R,
     {
         // Get the `ProcessGrant` for the process, possibly needing to
         // actually allocate the memory in the process's grant region to
@@ -1353,9 +1728,9 @@ impl<T: Default, const NUM_UPCALLS: usize> Grant<T, NUM_UPCALLS> {
     ///
     /// Calling this function when an `ProcessGrant` for a process is currently
     /// entered will result in a panic.
-    pub fn each<F>(&self, fun: F)
+    pub fn each<F>(&self, mut fun: F)
     where
-        F: Fn(ProcessId, &mut GrantData<T>, &GrantUpcallTable),
+        F: FnMut(ProcessId, &mut GrantData<T>, &GrantKernelData),
     {
         // Create a the iterator across `ProcessGrant`s for each process.
         for pg in self.iter() {
@@ -1371,7 +1746,7 @@ impl<T: Default, const NUM_UPCALLS: usize> Grant<T, NUM_UPCALLS> {
     ///
     /// Calling this function when an `ProcessGrant` for a process is currently
     /// entered will result in a panic.
-    pub fn iter(&self) -> Iter<T, NUM_UPCALLS> {
+    pub fn iter(&self) -> Iter<T, Upcalls, AllowROs, AllowRWs> {
         Iter {
             grant: self,
             subiter: self.kernel.get_process_iter(),
@@ -1380,9 +1755,15 @@ impl<T: Default, const NUM_UPCALLS: usize> Grant<T, NUM_UPCALLS> {
 }
 
 /// Type to iterate `ProcessGrant`s across processes.
-pub struct Iter<'a, T: 'a + Default, const NUM_UPCALLS: usize> {
+pub struct Iter<
+    'a,
+    T: 'a + Default,
+    Upcalls: UpcallSize,
+    AllowROs: AllowRoSize,
+    AllowRWs: AllowRwSize,
+> {
     /// The grant type to use.
-    grant: &'a Grant<T, NUM_UPCALLS>,
+    grant: &'a Grant<T, Upcalls, AllowROs, AllowRWs>,
 
     /// Iterator over valid processes.
     subiter: core::iter::FilterMap<
@@ -1391,14 +1772,16 @@ pub struct Iter<'a, T: 'a + Default, const NUM_UPCALLS: usize> {
     >,
 }
 
-impl<'a, T: Default, const NUM_UPCALLS: usize> Iterator for Iter<'a, T, NUM_UPCALLS> {
-    type Item = ProcessGrant<'a, T, NUM_UPCALLS>;
+impl<'a, T: Default, Upcalls: UpcallSize, AllowROs: AllowRoSize, AllowRWs: AllowRwSize> Iterator
+    for Iter<'a, T, Upcalls, AllowROs, AllowRWs>
+{
+    type Item = ProcessGrant<'a, T, Upcalls, AllowROs, AllowRWs>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let grant = self.grant;
-        // Get the next `ProcessId` from the kernel processes array that is setup to
-        // use this grant. Since the iterator itself is saved calling this
-        // function again will start where we left off.
+        // Get the next `ProcessId` from the kernel processes array that is
+        // setup to use this grant. Since the iterator itself is saved calling
+        // this function again will start where we left off.
         self.subiter
             .find_map(|process| ProcessGrant::new_if_allocated(grant, process))
     }

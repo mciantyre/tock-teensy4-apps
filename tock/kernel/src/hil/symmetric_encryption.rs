@@ -7,7 +7,7 @@ use crate::ErrorCode;
 /// Implement this trait and use `set_client()` in order to receive callbacks from an `AES128`
 /// instance.
 pub trait Client<'a> {
-    fn crypt_done(&'a self, source: Option<&'a mut [u8]>, dest: &'a mut [u8]);
+    fn crypt_done(&'a self, source: Option<&'static mut [u8]>, dest: &'static mut [u8]);
 }
 
 /// The number of bytes used for AES block operations.  Keys and IVs must have this length,
@@ -78,12 +78,16 @@ pub trait AES128<'a> {
     /// across calls to `crypt()`.
     ///
     fn crypt(
-        &'a self,
-        source: Option<&'a mut [u8]>,
-        dest: &'a mut [u8],
+        &self,
+        source: Option<&'static mut [u8]>,
+        dest: &'static mut [u8],
         start_index: usize,
         stop_index: usize,
-    ) -> Option<(Result<(), ErrorCode>, Option<&'a mut [u8]>, &'a mut [u8])>;
+    ) -> Option<(
+        Result<(), ErrorCode>,
+        Option<&'static mut [u8]>,
+        &'static mut [u8],
+    )>;
 }
 
 pub trait AES128Ctr {
@@ -132,6 +136,43 @@ pub trait AES128CCM<'a> {
         m_len: usize,
         mic_len: usize,
         confidential: bool,
+        encrypting: bool,
+    ) -> Result<(), (ErrorCode, &'static mut [u8])>;
+}
+
+pub trait GCMClient {
+    /// `res` is Ok(()) if the encryption/decryption process succeeded. This
+    /// does not mean that the message has been verified in the case of
+    /// decryption.
+    /// If we are encrypting: `tag_is_valid` is `true` iff `res` is Ok(()).
+    /// If we are decrypting: `tag_is_valid` is `true` iff `res` is Ok(()) and the
+    /// message authentication tag is valid.
+    fn crypt_done(&self, buf: &'static mut [u8], res: Result<(), ErrorCode>, tag_is_valid: bool);
+}
+
+pub trait AES128GCM<'a> {
+    /// Set the client instance which will receive `crypt_done()` callbacks
+    fn set_client(&'a self, client: &'a dyn GCMClient);
+
+    /// Set the key to be used for GCM encryption
+    /// Returns `INVAL` if length is not `AES128_KEY_SIZE`
+    fn set_key(&self, key: &[u8]) -> Result<(), ErrorCode>;
+
+    /// Set the IV to be used for GCM encryption. The IV should be less
+    /// or equal to 12 bytes (96 bits) as recommened in NIST-800-38D.
+    /// Returns `INVAL` if length is greater then 12 bytes
+    fn set_iv(&self, nonce: &[u8]) -> Result<(), ErrorCode>;
+
+    /// Try to begin the encryption/decryption process
+    /// The possible ErrorCodes are:
+    ///     - `BUSY`: An operation is already in progress
+    ///     - `SIZE`: The offset and lengths don't fit inside the buffer
+    fn crypt(
+        &self,
+        buf: &'static mut [u8],
+        aad_offset: usize,
+        message_offset: usize,
+        message_len: usize,
         encrypting: bool,
     ) -> Result<(), (ErrorCode, &'static mut [u8])>;
 }

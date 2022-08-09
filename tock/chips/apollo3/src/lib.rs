@@ -2,7 +2,6 @@
 
 #![crate_name = "apollo3"]
 #![crate_type = "rlib"]
-#![feature(asm, const_fn_trait_bound)]
 #![no_std]
 
 // Peripherals
@@ -18,10 +17,7 @@ pub mod pwrctrl;
 pub mod stimer;
 pub mod uart;
 
-use cortexm4::{
-    generic_isr, hard_fault_handler, initialize_ram_jump_to_main, scb, svc_handler,
-    systick_handler, unhandled_interrupt,
-};
+use cortexm4::{initialize_ram_jump_to_main, scb, unhandled_interrupt, CortexM4, CortexMVariant};
 
 extern "C" {
     // _estack is not really a function, but it makes the types work
@@ -38,20 +34,20 @@ extern "C" {
 pub static BASE_VECTORS: [unsafe extern "C" fn(); 16] = [
     _estack,
     initialize_ram_jump_to_main,
-    unhandled_interrupt, // NMI
-    hard_fault_handler,  // Hard Fault
-    unhandled_interrupt, // MemManage
-    unhandled_interrupt, // BusFault
-    unhandled_interrupt, // UsageFault
+    unhandled_interrupt,          // NMI
+    CortexM4::HARD_FAULT_HANDLER, // Hard Fault
+    unhandled_interrupt,          // MemManage
+    unhandled_interrupt,          // BusFault
+    unhandled_interrupt,          // UsageFault
     unhandled_interrupt,
     unhandled_interrupt,
     unhandled_interrupt,
     unhandled_interrupt,
-    svc_handler,         // SVC
-    unhandled_interrupt, // DebugMon
+    CortexM4::SVC_HANDLER, // SVC
+    unhandled_interrupt,   // DebugMon
     unhandled_interrupt,
-    unhandled_interrupt, // PendSV
-    systick_handler,     // SysTick
+    unhandled_interrupt,       // PendSV
+    CortexM4::SYSTICK_HANDLER, // SysTick
 ];
 
 #[cfg_attr(
@@ -60,7 +56,7 @@ pub static BASE_VECTORS: [unsafe extern "C" fn(); 16] = [
 )]
 // used Ensures that the symbol is kept until the final binary
 #[cfg_attr(all(target_arch = "arm", target_os = "none"), used)]
-pub static IRQS: [unsafe extern "C" fn(); 32] = [generic_isr; 32];
+pub static IRQS: [unsafe extern "C" fn(); 32] = [CortexM4::GENERIC_ISR; 32];
 
 // The Patch table.
 //
@@ -76,6 +72,7 @@ pub static PATCH: [unsafe extern "C" fn(); 16] = [unhandled_interrupt; 16];
 
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 pub unsafe fn init() {
+    use core::arch::asm;
     let cache_ctrl = crate::cachectrl::CacheCtrl::new();
     cache_ctrl.enable_cache();
 

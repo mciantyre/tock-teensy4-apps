@@ -2,7 +2,7 @@
 
 #![crate_name = "cortexm"]
 #![crate_type = "rlib"]
-#![feature(asm)]
+#![feature(asm_sym)]
 #![feature(naked_functions)]
 #![no_std]
 
@@ -15,7 +15,92 @@ pub mod support;
 pub mod syscall;
 pub mod systick;
 
-/// These constants are defined in the linker script.
+/// Trait to encapsulate differences in between Cortex-M variants
+///
+/// This trait contains functions and other associated data (constants) which
+/// differs in between different Cortex-M architecture variants (e.g. Cortex-M0,
+/// Cortex-M4, etc.). It is not designed to be implemented by an instantiable
+/// type and passed around as a runtime-accessible object, but is to be used as
+/// a well-defined collection of functions and data to be exposed to
+/// architecture-dependent code paths. Hence, implementations can use an `enum`
+/// without variants to implement this trait.
+///
+/// The fact that some functions are proper trait functions, while others are
+/// exposed via associated constants is necessitated by the associated const
+/// functions being `#\[naked\]`. To wrap these functions in proper trait
+/// functions would require these trait functions to also be `#\[naked\]` to
+/// avoid generating a function prologue and epilogue, and we'd have to call the
+/// respective backing function from within an asm! block. The associated
+/// constants allow us to simply reference any function in scope and export it
+/// through the provided CortexMVariant trait infrastructure.
+// This approach outlined above has some significant benefits over passing
+// functions via symbols, as done before this change (tock/tock#3080):
+//
+// - By using a trait carrying proper first-level Rust functions, the type
+//   signatures of the trait and implementing functions are properly
+//   validated. Before these changes, some Cortex-M variants previously used
+//   incorrect type signatures (e.g. `*mut u8` instead of `*const usize`) for
+//   the user_stack argument. It also ensures that all functions are provided by
+//   a respective sub-architecture at compile time, instead of throwing linker
+//   errors.
+//
+// - Determining the respective functions at compile time, Rust might be able to
+//   perform more aggressive inlining, especially if more device-specific proper
+//   Rust functions (non hardware-exposed symbols, i.e. not fault or interrupt
+//   handlers) were to be added.
+//
+// - Most importantly, this avoid ambiguity with respect to a compiler fence
+//   being inserted by the compiler around calls to switch_to_user. The asm!
+//   macro in that function call will cause Rust to emit a compiler fence given
+//   the nomem option is not passed, but the opaque extern "C" function call
+//   obscured that code path. While this is probably fine and Rust is obliged to
+//   generate a compiler fence when switching to C code, having a traceable code
+//   path for Rust to the asm! macro will remove any remaining ambiguity and
+//   allow us to argue against requiring volatile accesses to userspace memory
+//   (during context switches). See tock/tock#2582 for further discussion of
+//   this issue.
+pub trait CortexMVariant {
+    /// All ISRs not caught by a more specific handler are caught by this
+    /// handler. This must ensure the interrupt is disabled (per Tock's
+    /// interrupt model) and then as quickly as possible resume the main thread
+    /// (i.e. leave the interrupt context). The interrupt will be marked as
+    /// pending and handled when the scheduler checks if there are any pending
+    /// interrupts.
+    ///
+    /// If the ISR is called while an app is running, this will switch control
+    /// to the kernel.
+    const GENERIC_ISR: unsafe extern "C" fn();
+
+    /// The `systick_handler` is called when the systick interrupt occurs,
+    /// signaling that an application executed for longer than its
+    /// timeslice. This interrupt handler is no longer responsible for signaling
+    /// to the kernel thread that an interrupt has occurred, but is slightly
+    /// more efficient than the `generic_isr` handler on account of not needing
+    /// to mark the interrupt as pending.
+    const SYSTICK_HANDLER: unsafe extern "C" fn();
+
+    /// This is called after a `svc` instruction, both when switching to
+    /// userspace and when userspace makes a system call.
+    const SVC_HANDLER: unsafe extern "C" fn();
+
+    /// Hard fault handler.
+    const HARD_FAULT_HANDLER: unsafe extern "C" fn();
+
+    /// Assembly function called from `UserspaceKernelBoundary` to switch to an
+    /// an application. This handles storing and restoring application state
+    /// before and after the switch.
+    unsafe fn switch_to_user(
+        user_stack: *const usize,
+        process_regs: &mut [usize; 8],
+    ) -> *const usize;
+
+    /// Format and display architecture-specific state useful for debugging.
+    ///
+    /// This is generally used after a `panic!()` to aid debugging.
+    unsafe fn print_cortexm_state(writer: &mut dyn Write);
+}
+
+// These constants are defined in the linker script.
 extern "C" {
     static _estack: u32;
     static mut _sstack: u32;
@@ -26,12 +111,10 @@ extern "C" {
     static mut _erelocate: u32;
 }
 
-/// The `systick_handler` is called when the systick interrupt occurs, signaling
-/// that an application executed for longer than its timeslice. This interrupt
-/// handler is no longer responsible for signaling to the kernel thread that an
-/// interrupt has occurred, but is slightly more efficient than the
-/// `generic_isr` handler on account of not needing to mark the interrupt as
-/// pending.
+/// ARMv7-M systick handler function.
+///
+/// For documentation of this function, please see
+/// [`CortexMVariant::SYSTICK_HANDLER`].
 #[cfg(all(
     target_arch = "arm",
     target_feature = "v7",
@@ -40,6 +123,7 @@ extern "C" {
 ))]
 #[naked]
 pub unsafe extern "C" fn systick_handler_arm_v7m() {
+    use core::arch::asm;
     asm!(
         "
     // Set thread mode to privileged to switch back to kernel mode.
@@ -60,8 +144,10 @@ pub unsafe extern "C" fn systick_handler_arm_v7m() {
     );
 }
 
-/// This is called after a `svc` instruction, both when switching to userspace
-/// and when userspace makes a system call.
+/// Handler of `svc` instructions on ARMv7-M.
+///
+/// For documentation of this function, please see
+/// [`CortexMVariant::SVC_HANDLER`].
 #[cfg(all(
     target_arch = "arm",
     target_feature = "v7",
@@ -70,13 +156,14 @@ pub unsafe extern "C" fn systick_handler_arm_v7m() {
 ))]
 #[naked]
 pub unsafe extern "C" fn svc_handler_arm_v7m() {
+    use core::arch::asm;
     asm!(
         "
     // First check to see which direction we are going in. If the link register
     // is something other than 0xfffffff9, then we are coming from an app which
     // has called a syscall.
     cmp lr, #0xfffffff9
-    bne to_kernel
+    bne 100f // to_kernel
 
     // If we get here, then this is a context switch from the kernel to the
     // application. Set thread mode to unprivileged to run the application.
@@ -92,7 +179,7 @@ pub unsafe extern "C" fn svc_handler_arm_v7m() {
     // Switch to the app.
     bx lr
 
-  to_kernel:
+  100: // to_kernel
     // An application called a syscall. We mark this in the global variable
     // `SYSCALL_FIRED` which is stored in the syscall file.
     // `UserspaceKernelBoundary` will use this variable to decide why the app
@@ -116,14 +203,9 @@ pub unsafe extern "C" fn svc_handler_arm_v7m() {
     );
 }
 
-/// All ISRs are caught by this handler. This must ensure the interrupt is
-/// disabled (per Tock's interrupt model) and then as quickly as possible resume
-/// the main thread (i.e. leave the interrupt context). The interrupt will be
-/// marked as pending and handled when the scheduler checks if there are any
-/// pending interrupts.
+/// Generic interrupt handler for ARMv7-M instruction sets.
 ///
-/// If the ISR is called while an app is running, this will switch control to
-/// the kernel.
+/// For documentation of this function, see [`CortexMVariant::GENERIC_ISR`].
 #[cfg(all(
     target_arch = "arm",
     target_feature = "v7",
@@ -132,6 +214,7 @@ pub unsafe extern "C" fn svc_handler_arm_v7m() {
 ))]
 #[naked]
 pub unsafe extern "C" fn generic_isr_arm_v7m() {
+    use core::arch::asm;
     asm!(
         "
     // Set thread mode to privileged to ensure we are executing as the kernel.
@@ -209,6 +292,7 @@ pub unsafe extern "C" fn generic_isr_arm_v7m() {
 
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 pub unsafe extern "C" fn unhandled_interrupt() {
+    use core::arch::asm;
     let mut interrupt_number: u32;
 
     // IPSR[8:0] holds the currently active interrupt
@@ -232,6 +316,7 @@ pub unsafe extern "C" fn unhandled_interrupt() {
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 #[naked]
 pub unsafe extern "C" fn initialize_ram_jump_to_main() {
+    use core::arch::asm;
     asm!(
         "
     // Start by initializing .bss memory. The Tock linker script defines
@@ -239,20 +324,19 @@ pub unsafe extern "C" fn initialize_ram_jump_to_main() {
     ldr r0, ={sbss}     // r0 = first address of .bss
     ldr r1, ={ebss}     // r1 = first address after .bss
 
-    movs r2, #0          // r2 = 0
+    movs r2, #0         // r2 = 0
 
-  bss_init_loop:
+  100: // bss_init_loop
     cmp r1, r0          // We increment r0. Check if we have reached r1
                         // (end of .bss), and stop if so.
-    beq bss_init_done   // If r0 == r1, we are done.
+    beq 101f            // If r0 == r1, we are done.
     stm r0!, {{r2}}     // Write a word to the address in r0, and increment r0.
                         // Since r2 contains zero, this will clear the memory
                         // pointed to by r0. Using `stm` (store multiple) with the
                         // bang allows us to also increment r0 automatically.
-    b bss_init_loop     // Continue the loop.
+    b 100b              // Continue the loop.
 
-  bss_init_done:
-
+  101: // bss_init_done
 
     // Now initialize .data memory. This involves coping the values right at the
     // end of the .text section (in flash) into the .data section (in RAM).
@@ -260,17 +344,17 @@ pub unsafe extern "C" fn initialize_ram_jump_to_main() {
     ldr r1, ={edata}    // r1 = first address after data section in RAM
     ldr r2, ={etext}    // r2 = address of stored data initial values
 
-  data_init_loop:
+  200: // data_init_loop
     cmp r1, r0          // We increment r0. Check if we have reached the end
                         // of the data section, and if so we are done.
-    beq data_init_done  // r0 == r1, and we have iterated through the .data section
+    beq 201f            // r0 == r1, and we have iterated through the .data section
     ldm r2!, {{r3}}     // r3 = *(r2), r2 += 1. Load the initial value into r3,
                         // and use the bang to increment r2.
     stm r0!, {{r3}}     // *(r0) = r3, r0 += 1. Store the value to memory, and
                         // increment r0.
-    b data_init_loop    // Continue the loop.
+    b 200b              // Continue the loop.
 
-  data_init_done:
+  201: // data_init_done
 
     // Now that memory has been initialized, we can jump to main() where the
     // board initialization takes place and Rust code starts.
@@ -285,20 +369,22 @@ pub unsafe extern "C" fn initialize_ram_jump_to_main() {
     );
 }
 
-/// Assembly function called from `UserspaceKernelBoundary` to switch to an
-/// an application. This handles storing and restoring application state before
-/// and after the switch.
+/// Assembly function to switch into userspace and store/restore application
+/// state.
+///
+/// For documentation of this function, please see
+/// [`CortexMVariant::switch_to_user`].
 #[cfg(all(
     target_arch = "arm",
     target_feature = "v7",
     target_feature = "thumb-mode",
     target_os = "none"
 ))]
-#[no_mangle]
-pub unsafe extern "C" fn switch_to_user_arm_v7m(
+pub unsafe fn switch_to_user_arm_v7m(
     mut user_stack: *const usize,
     process_regs: &mut [usize; 8],
 ) -> *const usize {
+    use core::arch::asm;
     asm!(
     "
     // Rust `asm!()` macro (as of May 2021) will not let us mark r6, r7 and r9
@@ -326,7 +412,7 @@ pub unsafe extern "C" fn switch_to_user_arm_v7m(
     // SWITCH
     svc 0xff   // It doesn't matter which SVC number we use here as it has no
                // defined meaning for the Cortex-M syscall interface. Data being
-               // returned from a syscall is transfered on the app's stack.
+               // returned from a syscall is transferred on the app's stack.
 
     // When execution returns here we have switched back to the kernel from the
     // application.
@@ -515,6 +601,7 @@ unsafe extern "C" fn hard_fault_handler_arm_v7m_continued(
     kernel_stack: u32,
     stack_overflow: u32,
 ) {
+    use core::arch::asm;
     if kernel_stack != 0 {
         if stack_overflow != 0 {
             // Panic to show the correct error.
@@ -563,6 +650,10 @@ unsafe extern "C" fn hard_fault_handler_arm_v7m_continued(
     }
 }
 
+/// ARMv7-M hardfault handler.
+///
+/// For documentation of this function, please see
+/// [`CortexMVariant::HARD_FAULT_HANDLER_HANDLER`].
 #[cfg(all(
     target_arch = "arm",
     target_feature = "v7",
@@ -571,6 +662,7 @@ unsafe extern "C" fn hard_fault_handler_arm_v7m_continued(
 ))]
 #[naked]
 pub unsafe extern "C" fn hard_fault_handler_arm_v7m() {
+    use core::arch::asm;
     // First need to determine if this a kernel fault or a userspace fault, and store
     // the unmodified stack pointer. Place these values in registers, then call
     // a non-naked function, to allow for use of rust code alongside inline asm.

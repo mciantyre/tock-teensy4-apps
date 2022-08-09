@@ -88,6 +88,8 @@ impl Component for MockUDPComponent {
             VirtualMuxAlarm<'static, sam4l::ast::Ast>,
             VirtualMuxAlarm::new(self.alarm_mux)
         );
+        udp_alarm.setup();
+
         let mock_udp = static_init!(
             capsules::test::udp::MockUdp<'static, VirtualMuxAlarm<'static, sam4l::ast::Ast>>,
             capsules::test::udp::MockUdp::new(
@@ -96,7 +98,7 @@ impl Component for MockUDPComponent {
                 udp_send,
                 udp_recv,
                 self.bound_port_table,
-                kernel::utilities::leasable_buffer::LeasableBuffer::new(
+                kernel::utilities::leasable_buffer::LeasableMutableBuffer::new(
                     self.udp_payload.take().expect("missing payload")
                 ),
                 self.dst_port,

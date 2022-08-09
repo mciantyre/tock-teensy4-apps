@@ -1,6 +1,6 @@
 //! Test for Tock KV System capsules.
 //!
-//! This capsule implements the tests for KV system libraies in Tock.
+//! This capsule implements the tests for KV system libraries in Tock.
 //! This is originally written to test TicKV.
 //!
 //! +-----------------------+
@@ -35,11 +35,11 @@
 //!
 //! You should then see the following output
 //!
-//! ```
+//! ```text
 //! ---Starting TicKV Tests---
 //! Key: [18, 52, 86, 120, 154, 188, 222, 240] with value [16, 32, 48] was added
-//! Now retriving the key
-//! Key: [18, 52, 86, 120, 154, 188, 222, 240] with value [16, 32, 48, 0] was retrived
+//! Now retrieving the key
+//! Key: [18, 52, 86, 120, 154, 188, 222, 240] with value [16, 32, 48, 0] was retrieved
 //! Removed Key: [18, 52, 86, 120, 154, 188, 222, 240]
 //! Try to read removed key: [18, 52, 86, 120, 154, 188, 222, 240]
 //! Unable to find key: [18, 52, 86, 120, 154, 188, 222, 240]
@@ -64,17 +64,23 @@ enum CurrentState {
 pub struct KVSystemTest<'a, S: KVSystem<'static>, T: KeyType> {
     kv_system: &'a S,
     phantom: PhantomData<&'a T>,
+    value: TakeCell<'static, [u8]>,
     ret_buffer: TakeCell<'static, [u8]>,
     state: Cell<CurrentState>,
 }
 
 impl<'a, S: KVSystem<'static>, T: KeyType> KVSystemTest<'a, S, T> {
-    pub fn new(kv_system: &'a S, static_buf: &'static mut [u8; 4]) -> KVSystemTest<'a, S, T> {
+    pub fn new(
+        kv_system: &'a S,
+        value: &'static mut [u8],
+        static_buf: &'static mut [u8; 4],
+    ) -> KVSystemTest<'a, S, T> {
         debug!("---Starting TicKV Tests---");
 
         Self {
             kv_system: kv_system,
             phantom: PhantomData,
+            value: TakeCell::new(value),
             ret_buffer: TakeCell::new(static_buf),
             state: Cell::new(CurrentState::Normal),
         }
@@ -86,23 +92,34 @@ impl<'a, S: KVSystem<'static, K = T>, T: KeyType + core::fmt::Debug> kv_system::
 {
     fn generate_key_complete(
         &self,
-        _result: Result<(), ErrorCode>,
-        _unhashed_key: &'static [u8],
-        _key_buf: &'static T,
+        result: Result<(), ErrorCode>,
+        _unhashed_key: &'static mut [u8],
+        key_buf: &'static mut T,
     ) {
-        unimplemented!()
+        match result {
+            Ok(()) => {
+                debug!("Generated key: {:?}", key_buf);
+                debug!("Now appending the key");
+                self.kv_system
+                    .append_key(key_buf, self.value.take().unwrap())
+                    .unwrap();
+            }
+            Err(e) => {
+                panic!("Error adding key: {:?}", e);
+            }
+        }
     }
 
     fn append_key_complete(
         &self,
         result: Result<(), ErrorCode>,
         key: &'static mut T,
-        value: &'static [u8],
+        value: &'static mut [u8],
     ) {
         match result {
             Ok(()) => {
                 debug!("Key: {:?} with value {:?} was added", key, value);
-                debug!("Now retriving the key");
+                debug!("Now retrieving the key");
                 self.kv_system
                     .get_value(key, self.ret_buffer.take().unwrap())
                     .unwrap();
@@ -121,7 +138,7 @@ impl<'a, S: KVSystem<'static, K = T>, T: KeyType + core::fmt::Debug> kv_system::
     ) {
         match result {
             Ok(()) => {
-                debug!("Key: {:?} with value {:?} was retrived", key, ret_buf);
+                debug!("Key: {:?} with value {:?} was retrieved", key, ret_buf);
                 self.ret_buffer.replace(ret_buf);
                 self.kv_system.invalidate_key(key).unwrap();
             }

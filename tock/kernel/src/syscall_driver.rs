@@ -4,9 +4,9 @@
 //!
 //! # System-call Overview
 //!
-//! Tock supports six system calls. The `subscribe`, `yield`, and `memop` system
-//! calls are handled by the core kernel, while `command`, `allow_readwrite`,
-//! and `allow_readonly` are implemented by drivers. The main system calls:
+//! Tock supports six system calls. The `allow_readonly`, `allow_readwrite`,
+//! `subscribe`, `yield`, and `memop` system calls are handled by the core
+//! kernel, while `command`is implemented by drivers. The main system calls:
 //!
 //!   * `subscribe` passes a upcall to the driver which it can
 //!   invoke on the process later, when an event has occurred or data
@@ -16,6 +16,9 @@
 //!
 //!   * `allow_readwrite` provides the driver read-write access to an
 //!   application buffer.
+//!
+//!   * `allow_userspace_readable` provides the driver read-write access to an
+//!   application buffer that is still shared with the app.
 //!
 //!   * `allow_readonly` provides the driver read-only access to an
 //!   application buffer.
@@ -75,7 +78,7 @@ use core::convert::TryFrom;
 use crate::errorcode::ErrorCode;
 use crate::process;
 use crate::process::ProcessId;
-use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
+use crate::processbuffer::UserspaceReadableProcessBuffer;
 use crate::syscall::SyscallReturn;
 
 /// Possible return values of a `command` driver method, as specified
@@ -176,9 +179,10 @@ impl From<process::Error> for CommandReturn {
 /// and what they represents) are specific to the peripheral system call
 /// driver.
 ///
-/// Note about subscribe: upcall subscriptions are handled entirely by the core
-/// kernel, and therefore there is no subscribe function for capsules to
-/// implement.
+/// Note about **subscribe**, **read-only allow**, and *read-write allow**
+/// syscalls:
+/// those are handled entirely by the core kernel, and there is no
+/// corresponding function for capsules to implement.
 #[allow(unused_variables)]
 pub trait SyscallDriver {
     /// System call for a process to perform a short synchronous operation
@@ -196,32 +200,22 @@ pub trait SyscallDriver {
         CommandReturn::failure(ErrorCode::NOSUPPORT)
     }
 
-    /// System call for a process to pass a buffer (a ReadWriteProcessBuffer) to
-    /// the kernel that the kernel can either read or write. The kernel calls
-    /// this method only after it checks that the entire buffer is
-    /// within memory the process can both read and write.
-    fn allow_readwrite(
+    /// System call for a process to pass a buffer (a
+    /// UserspaceReadableProcessBuffer) to the kernel that the kernel can either
+    /// read or write. The kernel calls this method only after it checks that
+    /// the entire buffer is within memory the process can both read and write.
+    ///
+    /// This is different to `allow_readwrite()` in that the app is allowed
+    /// to read the buffer once it has been passed to the kernel.
+    /// For more details on how this can be done safely see the userspace
+    /// readable allow syscalls TRDXXX.
+    fn allow_userspace_readable(
         &self,
-        process_id: ProcessId,
-        allow_num: usize,
-        buffer: ReadWriteProcessBuffer,
-    ) -> Result<ReadWriteProcessBuffer, (ReadWriteProcessBuffer, ErrorCode)> {
-        Err((buffer, ErrorCode::NOSUPPORT))
-    }
-
-    /// System call for a process to pass a read-only buffer (a
-    /// ReadOnlyProcessBuffer) to the kernel that the kernel can read.
-    /// The kernel calls this method only after it
-    /// checks that that the entire buffer is within memory the
-    /// process can read. This system call allows a process to pass
-    /// read-only data (e.g., in flash) to the kernel.
-    fn allow_readonly(
-        &self,
-        process_id: ProcessId,
-        allow_num: usize,
-        buffer: ReadOnlyProcessBuffer,
-    ) -> Result<ReadOnlyProcessBuffer, (ReadOnlyProcessBuffer, ErrorCode)> {
-        Err((buffer, ErrorCode::NOSUPPORT))
+        app: ProcessId,
+        which: usize,
+        slice: UserspaceReadableProcessBuffer,
+    ) -> Result<UserspaceReadableProcessBuffer, (UserspaceReadableProcessBuffer, ErrorCode)> {
+        Err((slice, ErrorCode::NOSUPPORT))
     }
 
     /// Request to allocate a capsule's grant for a specific process.
@@ -313,5 +307,9 @@ pub trait SyscallDriver {
     // mechanism may find more uses in the future if the kernel needs to store
     // additional state on a per-driver basis and therefore needs a mechanism to
     // force a grant allocation.
+    //
+    // This same mechanism was later extended to handle allow calls as well.
+    // Capsules that do not need upcalls but do use process buffers must also
+    // implement this function.
     fn allocate_grant(&self, process_id: ProcessId) -> Result<(), crate::process::Error>;
 }

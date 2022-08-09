@@ -7,7 +7,9 @@
 // https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
-#![feature(asm, naked_functions)]
+#![feature(naked_functions)]
+
+use core::arch::asm;
 
 use kernel::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
 
@@ -56,23 +58,23 @@ const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::Panic
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
-const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
     [None; NUM_PROCS];
 
 static mut CHIP: Option<&'static Rp2040<Rp2040DefaultPeripherals>> = None;
+static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 
 /// Supported drivers by the platform
 pub struct PicoExplorerBase {
-    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
+    ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
     console: &'static capsules::console::Console<'static>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
         VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>,
     >,
     gpio: &'static capsules::gpio::GPIO<'static, RPGpioPin<'static>>,
-    led: &'static capsules::led::LedDriver<'static, LedHigh<'static, RPGpioPin<'static>>>,
+    led: &'static capsules::led::LedDriver<'static, LedHigh<'static, RPGpioPin<'static>>, 1>,
     adc: &'static capsules::adc::AdcVirtualized<'static>,
     temperature: &'static capsules::temperature::TemperatureSensor<'static>,
 
@@ -112,6 +114,7 @@ impl KernelResources<Rp2040<'static, Rp2040DefaultPeripherals<'static>>> for Pic
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm0p::systick::SysTick;
     type WatchDog = ();
+    type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         &self
@@ -129,6 +132,9 @@ impl KernelResources<Rp2040<'static, Rp2040DefaultPeripherals<'static>>> for Pic
         &self.systick
     }
     fn watchdog(&self) -> &Self::WatchDog {
+        &()
+    }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
         &()
     }
 }
@@ -166,7 +172,7 @@ fn init_clocks(peripherals: &Rp2040DefaultPeripherals) {
     // Disable the Resus clock
     peripherals.clocks.disable_resus();
 
-    // Setup the external Osciallator
+    // Setup the external Oscillator
     peripherals.xosc.init();
 
     // disable ref and sys clock aux sources
@@ -243,7 +249,7 @@ pub unsafe fn main() {
     rp2040::init();
 
     let peripherals = get_peripherals();
-    peripherals.set_clocks();
+    peripherals.resolve_dependencies();
 
     // Set the UART used for panic
     io::WRITER.set_uart(&peripherals.uart0);
@@ -336,7 +342,7 @@ pub unsafe fn main() {
         capsules::console::DRIVER_NUM,
         uart_mux,
     )
-    .finalize(());
+    .finalize(components::console_component_helper!());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -365,12 +371,9 @@ pub unsafe fn main() {
     )
     .finalize(components::gpio_component_buf!(RPGpioPin<'static>));
 
-    let led = LedsComponent::new(components::led_component_helper!(
+    let led = LedsComponent::new().finalize(components::led_component_helper!(
         LedHigh<'static, RPGpioPin<'static>>,
         LedHigh::new(&peripherals.pins.get_pin(RPGpio::GPIO25))
-    ))
-    .finalize(components::led_component_buf!(
-        LedHigh<'static, RPGpioPin<'static>>
     ));
 
     peripherals.adc.init();
@@ -405,16 +408,19 @@ pub unsafe fn main() {
     let mux_spi = components::spi::SpiMuxComponent::new(&peripherals.spi0, dynamic_deferred_caller)
         .finalize(components::spi_mux_component_helper!(Spi));
 
-    let bus = components::bus::SpiMasterBusComponent::new().finalize(
-        components::spi_bus_component_helper!(
-            // spi type
-            Spi,
-            // chip select
-            &peripherals.pins.get_pin(RPGpio::GPIO17),
-            // spi mux
-            mux_spi
-        ),
-    );
+    let bus = components::bus::SpiMasterBusComponent::new(
+        20_000_000,
+        kernel::hil::spi::ClockPhase::SampleLeading,
+        kernel::hil::spi::ClockPolarity::IdleLow,
+    )
+    .finalize(components::spi_bus_component_helper!(
+        // spi type
+        Spi,
+        // chip select
+        &peripherals.pins.get_pin(RPGpio::GPIO17),
+        // spi mux
+        mux_spi
+    ));
 
     let tft = components::st77xx::ST77XXComponent::new(mux_alarm).finalize(
         components::st77xx_component_helper!(
@@ -490,10 +496,18 @@ pub unsafe fn main() {
                 adc_channel_1,
                 adc_channel_2,
             ));
+    let process_printer =
+        components::process_printer::ProcessPrinterTextComponent::new().finalize(());
+    PROCESS_PRINTER = Some(process_printer);
+
     // PROCESS CONSOLE
-    let process_console =
-        components::process_console::ProcessConsoleComponent::new(board_kernel, uart_mux)
-            .finalize(());
+    let process_console = components::process_console::ProcessConsoleComponent::new(
+        board_kernel,
+        uart_mux,
+        mux_alarm,
+        process_printer,
+    )
+    .finalize(components::process_console_component_helper!(RPTimer));
     let _ = process_console.start();
 
     let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
@@ -531,7 +545,7 @@ pub unsafe fn main() {
     );
     debug!("Initialization complete. Enter main loop");
 
-    /// These symbols are defined in the linker script.
+    // These symbols are defined in the linker script.
     extern "C" {
         /// Beginning of the ROM region containing app images.
         static _sapps: u8;

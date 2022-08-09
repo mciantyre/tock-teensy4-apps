@@ -130,13 +130,18 @@ pub fn parse_tbf_header(
                     Default::default();
                 let mut app_name_str = "";
                 let mut fixed_address_pointer: Option<types::TbfHeaderV2FixedAddresses> = None;
+                let mut permissions_pointer: Option<types::TbfHeaderV2Permissions<8>> = None;
+                let mut persistent_acls_pointer: Option<types::TbfHeaderV2PersistentAcl<8>> = None;
                 let mut kernel_version: Option<types::TbfHeaderV2KernelVersion> = None;
 
                 // Iterate the remainder of the header looking for TLV entries.
                 while remaining.len() > 0 {
                     // Get the T and L portions of the next header (if it is
                     // there).
-                    let tlv_header: types::TbfHeaderTlv = remaining.try_into()?;
+                    let tlv_header: types::TbfHeaderTlv = remaining
+                        .get(0..4)
+                        .ok_or(types::TbfParseError::NotEnoughFlash)?
+                        .try_into()?;
                     remaining = remaining
                         .get(4..)
                         .ok_or(types::TbfParseError::NotEnoughFlash)?;
@@ -150,7 +155,12 @@ pub fn parse_tbf_header(
                             // Otherwise, we fail to parse this TBF header and
                             // throw an error.
                             if tlv_header.length as usize == entry_len {
-                                main_pointer = Some(remaining.try_into()?);
+                                main_pointer = Some(
+                                    remaining
+                                        .get(0..entry_len)
+                                        .ok_or(types::TbfParseError::NotEnoughFlash)?
+                                        .try_into()?,
+                                );
                             } else {
                                 return Err(types::TbfParseError::BadTlvEntry(
                                     tlv_header.tipe as usize,
@@ -210,9 +220,14 @@ pub fn parse_tbf_header(
                         }
 
                         types::TbfHeaderTypes::TbfHeaderFixedAddresses => {
-                            let entry_len = 8;
+                            let entry_len = mem::size_of::<types::TbfHeaderV2FixedAddresses>();
                             if tlv_header.length as usize == entry_len {
-                                fixed_address_pointer = Some(remaining.try_into()?);
+                                fixed_address_pointer = Some(
+                                    remaining
+                                        .get(0..entry_len)
+                                        .ok_or(types::TbfParseError::NotEnoughFlash)?
+                                        .try_into()?,
+                                );
                             } else {
                                 return Err(types::TbfParseError::BadTlvEntry(
                                     tlv_header.tipe as usize,
@@ -220,10 +235,23 @@ pub fn parse_tbf_header(
                             }
                         }
 
+                        types::TbfHeaderTypes::TbfHeaderPermissions => {
+                            permissions_pointer = Some(remaining.try_into()?);
+                        }
+
+                        types::TbfHeaderTypes::TbfHeaderPersistentAcl => {
+                            persistent_acls_pointer = Some(remaining.try_into()?);
+                        }
+
                         types::TbfHeaderTypes::TbfHeaderKernelVersion => {
-                            let entry_len = 4;
+                            let entry_len = mem::size_of::<types::TbfHeaderV2KernelVersion>();
                             if tlv_header.length as usize == entry_len {
-                                kernel_version = Some(remaining.try_into()?);
+                                kernel_version = Some(
+                                    remaining
+                                        .get(0..entry_len)
+                                        .ok_or(types::TbfParseError::NotEnoughFlash)?
+                                        .try_into()?,
+                                );
                             } else {
                                 return Err(types::TbfParseError::BadTlvEntry(
                                     tlv_header.tipe as usize,
@@ -248,6 +276,8 @@ pub fn parse_tbf_header(
                     package_name: Some(app_name_str),
                     writeable_regions: Some(wfr_pointer),
                     fixed_addresses: fixed_address_pointer,
+                    permissions: permissions_pointer,
+                    persistent_acls: persistent_acls_pointer,
                     kernel_version: kernel_version,
                 };
 

@@ -32,22 +32,21 @@ usage:
 	@echo "Tock currently includes support for the following platforms:"
 	@for f in $(ALL_BOARDS); do printf " - $$f\n"; done
 	@echo
-	@echo "Run 'make' in a board directory to build Tock for that board,"
-	@echo "and usually 'make program' or 'make flash' to load Tock onto hardware."
-	@echo "Check out the README in your board's folder for more information."
+	@echo "Run 'make' in a board directory to build Tock for that board, and then"
+	@echo "run 'make install' to load Tock onto hardware. Check out the README in"
+	@echo "your board's folder for more information."
 	@echo
-	@echo "There are a few helpful targets that can be run for all individual boards."
-	@echo "To run these, run 'make {target}' from the board directory for any of the"
-	@echo "following targets:"
-	@echo "        cargobloat: Runs the cargo-bloat tool for attributing binary size"
-	@echo "        stack-analysis: Prints the 5 largest stack frames for the board"
+	@echo "There are a few helpful targets that can be run for individual boards. To"
+	@echo "run these, run 'make {target}' from the board directory for these targets:"
+	@echo "      cargobloat: Runs the cargo-bloat tool for attributing binary size"
+	@echo "  stack-analysis: Prints the 5 largest stack frames for the board"
 	@echo
 	@echo "This root Makefile has a few useful targets as well:"
-	@echo "        allaudit: Audit Cargo dependencies for all kernel sources"
-	@echo "       allboards: Compiles Tock for all supported boards"
-	@echo "        allcheck: Checks, but does not compile, Tock for all supported boards"
-	@echo "          alldoc: Builds Tock documentation for all boards"
-	@echo "        allstack: Prints a basic stack frame analysis for all boards"
+	@echo "           audit: Audit Cargo dependencies for all kernel sources"
+	@echo "          boards: Compiles Tock for all supported boards"
+	@echo "           check: Checks, but does not compile, Tock for all supported boards"
+	@echo "             doc: Builds Tock documentation for all boards"
+	@echo "           stack: Prints a basic stack frame analysis for all boards"
 	@echo "           clean: Clean all builds"
 	@echo "          format: Runs the rustfmt tool on all kernel sources"
 	@echo "            list: Lists available boards"
@@ -127,33 +126,33 @@ endef
 ##
 
 ## Aggregate targets
-.PHONY: allaudit
-allaudit:
+.PHONY: allaudit audit
+allaudit audit:
 	@for f in `./tools/list_lock.sh`;\
 		do echo "$$(tput bold)Auditing $$f";\
 		(cd "$$f" && cargo audit || exit 1);\
 		done
 
-.PHONY: allboards
-allboards:
+.PHONY: allboards boards
+allboards boards:
 	@for f in $(ALL_BOARDS);\
 		do echo "$$(tput bold)Build $$f";\
 		$(MAKE) -C "boards/$$f" || exit 1;\
 		done
 
-.PHONY: allcheck
-allcheck:
+.PHONY: allcheck check
+allcheck check:
 	@cargo check
 
-.PHONY: alldoc
-alldoc:
+.PHONY: alldoc doc
+alldoc doc:
 	@for f in $(ALL_BOARDS);\
 		do echo "$$(tput bold)Documenting $$f";\
 		$(MAKE) -C "boards/$$f" doc || exit 1;\
 		done
 
-.PHONY: allstack
-allstack:
+.PHONY: allstack stack stack-analysis
+allstack stack stack-analysis:
 	@for f in $(ALL_BOARDS);\
 		do $(MAKE) --no-print-directory -C "boards/$$f" stack-analysis || exit 1;\
 		done
@@ -193,7 +192,7 @@ list:
 
 ## Meta-Targets
 
-# Run all possible CI. If this passses locally, all cloud CI *must* pass as well.
+# Run all possible CI. If this passes locally, all cloud CI *must* pass as well.
 .PHONY: ci-all
 ci-all:\
 	ci-runner-github\
@@ -292,7 +291,8 @@ ci-runner-github-build:\
 	ci-job-syntax\
 	ci-job-compilation\
 	ci-job-debug-support-targets\
-	ci-job-collect-artifacts
+	ci-job-collect-artifacts\
+	ci-job-cargo-test-build
 	$(call banner,CI-Runner: GitHub build runner DONE)
 
 .PHONY: ci-runner-github-tests
@@ -339,12 +339,12 @@ ci-runner-netlify:\
 .PHONY: ci-job-format
 ci-job-format:
 	$(call banner,CI-Job: Format Check)
-	@CI=true TOCK_FORMAT_MODE=diff $(MAKE) format
+	@NOWARNINGS=true TOCK_FORMAT_MODE=diff $(MAKE) format
 
 .PHONY: ci-job-clippy
 ci-job-clippy:
 	$(call banner,CI-Job: Clippy)
-	@CI=true ./tools/run_clippy.sh
+	@NOWARNINGS=true ./tools/run_clippy.sh
 
 define ci_setup_markdown_toc
 	$(call banner,CI-Setup: Install markdown-toc)
@@ -361,7 +361,7 @@ ci-setup-markdown-toc:
 
 define ci_job_markdown_toc
 	$(call banner,CI-Job: Markdown Table of Contents Validation)
-	@CI=true PATH="node_modules/.bin:${PATH}" tools/toc.sh
+	@NOWARNINGS=true PATH="node_modules/.bin:${PATH}" tools/toc.sh
 endef
 
 .PHONY: ci-job-markdown-toc
@@ -374,12 +374,12 @@ ci-job-markdown-toc: ci-setup-markdown-toc
 .PHONY: ci-job-syntax
 ci-job-syntax:
 	$(call banner,CI-Job: Syntax)
-	@CI=true $(MAKE) allcheck
+	@NOWARNINGS=true $(MAKE) allcheck
 
 .PHONY: ci-job-compilation
 ci-job-compilation:
 	$(call banner,CI-Job: Compilation)
-	@CI=true $(MAKE) allboards
+	@NOWARNINGS=true $(MAKE) allboards
 
 .PHONY: ci-job-debug-support-targets
 ci-job-debug-support-targets:
@@ -389,9 +389,9 @@ ci-job-debug-support-targets:
 	# work, but don't build them for every board.
 	#
 	# The choice of building for the nrf52dk was chosen by random die roll.
-	@CI=true $(MAKE) -C boards/nordic/nrf52dk lst
-	@CI=true $(MAKE) -C boards/nordic/nrf52dk debug
-	@CI=true $(MAKE) -C boards/nordic/nrf52dk debug-lst
+	@NOWARNINGS=true $(MAKE) -C boards/nordic/nrf52dk lst
+	@NOWARNINGS=true $(MAKE) -C boards/nordic/nrf52dk debug
+	@NOWARNINGS=true $(MAKE) -C boards/nordic/nrf52dk debug-lst
 
 .PHONY: ci-job-collect-artifacts
 ci-job-collect-artifacts: ci-job-compilation
@@ -413,10 +413,10 @@ ci-job-collect-artifacts: ci-job-compilation
 .PHONY: ci-job-libraries
 ci-job-libraries:
 	$(call banner,CI-Job: Libraries)
-	@cd libraries/enum_primitive && CI=true RUSTFLAGS="-D warnings" cargo test
-	@cd libraries/riscv-csr && CI=true RUSTFLAGS="-D warnings" cargo test
-	@cd libraries/tock-cells && CI=true RUSTFLAGS="-D warnings" cargo test
-	@cd libraries/tock-register-interface && CI=true RUSTFLAGS="-D warnings" cargo test
+	@cd libraries/enum_primitive && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
+	@cd libraries/riscv-csr && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
+	@cd libraries/tock-cells && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
+	@cd libraries/tock-register-interface && NOWARNINGS=true RUSTFLAGS="-D warnings" cargo test
 
 .PHONY: ci-job-archs
 ci-job-archs:
@@ -424,20 +424,20 @@ ci-job-archs:
 	@for arch in `./tools/list_archs.sh`;\
 		do echo "$$(tput bold)Test $$arch";\
 		cd arch/$$arch;\
-		CI=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test || exit 1;\
+		NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test || exit 1;\
 		cd ../..;\
 		done
 
 .PHONY: ci-job-kernel
 ci-job-kernel:
 	$(call banner,CI-Job: Kernel)
-	@cd kernel && CI=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test
+	@cd kernel && NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test
 
 .PHONY: ci-job-capsules
 ci-job-capsules:
 	$(call banner,CI-Job: Capsules)
 	@# Capsule initialization depends on board/chip specific imports, so ignore doc tests
-	@cd capsules && CI=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test --lib --examples
+	@cd capsules && NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test --lib --examples
 
 .PHONY: ci-job-chips
 ci-job-chips:
@@ -445,7 +445,7 @@ ci-job-chips:
 	@for chip in `./tools/list_chips.sh`;\
 		do echo "$$(tput bold)Test $$chip";\
 		cd chips/$$chip;\
-		CI=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test || exit 1;\
+		NOWARNINGS=true RUSTFLAGS="-D warnings" TOCK_KERNEL_VERSION=ci_test cargo test || exit 1;\
 		cd ../..;\
 		done
 
@@ -480,7 +480,7 @@ define ci_job_tools
 	@for tool in `./tools/list_tools.sh`;\
 		do echo "$$(tput bold)Build & Test $$tool";\
 		cd tools/$$tool;\
-		CI=true RUSTFLAGS="-D warnings" cargo build --all-targets || exit 1;\
+		NOWARNINGS=true RUSTFLAGS="-D warnings" cargo build --all-targets || exit 1;\
 		cd - > /dev/null;\
 		done
 endef
@@ -501,16 +501,21 @@ ci-job-miri: ci-setup-miri
 	# Note: This is highly experimental and limited at the moment.
 	#
 	@# Hangs forever during `Building` for this one :shrug:
-	@#cd libraries/tock-register-interface && CI=true cargo miri test
-	@cd kernel && CI=true cargo miri test
-	@for a in $$(tools/list_archs.sh); do cd arch/$$a && CI=true cargo miri test && cd ../..; done
-	@cd capsules && CI=true cargo miri test
-	@for c in $$(tools/list_chips.sh); do cd chips/$$c && CI=true cargo miri test && cd ../..; done
+	@#cd libraries/tock-register-interface && NOWARNINGS=true cargo miri test
+	@cd kernel && NOWARNINGS=true cargo miri test
+	@for a in $$(tools/list_archs.sh); do cd arch/$$a && NOWARNINGS=true cargo miri test && cd ../..; done
+	@cd capsules && NOWARNINGS=true cargo miri test
+	@for c in $$(tools/list_chips.sh); do cd chips/$$c && NOWARNINGS=true cargo miri test && cd ../..; done
 
+
+.PHONY: ci-job-cargo-test-build
+ci-job-cargo-test-build:
+	@$(MAKE) NO_RUN="--no-run" -C "boards/opentitan/earlgrey-cw310" test
+	@$(MAKE) NO_RUN="--no-run" -C "boards/esp32-c3-devkitM-1" test
 
 ### ci-runner-github-qemu jobs:
 
-QEMU_COMMIT_HASH=e77c8b8b8e933414ef07dbed04e02973fccffeb0
+QEMU_COMMIT_HASH=0ebf76aae58324b8f7bf6af798696687f5f4c2a9
 define ci_setup_qemu_riscv
 	$(call banner,CI-Setup: Build QEMU)
 	@# Use the latest QEMU as it has OpenTitan support
@@ -558,7 +563,10 @@ define ci_job_qemu
 	$(call banner,CI-Job: QEMU)
 	@cd tools/qemu-runner;\
 		PATH="$(shell pwd)/tools/qemu/build/riscv32-softmmu/:${PATH}"\
-		CI=true cargo run
+		NOWARNINGS=true cargo run
+	@cd boards/opentitan/earlgrey-cw310;\
+		PATH="$(shell pwd)/tools/qemu/build/riscv32-softmmu/:${PATH}"\
+		make test
 endef
 
 .PHONY: ci-job-qemu
@@ -575,7 +583,7 @@ board-release-test:
 .PHONY: ci-job-rustdoc
 ci-job-rustdoc:
 	$(call banner,CI-Job: Rustdoc Documentation)
-	@CI=true tools/build-all-docs.sh
+	@NOWARNINGS=true tools/build-all-docs.sh
 
 ## End CI rules
 ##

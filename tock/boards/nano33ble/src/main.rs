@@ -86,13 +86,13 @@ const FAULT_RESPONSE: kernel::process::StopWithDebugFaultPolicy =
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 8;
-const NUM_UPCALLS_IPC: usize = NUM_PROCS + 1;
 
 // State for loading and holding applications.
 static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
     [None; NUM_PROCS];
 
 static mut CHIP: Option<&'static nrf52840::chip::NRF52<Nrf52840DefaultPeripherals>> = None;
+static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 static mut CDC_REF_FOR_PANIC: Option<
     &'static capsules::usb::cdc::CdcAcm<
         'static,
@@ -127,15 +127,21 @@ pub struct Platform {
     console: &'static capsules::console::Console<'static>,
     pconsole: &'static capsules::process_console::ProcessConsole<
         'static,
+        capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
         components::process_console::Capability,
     >,
     proximity: &'static capsules::proximity::ProximitySensor<'static>,
     temperature: &'static capsules::temperature::TemperatureSensor<'static>,
     humidity: &'static capsules::humidity::HumiditySensor<'static>,
     gpio: &'static capsules::gpio::GPIO<'static, nrf52::gpio::GPIOPin<'static>>,
-    led: &'static capsules::led::LedDriver<'static, LedLow<'static, nrf52::gpio::GPIOPin<'static>>>,
+    led: &'static capsules::led::LedDriver<
+        'static,
+        LedLow<'static, nrf52::gpio::GPIOPin<'static>>,
+        3,
+    >,
+    adc: &'static capsules::adc::AdcVirtualized<'static>,
     rng: &'static capsules::rng::RngDriver<'static>,
-    ipc: kernel::ipc::IPC<NUM_PROCS, NUM_UPCALLS_IPC>,
+    ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
     alarm: &'static capsules::alarm::AlarmDriver<
         'static,
         capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
@@ -158,6 +164,7 @@ impl SyscallDriverLookup for Platform {
             capsules::gpio::DRIVER_NUM => f(Some(self.gpio)),
             capsules::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules::led::DRIVER_NUM => f(Some(self.led)),
+            capsules::adc::DRIVER_NUM => f(Some(self.adc)),
             capsules::rng::DRIVER_NUM => f(Some(self.rng)),
             capsules::ble_advertising_driver::DRIVER_NUM => f(Some(self.ble_radio)),
             capsules::ieee802154::DRIVER_NUM => f(Some(self.ieee802154_radio)),
@@ -177,6 +184,7 @@ impl KernelResources<nrf52::chip::NRF52<'static, Nrf52840DefaultPeripherals<'sta
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm4::systick::SysTick;
     type WatchDog = ();
+    type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
         &self
@@ -194,6 +202,9 @@ impl KernelResources<nrf52::chip::NRF52<'static, Nrf52840DefaultPeripherals<'sta
         &self.systick
     }
     fn watchdog(&self) -> &Self::WatchDog {
+        &()
+    }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
         &()
     }
 }
@@ -279,14 +290,11 @@ pub unsafe fn main() {
     // LEDs
     //--------------------------------------------------------------------------
 
-    let led = components::led::LedsComponent::new(components::led_component_helper!(
+    let led = components::led::LedsComponent::new().finalize(components::led_component_helper!(
         LedLow<'static, nrf52840::gpio::GPIOPin>,
         LedLow::new(&nrf52840_peripherals.gpio_port[LED_RED_PIN]),
         LedLow::new(&nrf52840_peripherals.gpio_port[LED_GREEN_PIN]),
         LedLow::new(&nrf52840_peripherals.gpio_port[LED_BLUE_PIN]),
-    ))
-    .finalize(components::led_component_buf!(
-        LedLow<'static, nrf52840::gpio::GPIOPin>
     ));
 
     //--------------------------------------------------------------------------
@@ -354,13 +362,24 @@ pub unsafe fn main() {
     ));
     CDC_REF_FOR_PANIC = Some(cdc); //for use by panic handler
 
+    // Process Printer for displaying process information.
+    let process_printer =
+        components::process_printer::ProcessPrinterTextComponent::new().finalize(());
+    PROCESS_PRINTER = Some(process_printer);
+
     // Create a shared UART channel for the console and for kernel debug.
     let uart_mux = components::console::UartMuxComponent::new(cdc, 115200, dynamic_deferred_caller)
         .finalize(());
 
-    let pconsole =
-        components::process_console::ProcessConsoleComponent::new(board_kernel, uart_mux)
-            .finalize(());
+    let pconsole = components::process_console::ProcessConsoleComponent::new(
+        board_kernel,
+        uart_mux,
+        mux_alarm,
+        process_printer,
+    )
+    .finalize(components::process_console_component_helper!(
+        nrf52::rtc::Rtc<'static>
+    ));
 
     // Setup the console.
     let console = components::console::ConsoleComponent::new(
@@ -368,7 +387,7 @@ pub unsafe fn main() {
         capsules::console::DRIVER_NUM,
         uart_mux,
     )
-    .finalize(());
+    .finalize(components::console_component_helper!());
     // Create the debugger object that handles calls to `debug!()`.
     components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
 
@@ -384,6 +403,67 @@ pub unsafe fn main() {
     .finalize(());
 
     //--------------------------------------------------------------------------
+    // ADC
+    //--------------------------------------------------------------------------
+    base_peripherals.adc.calibrate();
+
+    let adc_mux = components::adc::AdcMuxComponent::new(&base_peripherals.adc)
+        .finalize(components::adc_mux_component_helper!(nrf52840::adc::Adc));
+
+    let adc_syscall =
+        components::adc::AdcVirtualComponent::new(board_kernel, capsules::adc::DRIVER_NUM)
+            .finalize(components::adc_syscall_component_helper!(
+                // A0
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput2)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+                // A1
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput3)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+                // A2
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput6)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+                // A3
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput5)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+                // A4
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput7)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+                // A5
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput0)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+                // A6
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput4)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+                // A7
+                components::adc::AdcComponent::new(
+                    &adc_mux,
+                    nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput1)
+                )
+                .finalize(components::adc_component_helper!(nrf52840::adc::Adc)),
+            ));
+
+    //--------------------------------------------------------------------------
     // SENSORS
     //--------------------------------------------------------------------------
 
@@ -397,8 +477,8 @@ pub unsafe fn main() {
     );
     base_peripherals.twi0.set_master_client(sensors_i2c_bus);
 
-    &nrf52840_peripherals.gpio_port[I2C_PULLUP_PIN].make_output();
-    &nrf52840_peripherals.gpio_port[I2C_PULLUP_PIN].set();
+    let _ = &nrf52840_peripherals.gpio_port[I2C_PULLUP_PIN].make_output();
+    let _ = &nrf52840_peripherals.gpio_port[I2C_PULLUP_PIN].set();
 
     let apds9960_i2c = static_init!(
         capsules::virtual_i2c::I2CDevice,
@@ -461,9 +541,7 @@ pub unsafe fn main() {
     );
     base_peripherals.ecb.set_client(aes_mux);
     aes_mux.initialize_callback_handle(
-        dynamic_deferred_caller
-            .register(aes_mux)
-            .expect("no deferred call slot available for ccm mux"),
+        dynamic_deferred_caller.register(aes_mux).unwrap(), // Unwrap fail = no deferred call slot available for ccm mux
     );
     use capsules::net::ieee802154::MacAddress;
     use capsules::virtual_alarm::VirtualMuxAlarm;
@@ -544,6 +622,7 @@ pub unsafe fn main() {
         proximity,
         temperature,
         humidity,
+        adc: adc_syscall,
         led,
         gpio,
         rng,
@@ -592,7 +671,7 @@ pub unsafe fn main() {
     // PROCESSES AND MAIN LOOP
     //--------------------------------------------------------------------------
 
-    /// These symbols are defined in the linker script.
+    // These symbols are defined in the linker script.
     extern "C" {
         /// Beginning of the ROM region containing app images.
         static _sapps: u8;
