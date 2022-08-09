@@ -33,21 +33,22 @@ Teensy 4. You should observe
 
 To re-run these tests, see the still-hacky Tock 2.1 section in the Makefile.
 
-- [ ] `examples/c_hello` and `examples/tests/printf_long`
+- [x] `examples/c_hello` and `examples/tests/printf_long`
   - uart_tx_small and uart_tx_large: applications that write to console with small and large buffers; run both in parallel to properly test virtualization
-- [ ] `examples/tests/console_recv_short` and `examples/tests/console_recv_long`
-- [ ] `examples/blink`
-- [ ] `examples/rot13_client` and `examples/rot13_service`
-- [ ] `examples/blink` and `examples/c_hello` ~~and `examples/buttons`~~
+- [x] `examples/tests/console_recv_short` and `examples/tests/console_recv_long`
+- [x] `examples/blink`
+- [x] `examples/rot13_client` and `examples/rot13_service`
+- [x] `examples/blink` and `examples/c_hello` ~~and `examples/buttons`~~
   - *No buttons available.*
-- [ ] `examples/lua-hello`
-- [ ] `examples/tests/console_timeout`
-- [ ] `examples/tests/malloc_test01`
-- [ ] `examples/tests/stack_size_test01`
-- [ ] `examples/tests/stack_size_test02`
-- [ ] `examples/tests/mpu_stack_growth`
-- [ ] `examples/tests/mpu_walk_region`
+- [x] `examples/lua-hello`
+- [x] `examples/tests/console_timeout`
+- [x] `examples/tests/malloc_test01`
+- [x] `examples/tests/malloc_test02`
+- [x] `examples/tests/stack_size_test01`
+- [x] `examples/tests/stack_size_test02`
+- [x] `examples/tests/mpu_stack_growth`
+- [x] `examples/tests/mpu_walk_region`
   - *No buttons available.*
-- [ ] `examples/tests/multi_alarm_test`
+- [x] `examples/tests/multi_alarm_test`
   - *Only one configured LED on board; combined with `whileone` to make it interesting.*
-- [ ] `examples/tests/whileone`
+- [x] `examples/tests/whileone`
